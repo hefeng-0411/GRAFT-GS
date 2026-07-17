@@ -1,0 +1,109 @@
+precision:
+  backbone: bfloat16
+  geometric_state: float32
+  analytical_solve: float32
+  diagnostics: float64
+distributed:
+  backend: nccl
+  world_size: 6
+  synchronize_object_atlas: false
+dataset:
+  input_view_set: renders
+  image_size: [518, 518]
+  minimum_views: 2
+  maximum_views: 24
+  view_selection: random
+  foreground_alpha_threshold: 0.5
+  surface_grid_resolution: 64
+  require_surface_voxels: true
+  load_trellis_features: true
+  load_trellis_latents: true
+  dino_pseudo_confidence: 0.5
+  trellis_latent_pseudo_confidence: 0.5
+  topology_supervision_mode: validated_or_repaired
+  minimum_topology_confidence: 0.95
+  minimum_teacher_bundle_confidence: 0.25
+model:
+  feature_dim: 1024
+  base_level: 4
+  max_level: 10
+  encoder_layers: 4
+  attention_heads: 4
+  flow_layers: 8
+  flow_steps: 8
+  transport_feature_iterations: 2
+  refinement_rounds: 1
+  renderer_backend: cuda
+transport:
+  epsilon: 0.03
+  tau_source: 0.5
+  tau_target: 0.5
+  max_iterations: 300
+  tolerance: 1.0e-7
+  # Conditional chart moments are shrunk toward the persistent chart when
+  # retained/source UOT mass is below this dimensionless ratio.
+  retention_shrinkage: 0.05
+trellis_prior:
+  enabled_after_phase_a: true
+  samples: 8
+  sampler_steps: 12
+  strength: 0.35
+  minimum_probability: 0.0
+  uncertainty_discount: 0.5
+training:
+  phases: [A, B, C, D, E, F]
+  learning_rate: 1.0e-4
+  gradient_accumulation_steps: 1
+  maximum_gradient_norm: 1.0
+  # Phase F only: exact Gram-space view consensus, augmentation-artifact
+  # rejection, and diagonal Fisher clipping. Global topology/barrier gradients
+  # bypass this purifier and remain exact derivatives of their scalar losses.
+  gradient_purification_enabled: true
+  gradient_purification_maximum_views: 8
+  gradient_consensus_cosine: 0.2
+  gradient_consensus_relative_singular_value: 0.05
+  gradient_artifact_relative_singular_value: 0.1
+  gradient_weiszfeld_iterations: 12
+  gradient_fisher_decay: 0.95
+  gradient_fisher_damping: 1.0e-6
+  gradient_fisher_radius: 1.0
+  # Phase F one-step inner maximization in log quantization-scale space.
+  quantization_adversarial_log_scale_radius: 0.05
+  # Dimensionless safety slack: zero is the exact hard barrier.
+  topology_hardening_relative_margin: 0.1
+  topology_hardening_temperature: 0.1
+  # Teacher topology is a pseudo-label, never promoted to hard mesh ground
+  # truth. Set to zero to distill state/transport only.
+  teacher_distillation_confidence: 1.0
+  teacher_topology_confidence: 0.5
+  derive_mesh_depth_normals: true
+  require_mesh_depth_normals: false
+loss:
+  transport: 1.0
+  surface: 5.0
+  surface_uncertainty_nll: 0.1
+  confidence_brier: 1.0
+  render: 10.0
+  ssim: 2.0
+  perceptual: 1.0
+  mask: 1.0
+  mesh_depth: 1.0
+  mesh_normal: 0.2
+  vggt_depth_reprojection: 0.2
+  vggt_track_cycle: 0.1
+  vggt_depth_normal: 0.1
+  atlas_c0: 0.5
+  atlas_c1: 0.2
+  atlas_curvature: 0.05
+  atlas_multilevel: 0.1
+  tile_opacity: 0.1
+  topology_supervision: 1.0
+  feasibility: 1.0
+  flow: 1.0
+  distill_state: 1.0
+  distill_transport: 0.1
+  distill_topology: 0.1
+  distill_render: 1.0
+  distill_field: 0.5
+  distill_activation: 0.25
+  distill_jacobian: 0.1

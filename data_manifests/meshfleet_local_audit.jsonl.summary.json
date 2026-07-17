@@ -1,0 +1,11 @@
+{
+  "dataset_root": "D:\\VsCode\\MVG\\Base\\MeshFleet_TRELLIS",
+  "manifest": "D:\\VsCode\\MVG\\Base\\GRAFT-GS\\data_manifests\\meshfleet_local_audit.jsonl",
+  "record_count": 1,
+  "schema": "meshfleet-trellis-object-v2",
+  "split_counts": {
+    "test": 1,
+    "train": 0
+  },
+  "warning_count": 2
+}
