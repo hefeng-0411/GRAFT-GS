@@ -47,6 +47,7 @@ def main() -> None:
     parser.add_argument("object_id")
     parser.add_argument("output_directory", type=Path)
     parser.add_argument("--split", default="train")
+    parser.add_argument("--object-id-file", type=Path)
     parser.add_argument("--maximum-views", type=int, default=24)
     parser.add_argument("--iterations", type=int, default=300)
     parser.add_argument("--learning-rate", type=float, default=2.0e-3)
@@ -58,6 +59,10 @@ def main() -> None:
     args = parser.parse_args()
 
     model_config, _, _, dataset_config = load_server_config(args.config)
+    configured_id_file = dataset_config.get("object_id_file")
+    object_id_file = args.object_id_file or (
+        Path(str(configured_id_file)) if configured_id_file is not None else None
+    )
     prior_config = load_trellis_prior_config(args.config)
     use_prior = bool(prior_config["enabled_after_phase_a"])
     if use_prior and args.trellis_checkpoint is None:
@@ -67,6 +72,7 @@ def main() -> None:
         MeshFleetDatasetConfig(
             root=args.dataset_root,
             manifest=args.manifest,
+            object_id_file=object_id_file,
             split=args.split,
             input_view_set=str(dataset_config.get("input_view_set", "renders")),
             image_size=(int(image_size[0]), int(image_size[1])),
@@ -81,6 +87,14 @@ def main() -> None:
             ),
             load_surface_voxels=True,
             require_surface_voxels=True,
+            require_requested_modalities=bool(
+                dataset_config.get("require_requested_modalities", True)
+            ),
+            require_complete_input_view_set=bool(
+                dataset_config.get("require_complete_input_view_set", True)
+            ),
+            require_normalization=bool(dataset_config.get("require_normalization", True)),
+            require_render_mesh=bool(dataset_config.get("require_render_mesh", False)),
         )
     )
     sample = dataset[_record_index(dataset, args.object_id)]

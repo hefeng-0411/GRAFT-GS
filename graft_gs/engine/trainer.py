@@ -80,6 +80,9 @@ class TrainerConfig:
     seed: int = 17
     dataset_manifest: Optional[str] = None
     dataset_manifest_sha256: Optional[str] = None
+    dataset_object_id_catalog: Optional[str] = None
+    dataset_object_id_catalog_sha256: Optional[str] = None
+    dataset_object_id_count: Optional[int] = None
     dataset_split: Optional[str] = None
     dataset_view_set: Optional[str] = None
     dataset_manifest_schema: Optional[str] = None
@@ -1376,6 +1379,8 @@ class GraftGSTrainer:
                 "synchronize_object_atlas",
                 "seed",
                 "dataset_manifest_schema",
+                "dataset_object_id_catalog_sha256",
+                "dataset_object_id_count",
                 "topology_supervision_mode",
                 "minimum_topology_confidence",
                 "teacher_checkpoint",

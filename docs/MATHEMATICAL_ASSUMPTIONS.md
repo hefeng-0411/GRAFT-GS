@@ -204,3 +204,9 @@
 - Environment validation assumes every active `requirements.txt` entry is one
   unconditional exact distribution pin. CUDA driver compatibility and external
   VGGT/TRELLIS checkpoint identity are separate recorded preconditions.
+- Dynamic corpus discovery assumes object identity is the lowercase 64-hex
+  Objaverse-XL SHA-256 serialized by the inspected TRELLIS tools. The default
+  primary-union/required-intersection policy defines manifest membership;
+  optional modality absence is missing supervision, never a zero target.
+  Multiple physical artifacts for the same `(split, modality, object, kind)`
+  are ambiguous and are not silently resolved.

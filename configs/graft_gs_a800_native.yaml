@@ -16,6 +16,10 @@ dataset:
   foreground_alpha_threshold: 0.5
   surface_grid_resolution: 64
   require_surface_voxels: true
+  require_requested_modalities: true
+  require_complete_input_view_set: true
+  require_normalization: true
+  require_render_mesh: true
   load_trellis_features: true
   load_trellis_latents: true
   dino_pseudo_confidence: 0.5

@@ -13,7 +13,7 @@ import unittest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CANONICAL_OBJECT_ID = "17a53839ae5da04c75ea21335d4bdc8ddc26b45f7bb9d0e18f5afaa397e43a17"
+OBJECT_ID_CATALOG = PROJECT_ROOT / "data_manifests" / "meshfleet_object_ids.txt"
 MANIFEST = Path(
     os.environ.get(
         "GRAFT_GS_MESHFLEET_MANIFEST",
@@ -37,14 +37,20 @@ def _records():
     ]
 
 
-def _canonical_record():
+def _audited_nonmanifold_record():
     matches = [
         record for record in _records()
-        if record["object_id"] == CANONICAL_OBJECT_ID
+        if record.get("checks", {}).get("render_mesh_topology", {}).get(
+            "connected_components"
+        ) == 8
+        and record.get("checks", {}).get("render_mesh_topology", {}).get(
+            "nonmanifold_edge_count"
+        ) == 313
     ]
     if len(matches) != 1:
         raise AssertionError(
-            f"canonical object must occur exactly once in manifest, found {len(matches)}"
+            "the audited 8-component/313-nonmanifold-edge topology fixture "
+            f"must occur exactly once, found {len(matches)}"
         )
     return matches[0]
 
@@ -64,6 +70,73 @@ def _load_manifest_module():
 
 
 class StaticMeshFleetManifestTest(unittest.TestCase):
+    def test_full_object_id_catalog_is_valid_unique_and_covers_local_records(self) -> None:
+        module = _load_manifest_module()
+        identifiers = module.load_meshfleet_object_ids(OBJECT_ID_CATALOG)
+        self.assertEqual(len(identifiers), 251)
+        self.assertEqual(len(set(identifiers)), 251)
+        self.assertTrue({record["object_id"] for record in _records()} <= set(identifiers))
+        self.assertEqual(
+            module.meshfleet_object_id_digest(identifiers),
+            module.meshfleet_object_id_digest(tuple(reversed(identifiers))),
+        )
+
+    def test_catalog_manifest_reports_missing_ids_and_admits_complete_sample(self) -> None:
+        module = _load_manifest_module()
+        audited_id = _audited_nonmanifold_record()["object_id"]
+        absent = "f" * 64
+        if absent == audited_id:
+            raise AssertionError("synthetic absent ID collides with audited fixture")
+        with tempfile.TemporaryDirectory() as directory:
+            directory = Path(directory)
+            catalog = directory / "ids.txt"
+            catalog.write_text(f"{absent}\n{audited_id}\n", encoding="utf8")
+            manifest = directory / "manifest.jsonl"
+            summary = module.build_meshfleet_manifest(
+                DATASET,
+                manifest,
+                object_id_file=catalog,
+            )
+            contract = summary["object_id_catalog"]
+            self.assertEqual(contract["count"], 2)
+            self.assertEqual(contract["discovered_count"], 1)
+            self.assertEqual(contract["missing_ids"], [absent])
+            dataset = module.MeshFleetObjectDataset(
+                module.MeshFleetDatasetConfig(
+                    root=DATASET,
+                    manifest=manifest,
+                    object_id_file=catalog,
+                    split="test",
+                    minimum_views=2,
+                    maximum_views=3,
+                    load_surface_voxels=True,
+                    require_surface_voxels=True,
+                    load_trellis_features=True,
+                    load_trellis_latents=True,
+                    require_render_mesh=True,
+                )
+            )
+            self.assertEqual([record.object_id for record in dataset.records], [audited_id])
+            self.assertEqual(dataset.coverage["admitted_count"], 1)
+            self.assertIn(absent, dataset.coverage["catalog_ids_absent_from_split"])
+
+    def test_requested_missing_modality_is_an_explicit_incompleteness_reason(self) -> None:
+        module = _load_manifest_module()
+        record = module.load_meshfleet_manifest(MANIFEST)[0]
+        record.modalities = dict(record.modalities)
+        record.modalities.pop("features")
+        reasons = module.meshfleet_record_admission_reasons(
+            record,
+            module.MeshFleetDatasetConfig(
+                root=DATASET,
+                manifest=MANIFEST,
+                split="test",
+                load_trellis_features=True,
+                require_surface_voxels=True,
+            ),
+        )
+        self.assertIn("missing required modality features", reasons)
+
     @staticmethod
     def _write_triangle_ply(path: Path, vertices, faces) -> None:
         header = (
@@ -99,8 +172,8 @@ class StaticMeshFleetManifestTest(unittest.TestCase):
                         record["checks"]["surface_voxel_indices_equal_feature_indices"]
                     )
 
-    def test_canonical_raw_topology_is_diagnostic_not_a_label(self) -> None:
-        record = _canonical_record()
+    def test_audited_raw_topology_is_diagnostic_not_a_label(self) -> None:
+        record = _audited_nonmanifold_record()
         topology = record["checks"]["render_mesh_topology"]
         self.assertEqual(topology["vertex_count"], 78448)
         self.assertEqual(topology["edge_count"], 236075)
@@ -147,19 +220,20 @@ class StaticMeshFleetManifestTest(unittest.TestCase):
         if not DATASET.is_dir():
             self.skipTest("audited MeshFleet_TRELLIS dataset is not mounted")
         module = _load_manifest_module()
+        audited = _audited_nonmanifold_record()
         with tempfile.TemporaryDirectory() as directory:
             rebuilt = Path(directory) / "manifest.jsonl"
             module.build_meshfleet_manifest(
                 DATASET,
                 rebuilt,
-                object_ids=(CANONICAL_OBJECT_ID,),
+                object_ids=(audited["object_id"],),
             )
             rebuilt_records = [
                 json.loads(line)
                 for line in rebuilt.read_text(encoding="utf8").splitlines()
                 if line
             ]
-            self.assertEqual(rebuilt_records, [_canonical_record()])
+            self.assertEqual(rebuilt_records, [audited])
 
     def test_closed_oriented_tetrahedron_is_admissible(self) -> None:
         module = _load_manifest_module()

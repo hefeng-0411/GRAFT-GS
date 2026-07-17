@@ -1,7 +1,6 @@
 {
   "candidate_counts": {
-    "test": 1,
-    "train": 0
+    "test": 1
   },
   "dataset_root": "D:\\VsCode\\MVG\\Base\\MeshFleet_TRELLIS",
   "discovered_object_ids_sha256": "faf865df1bc7f8f2d3a2d4c885c4856f5d149696aa5b5bec020068c02fcb15b8",
@@ -25,7 +24,7 @@
       "mesh_normalized"
     ]
   },
-  "manifest": "D:\\VsCode\\MVG\\Base\\GRAFT-GS\\data_manifests\\meshfleet_local_audit.jsonl",
+  "manifest": "D:\\VsCode\\MVG\\Base\\GRAFT-GS\\outputs\\dynamic_local_manifest.jsonl",
   "modality_availability_counts": {
     "test": {
       "features": 1,
@@ -37,17 +36,6 @@
       "renders_eval_90": 1,
       "ss_latents": 1,
       "voxels": 1
-    },
-    "train": {
-      "features": 0,
-      "latents": 0,
-      "mesh_normalized": 0,
-      "renders": 0,
-      "renders_cond": 0,
-      "renders_eval_70": 0,
-      "renders_eval_90": 0,
-      "ss_latents": 0,
-      "voxels": 0
     }
   },
   "object_id_catalog": {
@@ -61,14 +49,12 @@
   },
   "record_count": 1,
   "rejected_counts": {
-    "test": 0,
-    "train": 0
+    "test": 0
   },
-  "rejected_manifest": "D:\\VsCode\\MVG\\Base\\GRAFT-GS\\data_manifests\\meshfleet_local_audit.jsonl.rejected.jsonl",
+  "rejected_manifest": "D:\\VsCode\\MVG\\Base\\GRAFT-GS\\outputs\\dynamic_local_manifest.jsonl.rejected.jsonl",
   "schema": "meshfleet-trellis-object-v2",
   "split_counts": {
-    "test": 1,
-    "train": 0
+    "test": 1
   },
   "split_disjoint": true,
   "warning_count": 2

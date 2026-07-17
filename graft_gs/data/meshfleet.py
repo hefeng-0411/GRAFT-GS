@@ -24,6 +24,7 @@ import hashlib
 import json
 from math import tan
 from pathlib import Path
+import re
 import struct
 from typing import TYPE_CHECKING, Any, Mapping, Optional, Sequence
 
@@ -38,6 +39,23 @@ if TYPE_CHECKING:
 MANIFEST_SCHEMA = "meshfleet-trellis-object-v2"
 _VIEW_MODALITIES = ("renders", "renders_cond", "renders_eval_70", "renders_eval_90")
 _ARRAY_MODALITIES = ("features", "latents", "ss_latents")
+_OBJECT_ID_RE = re.compile(r"^[0-9a-f]{64}$")
+MESHFLEET_MODALITIES = (
+    *_VIEW_MODALITIES,
+    *_ARRAY_MODALITIES,
+    "mesh_normalized",
+    "voxels",
+)
+# The discovery contract is deliberately weaker than any individual training
+# phase.  It identifies objects with observations, a normalized asset, and the
+# structured latent produced by the audited TRELLIS preprocessing lineage.
+# Phase-specific requirements (surface voxels, DINO features, render mesh,
+# structure latent) remain explicit in ``MeshFleetDatasetConfig``.
+DEFAULT_PRIMARY_MODALITIES = ("latents", "mesh_normalized")
+DEFAULT_REQUIRED_MODALITIES = ("renders", "latents", "mesh_normalized")
+DEFAULT_OPTIONAL_MODALITIES = tuple(
+    name for name in MESHFLEET_MODALITIES if name not in DEFAULT_REQUIRED_MODALITIES
+)
 
 
 @dataclass(frozen=True)
@@ -52,6 +70,7 @@ class MeshFleetDatasetConfig:
     root: str | Path
     split: str = "train"
     manifest: Optional[str | Path] = None
+    object_id_file: Optional[str | Path] = None
     input_view_set: str = "renders"
     image_size: tuple[int, int] = (518, 518)
     minimum_views: int = 2
@@ -67,6 +86,10 @@ class MeshFleetDatasetConfig:
     dino_pseudo_confidence: float = 0.5
     trellis_latent_pseudo_confidence: float = 0.5
     require_surface_voxels: bool = False
+    require_requested_modalities: bool = True
+    require_complete_input_view_set: bool = True
+    require_normalization: bool = True
+    require_render_mesh: bool = False
     topology_supervision_mode: str = "validated_or_repaired"
     minimum_topology_confidence: float = 0.95
     verify_files_at_load: bool = True
@@ -117,6 +140,7 @@ class ObjectManifestRecord:
     modalities: dict[str, dict[str, Any]] = field(default_factory=dict)
     supervision: dict[str, list[str]] = field(default_factory=dict)
     topology_supervision: dict[str, Any] = field(default_factory=dict)
+    discovery: dict[str, Any] = field(default_factory=dict)
     checks: dict[str, Any] = field(default_factory=dict)
     warnings: list[str] = field(default_factory=list)
 
@@ -128,8 +152,53 @@ class ObjectManifestRecord:
         return record
 
 
+def load_meshfleet_object_ids(path: str | Path) -> tuple[str, ...]:
+    """Load a deterministic, unique Objaverse-style SHA-256 object catalog."""
+
+    path = Path(path)
+    identifiers: list[str] = []
+    seen: set[str] = set()
+    for line_number, raw_line in enumerate(
+        path.read_text(encoding="utf-8-sig").splitlines(), 1
+    ):
+        value = raw_line.split("#", 1)[0].strip()
+        if not value:
+            continue
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError(
+                f"invalid MeshFleet object ID at {path}:{line_number}: {value!r}"
+            )
+        if value in seen:
+            raise ValueError(
+                f"duplicate MeshFleet object ID at {path}:{line_number}: {value}"
+            )
+        seen.add(value)
+        identifiers.append(value)
+    if not identifiers:
+        raise ValueError(f"MeshFleet object catalog is empty: {path}")
+    return tuple(identifiers)
+
+
+def meshfleet_object_id_digest(identifiers: Sequence[str]) -> str:
+    """Hash catalog membership independently of text-file ordering/whitespace."""
+
+    canonical = "".join(f"{value}\n" for value in sorted(identifiers)).encode("ascii")
+    return hashlib.sha256(canonical).hexdigest()
+
+
 def _relative(path: Path, root: Path) -> str:
     return path.resolve().relative_to(root.resolve()).as_posix()
+
+
+def _resolve_manifest_path(root: Path, relative: str | Path) -> Path:
+    """Resolve a manifest path while enforcing the configured dataset root."""
+
+    candidate = (root / relative).resolve()
+    try:
+        candidate.relative_to(root.resolve())
+    except ValueError as error:
+        raise ValueError(f"manifest path escapes the dataset root: {relative}") from error
+    return candidate
 
 
 def _array_metadata(path: Path) -> dict[str, Any]:
@@ -636,31 +705,191 @@ def _audit_camera_set(directory: Path, root: Path, inspect_image_headers: bool) 
     return result
 
 
-def _discover_object_ids(split_root: Path) -> set[str]:
-    identifiers: set[str] = set()
+@dataclass(frozen=True)
+class _ObjectLocation:
+    split: str
+    split_root: Path
+    object_id: str
+    artifacts: Mapping[str, Mapping[str, tuple[Path, ...]]]
+
+    @property
+    def layout(self) -> str:
+        return "modality-centric"
+
+
+def _discover_split_roots(root: Path, split: str) -> tuple[Path, ...]:
+    """Find direct and one-level-sharded split roots deterministically."""
+
+    candidates: set[Path] = set()
+    direct = root / split
+    if direct.is_dir():
+        candidates.add(direct.resolve())
+    if root.is_dir():
+        for shard in root.iterdir():
+            candidate = shard / split
+            if shard.is_dir() and candidate.is_dir():
+                candidates.add(candidate.resolve())
+    return tuple(sorted(candidates, key=lambda path: path.as_posix()))
+
+
+def _add_artifact(
+    index: dict[str, dict[str, dict[str, list[Path]]]],
+    modality: str,
+    object_id: str,
+    artifact: str,
+    path: Path,
+) -> None:
+    if _OBJECT_ID_RE.fullmatch(object_id) is None:
+        return
+    index.setdefault(modality, {}).setdefault(object_id, {}).setdefault(
+        artifact, []
+    ).append(path.resolve())
+
+
+def _index_split_modalities(
+    split_root: Path,
+) -> dict[str, dict[str, dict[str, tuple[Path, ...]]]]:
+    """Index the modality-centric tree once instead of rescanning per object.
+
+    TRELLIS permits model-name directories between an array modality and the
+    ``<sha256>.npz`` leaf.  Recursive enumeration is therefore necessary, but
+    is performed exactly once per modality and split.
+    """
+
+    mutable: dict[str, dict[str, dict[str, list[Path]]]] = {}
     for modality in _VIEW_MODALITIES:
         directory = split_root / modality
-        if directory.is_dir():
-            identifiers.update(path.parent.name for path in directory.rglob("transforms.json"))
+        if not directory.is_dir():
+            continue
+        for path in directory.rglob("transforms.json"):
+            _add_artifact(mutable, modality, path.parent.name, "transforms", path)
+        if modality == "renders":
+            for path in directory.rglob("mesh.ply"):
+                _add_artifact(mutable, modality, path.parent.name, "mesh", path)
     for modality in _ARRAY_MODALITIES:
         directory = split_root / modality
         if directory.is_dir():
-            identifiers.update(path.stem for path in directory.rglob("*.npz"))
-    voxel_root = split_root / "voxels"
-    if voxel_root.is_dir():
-        identifiers.update(path.stem for path in voxel_root.rglob("*.ply"))
-    normalized_root = split_root / "mesh_normalized"
-    if normalized_root.is_dir():
-        identifiers.update(path.parent.name for path in normalized_root.rglob("bounding_box.json"))
-    return identifiers
+            for path in directory.rglob("*.npz"):
+                _add_artifact(mutable, modality, path.stem, "npz", path)
+    directory = split_root / "voxels"
+    if directory.is_dir():
+        for path in directory.rglob("*.ply"):
+            _add_artifact(mutable, "voxels", path.stem, "ply", path)
+    directory = split_root / "mesh_normalized"
+    if directory.is_dir():
+        for path in directory.rglob("bounding_box.json"):
+            _add_artifact(
+                mutable, "mesh_normalized", path.parent.name, "bounding_box", path
+            )
+        for path in directory.rglob("mesh.glb"):
+            _add_artifact(mutable, "mesh_normalized", path.parent.name, "mesh", path)
+    return {
+        modality: {
+            object_id: {
+                artifact: tuple(sorted(set(paths), key=lambda item: item.as_posix()))
+                for artifact, paths in artifacts.items()
+            }
+            for object_id, artifacts in objects.items()
+        }
+        for modality, objects in mutable.items()
+    }
 
 
-def _unique_match(directory: Path, pattern: str, object_id: str) -> Optional[Path]:
-    if not directory.is_dir():
-        return None
-    matches = sorted(path for path in directory.rglob(pattern) if path.stem == object_id or path.parent.name == object_id)
+_MODALITY_ARTIFACT_REQUIREMENTS: dict[str, tuple[str, ...]] = {
+    **{name: ("transforms",) for name in _VIEW_MODALITIES},
+    **{name: ("npz",) for name in _ARRAY_MODALITIES},
+    "voxels": ("ply",),
+    "mesh_normalized": ("bounding_box", "mesh"),
+}
+
+
+def _modality_is_available(location: _ObjectLocation, modality: str) -> bool:
+    artifacts = location.artifacts.get(modality, {})
+    return all(
+        len(artifacts.get(name, ())) == 1
+        for name in _MODALITY_ARTIFACT_REQUIREMENTS[modality]
+    )
+
+
+def _ambiguous_modality_artifacts(
+    location: _ObjectLocation, modality: str
+) -> tuple[str, ...]:
+    artifacts = location.artifacts.get(modality, {})
+    return tuple(
+        name
+        for name in _MODALITY_ARTIFACT_REQUIREMENTS[modality]
+        if len(artifacts.get(name, ())) > 1
+    )
+
+
+def _validate_modality_policy(
+    primary_modalities: Sequence[str],
+    required_modalities: Sequence[str],
+    optional_modalities: Sequence[str],
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...]]:
+    primary = tuple(dict.fromkeys(primary_modalities))
+    required = tuple(dict.fromkeys(required_modalities))
+    optional = tuple(dict.fromkeys(optional_modalities))
+    unknown = sorted((set(primary) | set(required) | set(optional)) - set(MESHFLEET_MODALITIES))
+    if unknown:
+        raise ValueError(f"unknown MeshFleet modalities: {','.join(unknown)}")
+    if not primary:
+        raise ValueError("at least one primary discovery modality is required")
+    overlap = sorted(set(required) & set(optional))
+    if overlap:
+        raise ValueError(
+            "required and optional MeshFleet modalities overlap: " + ",".join(overlap)
+        )
+    return primary, required, optional
+
+
+def _discover_object_locations(
+    root: Path,
+    split: str,
+    primary_modalities: Sequence[str] = DEFAULT_PRIMARY_MODALITIES,
+) -> tuple[_ObjectLocation, ...]:
+    locations: dict[str, _ObjectLocation] = {}
+    for split_root in _discover_split_roots(root, split):
+        index = _index_split_modalities(split_root)
+        candidate_ids: set[str] = set()
+        for modality in primary_modalities:
+            candidate_ids.update(index.get(modality, {}))
+        for object_id in sorted(candidate_ids):
+            artifacts = {
+                modality: objects[object_id]
+                for modality, objects in index.items()
+                if object_id in objects
+            }
+            location = _ObjectLocation(split, split_root, object_id, artifacts)
+            previous = locations.get(object_id)
+            if previous is not None and previous != location:
+                raise ValueError(
+                    f"object {object_id} occurs in multiple {split} dataset shards: "
+                    f"{previous.split_root}, {split_root}"
+                )
+            locations[object_id] = location
+    return tuple(locations[key] for key in sorted(locations))
+
+
+def _location_match(
+    location: _ObjectLocation,
+    modality: str,
+    pattern: str,
+) -> Optional[Path]:
+    artifact = {
+        "transforms.json": "transforms",
+        "*.npz": "npz",
+        "*.ply": "ply",
+        "mesh.ply": "mesh",
+        "bounding_box.json": "bounding_box",
+    }.get(pattern)
+    if artifact is None:
+        raise ValueError(f"unsupported indexed MeshFleet artifact pattern {pattern!r}")
+    matches = location.artifacts.get(modality, {}).get(artifact, ())
     if len(matches) > 1:
-        raise ValueError(f"ambiguous {pattern} records for object {object_id}: {matches}")
+        raise ValueError(
+            f"ambiguous {modality}/{pattern} for object {location.object_id}: {matches}"
+        )
     return matches[0] if matches else None
 
 
@@ -670,24 +899,81 @@ def build_meshfleet_manifest(
     splits: Sequence[str] = ("train", "test"),
     inspect_image_headers: bool = True,
     object_ids: Optional[Sequence[str]] = None,
+    object_id_file: Optional[str | Path] = None,
+    primary_modalities: Sequence[str] = DEFAULT_PRIMARY_MODALITIES,
+    required_modalities: Sequence[str] = DEFAULT_REQUIRED_MODALITIES,
+    optional_modalities: Sequence[str] = DEFAULT_OPTIONAL_MODALITIES,
 ) -> dict[str, Any]:
-    """Audit all physical modalities and write deterministic JSON Lines records."""
+    """Build the required-modality intersection and audit every valid object.
+
+    Candidate IDs are the union found in ``primary_modalities``.  A candidate
+    enters the manifest iff every ``required_modalities`` artifact contract is
+    satisfied.  Missing optional modalities are recorded but never reject an
+    otherwise valid object.
+    """
 
     root = Path(root).resolve()
     output_path = Path(output_path)
+    if object_ids is not None and object_id_file is not None:
+        raise ValueError("use either object_ids or object_id_file, not both")
+    if object_id_file is not None:
+        object_ids = load_meshfleet_object_ids(object_id_file)
+    primary_modalities, required_modalities, optional_modalities = (
+        _validate_modality_policy(
+            primary_modalities, required_modalities, optional_modalities
+        )
+    )
     records: list[ObjectManifestRecord] = []
+    rejected: list[dict[str, Any]] = []
     split_counts: dict[str, int] = {}
+    candidate_counts: dict[str, int] = {}
+    rejected_counts: dict[str, int] = {}
+    availability_counts: dict[str, dict[str, int]] = {}
     requested_ids = set(object_ids) if object_ids is not None else None
+    discovered_by_split: dict[str, set[str]] = {}
     for split in splits:
-        split_root = root / split
-        if not split_root.is_dir():
-            split_counts[split] = 0
-            continue
-        identifiers = sorted(_discover_object_ids(split_root))
+        locations = _discover_object_locations(root, split, primary_modalities)
+        discovered = {location.object_id for location in locations}
+        discovered_by_split[split] = discovered
         if requested_ids is not None:
-            identifiers = [value for value in identifiers if value in requested_ids]
-        split_counts[split] = len(identifiers)
-        for object_id in identifiers:
+            locations = tuple(
+                location
+                for location in locations
+                if location.object_id in requested_ids
+            )
+        candidate_counts[split] = len(locations)
+        split_counts[split] = 0
+        rejected_counts[split] = 0
+        availability_counts[split] = {name: 0 for name in MESHFLEET_MODALITIES}
+        for location in locations:
+            object_id = location.object_id
+            available_modalities = tuple(
+                name for name in MESHFLEET_MODALITIES
+                if _modality_is_available(location, name)
+            )
+            for modality in available_modalities:
+                availability_counts[split][modality] += 1
+            missing_required = tuple(
+                name for name in required_modalities
+                if name not in available_modalities
+            )
+            if missing_required:
+                rejected_counts[split] += 1
+                rejected.append(
+                    {
+                        "object_id": object_id,
+                        "split": split,
+                        "available_modalities": list(available_modalities),
+                        "missing_required_modalities": list(missing_required),
+                        "ambiguous_required_artifacts": {
+                            name: list(_ambiguous_modality_artifacts(location, name))
+                            for name in missing_required
+                            if _ambiguous_modality_artifacts(location, name)
+                        },
+                    }
+                )
+                continue
+            split_counts[split] += 1
             record = ObjectManifestRecord(
                 schema=MANIFEST_SCHEMA,
                 object_id=object_id,
@@ -698,8 +984,43 @@ def build_meshfleet_manifest(
                     "pseudo_label": [],
                 },
             )
+            record.discovery = {
+                "candidate_source_modalities": [
+                    name for name in primary_modalities
+                    if name in location.artifacts
+                ],
+                "required_modalities": list(required_modalities),
+                "optional_modalities": list(optional_modalities),
+                "available_modalities": list(available_modalities),
+                "missing_optional_modalities": [
+                    name for name in optional_modalities
+                    if name not in available_modalities
+                ],
+                "ambiguous_optional_artifacts": {
+                    name: list(_ambiguous_modality_artifacts(location, name))
+                    for name in optional_modalities
+                    if _ambiguous_modality_artifacts(location, name)
+                },
+                "structural_map": {
+                    modality: {
+                        artifact: [_relative(path, root) for path in paths]
+                        for artifact, paths in sorted(artifacts.items())
+                    }
+                    for modality, artifacts in sorted(location.artifacts.items())
+                },
+            }
+            record.checks["storage_layout"] = location.layout
+            record.checks["split_root"] = _relative(location.split_root, root)
             for view_name in _VIEW_MODALITIES:
-                manifest = _unique_match(split_root / view_name, "transforms.json", object_id)
+                view_paths = location.artifacts.get(view_name, {}).get(
+                    "transforms", ()
+                )
+                if len(view_paths) > 1:
+                    record.warnings.append(
+                        f"{view_name}: multiple camera manifests are ambiguous and were omitted"
+                    )
+                    continue
+                manifest = _location_match(location, view_name, "transforms.json")
                 if manifest is None:
                     continue
                 audit = _audit_camera_set(manifest.parent, root, inspect_image_headers)
@@ -712,14 +1033,27 @@ def build_meshfleet_manifest(
                         f"{view_name}: {audit['missing_frame_count']} declared frames have no physical image"
                     )
             for modality in _ARRAY_MODALITIES:
-                path = _unique_match(split_root / modality, "*.npz", object_id)
+                array_paths = location.artifacts.get(modality, {}).get("npz", ())
+                if len(array_paths) > 1:
+                    record.warnings.append(
+                        f"{modality}: multiple model variants are ambiguous and were omitted"
+                    )
+                    continue
+                path = _location_match(location, modality, "*.npz")
                 if path is None:
                     continue
                 metadata = _array_metadata(path)
                 metadata["path"] = _relative(path, root)
                 record.modalities[modality] = metadata
                 record.supervision["pseudo_label"].append(modality)
-            voxel = _unique_match(split_root / "voxels", "*.ply", object_id)
+            voxel_paths = location.artifacts.get("voxels", {}).get("ply", ())
+            if len(voxel_paths) > 1:
+                record.warnings.append(
+                    "voxels: multiple physical variants are ambiguous and were omitted"
+                )
+                voxel = None
+            else:
+                voxel = _location_match(location, "voxels", "*.ply")
             if voxel is not None:
                 record.modalities["surface_voxels"] = {
                     "path": _relative(voxel, root),
@@ -728,7 +1062,14 @@ def build_meshfleet_manifest(
                 }
                 record.supervision["ground_truth"].append("surface_voxels")
                 record.supervision["derived"].extend(("surface_distance", "surface_occupancy"))
-            render_mesh = _unique_match(split_root / "renders", "mesh.ply", object_id)
+            render_mesh_paths = location.artifacts.get("renders", {}).get("mesh", ())
+            if len(render_mesh_paths) > 1:
+                record.warnings.append(
+                    "renders: multiple mesh variants are ambiguous and were omitted"
+                )
+                render_mesh = None
+            else:
+                render_mesh = _location_match(location, "renders", "mesh.ply")
             if render_mesh is not None:
                 topology_audit = _triangle_mesh_topology(render_mesh)
                 render_mesh_path = _relative(render_mesh, root)
@@ -811,7 +1152,9 @@ def build_meshfleet_manifest(
                         "target_stratum": None,
                     },
                 }
-            bounding_box = _unique_match(split_root / "mesh_normalized", "bounding_box.json", object_id)
+            bounding_box = _location_match(
+                location, "mesh_normalized", "bounding_box.json"
+            )
             normalized_mesh = bounding_box.parent / "mesh.glb" if bounding_box is not None else None
             if bounding_box is not None:
                 record.modalities["normalized_bounding_box"] = {
@@ -855,17 +1198,73 @@ def build_meshfleet_manifest(
                     if not equal:
                         record.warnings.append("surface voxel and DINO feature sparse coordinates differ")
             records.append(record)
+    discovered_union = set().union(*discovered_by_split.values())
+    duplicated_across_splits = sorted(
+        identifier
+        for identifier in discovered_union
+        if sum(identifier in values for values in discovered_by_split.values()) > 1
+    )
+    if duplicated_across_splits:
+        raise ValueError(
+            "MeshFleet train/test leakage: object IDs occur in multiple splits: "
+            + ",".join(duplicated_across_splits[:16])
+        )
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with output_path.open("w", encoding="utf8", newline="\n") as file:
         for record in records:
-            file.write(json.dumps(asdict(record), sort_keys=True, separators=(",", ":")) + "\n")
+            file.write(
+                json.dumps(asdict(record), sort_keys=True, separators=(",", ":"))
+                + "\n"
+            )
+    rejected_path = output_path.with_suffix(output_path.suffix + ".rejected.jsonl")
+    with rejected_path.open("w", encoding="utf8", newline="\n") as file:
+        for rejection in rejected:
+            file.write(
+                json.dumps(rejection, sort_keys=True, separators=(",", ":"))
+                + "\n"
+            )
+    manifest_ids = {record.object_id for record in records}
+    missing_requested = (
+        sorted(requested_ids - manifest_ids) if requested_ids is not None else []
+    )
     summary = {
         "schema": MANIFEST_SCHEMA,
         "dataset_root": str(root),
         "record_count": len(records),
         "split_counts": split_counts,
+        "candidate_counts": candidate_counts,
+        "rejected_counts": rejected_counts,
+        "modality_availability_counts": availability_counts,
+        "discovery_policy": {
+            "layout": "modality-centric",
+            "primary_modalities": list(primary_modalities),
+            "required_modalities": list(required_modalities),
+            "optional_modalities": list(optional_modalities),
+        },
+        "discovered_object_ids_sha256": meshfleet_object_id_digest(
+            tuple(manifest_ids)
+        ),
         "warning_count": sum(len(record.warnings) for record in records),
         "manifest": str(output_path.resolve()),
+        "rejected_manifest": str(rejected_path.resolve()),
+        "object_id_catalog": {
+            "enabled": requested_ids is not None,
+            "count": len(requested_ids) if requested_ids is not None else None,
+            "sha256": (
+                meshfleet_object_id_digest(tuple(requested_ids))
+                if requested_ids is not None
+                else None
+            ),
+            "discovered_count": len(manifest_ids),
+            "missing_count": len(missing_requested),
+            "missing_ids": missing_requested,
+            "unlisted_discovered_count": (
+                len(discovered_union - requested_ids)
+                if requested_ids is not None
+                else 0
+            ),
+        },
+        "split_disjoint": True,
     }
     summary_path = output_path.with_suffix(output_path.suffix + ".summary.json")
     summary_path.write_text(json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf8")
@@ -883,6 +1282,92 @@ def load_meshfleet_manifest(path: str | Path) -> list[ObjectManifestRecord]:
             except Exception as error:
                 raise ValueError(f"invalid manifest record at line {line_number}") from error
     return records
+
+
+def meshfleet_record_admission_reasons(
+    record: ObjectManifestRecord,
+    config: MeshFleetDatasetConfig,
+) -> tuple[str, ...]:
+    """Return every reason an object is incomplete for the requested task.
+
+    Completeness is configuration-relative: only the selected input view set
+    and modalities actually consumed by a run are required. Optional camera
+    sets such as ``renders_cond`` do not invalidate an otherwise complete
+    training object.
+    """
+
+    reasons: list[str] = []
+    view = record.views.get(config.input_view_set)
+    if view is None:
+        reasons.append(f"missing view set {config.input_view_set}")
+    else:
+        count = int(view.get("available_frame_count", 0))
+        if count < config.minimum_views:
+            reasons.append(
+                f"{config.input_view_set} has {count} physical frames; requires {config.minimum_views}"
+            )
+        if config.require_complete_input_view_set and int(
+            view.get("missing_frame_count", 0)
+        ) != 0:
+            reasons.append(f"{config.input_view_set} has missing declared frames")
+        if config.require_normalization and "aabb" not in view:
+            reasons.append(f"{config.input_view_set} lacks canonical normalization aabb")
+
+    required_modalities: list[tuple[bool, str, tuple[str, ...]]] = [
+        (
+            config.require_surface_voxels,
+            "surface_voxels",
+            (),
+        ),
+        (
+            config.require_requested_modalities and config.load_trellis_features,
+            "features",
+            ("indices", "patchtokens"),
+        ),
+        (
+            config.require_requested_modalities and config.load_trellis_latents,
+            "latents",
+            ("coords", "feats"),
+        ),
+        (
+            config.require_requested_modalities and config.load_structure_latent,
+            "ss_latents",
+            ("mean",),
+        ),
+        (config.require_render_mesh, "render_mesh", ()),
+    ]
+    for required, modality_name, required_arrays in required_modalities:
+        if not required:
+            continue
+        modality = record.modalities.get(modality_name)
+        if modality is None:
+            reasons.append(f"missing required modality {modality_name}")
+            continue
+        arrays = modality.get("arrays", {})
+        missing_arrays = [name for name in required_arrays if name not in arrays]
+        if missing_arrays:
+            reasons.append(
+                f"{modality_name} is missing arrays {','.join(missing_arrays)}"
+            )
+
+    if config.require_surface_voxels:
+        grid = record.checks.get("surface_voxel_grid")
+        if not isinstance(grid, Mapping):
+            reasons.append("surface voxel grid audit is missing")
+        else:
+            if int(grid.get("resolution", -1)) != config.surface_grid_resolution:
+                reasons.append("surface voxel resolution differs from configuration")
+            if not bool(grid.get("indices_in_bounds", False)):
+                reasons.append("surface voxel indices are outside the canonical grid")
+            if float(grid.get("maximum_center_residual", float("inf"))) > 1.0e-6:
+                reasons.append("surface voxel samples are not cell-center aligned")
+    if config.load_trellis_features and config.load_trellis_latents:
+        if record.checks.get("feature_indices_equal_latent_coords") is not True:
+            reasons.append("DINO and TRELLIS sparse coordinates are not aligned")
+    if config.require_surface_voxels and config.load_trellis_features:
+        if record.checks.get("surface_voxel_indices_equal_feature_indices") is not True:
+            reasons.append("surface and DINO sparse coordinates are not aligned")
+    return tuple(reasons)
 
 
 def _frame_angles(frame: Mapping[str, Any], metadata: Mapping[str, Any]) -> tuple[float, float]:
@@ -957,6 +1442,54 @@ class MeshFleetObjectDataset:
             raise ValueError("MeshFleetObjectDataset requires an audited manifest; run build_meshfleet_manifest first")
         records = load_meshfleet_manifest(manifest_path)
         self.manifest_sha256 = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        summary_path = manifest_path.with_suffix(manifest_path.suffix + ".summary.json")
+        if summary_path.is_file():
+            summary = json.loads(summary_path.read_text(encoding="utf8"))
+            try:
+                summary_root = Path(str(summary["dataset_root"])).resolve()
+            except (KeyError, TypeError, ValueError) as error:
+                raise ValueError("MeshFleet manifest summary has no valid dataset root") from error
+            if summary_root != self.root:
+                raise ValueError(
+                    "MeshFleet manifest summary belongs to a different dataset root"
+                )
+        self.object_ids = (
+            load_meshfleet_object_ids(config.object_id_file)
+            if config.object_id_file is not None
+            else None
+        )
+        self.object_id_catalog_sha256 = (
+            meshfleet_object_id_digest(self.object_ids)
+            if self.object_ids is not None
+            else None
+        )
+        if self.object_ids is not None:
+            if not summary_path.is_file():
+                raise ValueError("catalog-filtered MeshFleet loading requires the manifest summary")
+            summary = json.loads(summary_path.read_text(encoding="utf8"))
+            catalog_contract = summary.get("object_id_catalog", {})
+            if (
+                not isinstance(catalog_contract, Mapping)
+                or catalog_contract.get("enabled") is not True
+                or catalog_contract.get("count") != len(self.object_ids)
+                or catalog_contract.get("sha256") != self.object_id_catalog_sha256
+            ):
+                raise ValueError(
+                    "MeshFleet manifest was not built from the configured object ID catalog"
+                )
+        catalog = set(self.object_ids) if self.object_ids is not None else None
+        membership: dict[str, set[str]] = {}
+        for record in records:
+            membership.setdefault(record.object_id, set()).add(record.split)
+        leaked = sorted(
+            object_id for object_id, record_splits in membership.items()
+            if len(record_splits) > 1
+        )
+        if leaked:
+            raise ValueError(
+                "MeshFleet manifest contains train/test object leakage: "
+                + ",".join(leaked[:16])
+            )
         self.teacher_bundle_root = (
             Path(config.teacher_bundle_root).resolve()
             if config.teacher_bundle_root is not None
@@ -967,18 +1500,12 @@ class MeshFleetObjectDataset:
         for record in records:
             if record.split != config.split:
                 continue
-            view = record.views.get(config.input_view_set)
-            if view is None:
-                self.excluded[record.object_id] = f"missing view set {config.input_view_set}"
+            if catalog is not None and record.object_id not in catalog:
+                self.excluded[record.object_id] = "object is absent from configured ID catalog"
                 continue
-            count = int(view.get("available_frame_count", 0))
-            if count < config.minimum_views:
-                self.excluded[record.object_id] = (
-                    f"{config.input_view_set} has {count} physical frames; requires {config.minimum_views}"
-                )
-                continue
-            if config.require_surface_voxels and "surface_voxels" not in record.modalities:
-                self.excluded[record.object_id] = "missing required surface voxel PLY"
+            reasons = meshfleet_record_admission_reasons(record, config)
+            if reasons:
+                self.excluded[record.object_id] = "; ".join(reasons)
                 continue
             if (
                 config.require_teacher_bundle
@@ -988,10 +1515,29 @@ class MeshFleetObjectDataset:
                 self.excluded[record.object_id] = "missing required refined teacher bundle"
                 continue
             self.records.append(record)
+        admitted = {record.object_id for record in self.records}
+        present_in_split = {
+            record.object_id for record in records if record.split == config.split
+        }
+        self.coverage = {
+            "split": config.split,
+            "catalog_enabled": catalog is not None,
+            "catalog_count": len(catalog) if catalog is not None else None,
+            "catalog_sha256": self.object_id_catalog_sha256,
+            "present_in_split_count": len(present_in_split),
+            "admitted_count": len(admitted),
+            "excluded_count": len(self.excluded),
+            "catalog_ids_absent_from_split": (
+                sorted(catalog - present_in_split) if catalog is not None else []
+            ),
+        }
         if not self.records:
             detail = "; ".join(f"{key}: {value}" for key, value in sorted(self.excluded.items()))
             raise ValueError(f"no usable MeshFleet objects for split {config.split!r}. {detail}")
         self.epoch = 0
+
+    def _path(self, relative: str | Path) -> Path:
+        return _resolve_manifest_path(self.root, relative)
 
     def __len__(self) -> int:
         return len(self.records)
@@ -1001,7 +1547,7 @@ class MeshFleetObjectDataset:
 
     def _frame_inventory(self, record: ObjectManifestRecord) -> tuple[dict[str, Any], list[dict[str, Any]]]:
         view = record.views[self.config.input_view_set]
-        transform_path = self.root / view["transforms"]
+        transform_path = self._path(view["transforms"])
         metadata = json.loads(transform_path.read_text(encoding="utf8"))
         by_index = {int(entry["frame_index"]): entry for entry in view["available_frames"]}
         inventory: list[dict[str, Any]] = []
@@ -1011,7 +1557,7 @@ class MeshFleetObjectDataset:
             entry = dict(frame)
             entry["physical_file"] = by_index[index]["file"]
             entry["frame_index"] = index
-            path = self.root / entry["physical_file"]
+            path = self._path(entry["physical_file"])
             if self.config.verify_files_at_load and not path.is_file():
                 raise FileNotFoundError(f"manifest frame disappeared from disk: {path}")
             inventory.append(entry)
@@ -1046,7 +1592,7 @@ class MeshFleetObjectDataset:
         frame_indices: list[int] = []
         background = torch.tensor(self.config.background_rgb, dtype=torch.float32)[:, None, None]
         for frame in frames:
-            image_path = self.root / frame["physical_file"]
+            image_path = self._path(frame["physical_file"])
             with Image.open(image_path) as source:
                 rgba = source.convert("RGBA")
                 native_width, native_height = rgba.size
@@ -1101,11 +1647,17 @@ class MeshFleetObjectDataset:
             "supervision_provenance": record.supervision,
             "topology_supervision": record.topology_supervision,
             "modality_paths": {
-                name: str(self.root / value["path"])
+                name: str(self._path(value["path"]))
                 for name, value in record.modalities.items()
                 if "path" in value
             },
             "dataset_warnings": tuple(record.warnings),
+            "available_modalities": tuple(
+                record.discovery.get("available_modalities", ())
+            ),
+            "missing_optional_modalities": tuple(
+                record.discovery.get("missing_optional_modalities", ())
+            ),
             "surface_grid_resolution": self.config.surface_grid_resolution,
             "surface_cell_size": 1.0 / self.config.surface_grid_resolution,
             "dino_pseudo_supervision_mask": torch.tensor(False, dtype=torch.bool),
@@ -1229,7 +1781,7 @@ class MeshFleetObjectDataset:
 
         cfg = self.config
         if cfg.load_surface_voxels and "surface_voxels" in record.modalities:
-            points = _read_surface_ply(self.root / record.modalities["surface_voxels"]["path"])
+            points = _read_surface_ply(self._path(record.modalities["surface_voxels"]["path"]))
             result["surface_voxel_centers"] = points
             resolution = float(cfg.surface_grid_resolution)
             grid = torch.round((points + 0.5) * resolution - 0.5).to(torch.int64)
@@ -1245,7 +1797,7 @@ class MeshFleetObjectDataset:
                 )
             result["surface_voxel_indices"] = grid
         if cfg.load_trellis_features and "features" in record.modalities:
-            with np.load(self.root / record.modalities["features"]["path"], allow_pickle=False) as archive:
+            with np.load(self._path(record.modalities["features"]["path"]), allow_pickle=False) as archive:
                 result["trellis_feature_indices"] = torch.from_numpy(np.array(archive["indices"], copy=True)).long()
                 result["trellis_patchtokens"] = torch.from_numpy(np.array(archive["patchtokens"], copy=True))
             result["dino_pseudo_confidence"] = torch.tensor(
@@ -1256,7 +1808,7 @@ class MeshFleetObjectDataset:
             )
             result["dino_pseudo_provenance"] = "pretrained_dinov2_surface_feature"
         if cfg.load_trellis_latents and "latents" in record.modalities:
-            with np.load(self.root / record.modalities["latents"]["path"], allow_pickle=False) as archive:
+            with np.load(self._path(record.modalities["latents"]["path"]), allow_pickle=False) as archive:
                 result["trellis_latent_coords"] = torch.from_numpy(np.array(archive["coords"], copy=True)).long()
                 result["trellis_latent_features"] = torch.from_numpy(np.array(archive["feats"], copy=True))
             result["trellis_latent_pseudo_confidence"] = torch.tensor(
@@ -1269,7 +1821,7 @@ class MeshFleetObjectDataset:
                 "pretrained_trellis_structured_latent_encoder"
             )
         if cfg.load_structure_latent and "ss_latents" in record.modalities:
-            with np.load(self.root / record.modalities["ss_latents"]["path"], allow_pickle=False) as archive:
+            with np.load(self._path(record.modalities["ss_latents"]["path"]), allow_pickle=False) as archive:
                 keys = sorted(archive.files)
                 if keys != ["mean"]:
                     raise ValueError(f"unsupported structure latent fields: {keys}")
@@ -1324,6 +1876,10 @@ def meshfleet_single_object_collate(batch: list[dict[str, object]]) -> dict[str,
 
 
 __all__ = [
+    "DEFAULT_OPTIONAL_MODALITIES",
+    "DEFAULT_PRIMARY_MODALITIES",
+    "DEFAULT_REQUIRED_MODALITIES",
+    "MESHFLEET_MODALITIES",
     "MANIFEST_SCHEMA",
     "MeshFleetDatasetConfig",
     "MeshFleetObjectDataset",
@@ -1331,6 +1887,9 @@ __all__ = [
     "build_meshfleet_manifest",
     "intrinsics_from_fov",
     "load_meshfleet_manifest",
+    "load_meshfleet_object_ids",
+    "meshfleet_object_id_digest",
+    "meshfleet_record_admission_reasons",
     "meshfleet_single_object_collate",
     "opengl_c2w_to_opencv_c2w",
     "topology_supervision_is_admissible",

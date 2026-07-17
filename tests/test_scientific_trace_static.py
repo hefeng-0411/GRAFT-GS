@@ -193,11 +193,14 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn('[sys.executable, "-m", "pip", "check"]', validator)
         self.assertIn('record["accelerator"] = accelerator', validator)
         self.assertIn('details.get("torch_cuda") != "11.8"', validator)
-        self.assertIn("c9028d206944a33af776f1b6967a6d82af385e97", validator)
-        self.assertIn("_inspect_manifest_contract(manifest, dataset_root)", validator)
+        self.assertIn('"/mnt/sda2/hef/Base/dataset"', validator)
+        self.assertNotIn("canonical schema ID", validator)
+        self.assertIn("_inspect_manifest_contract(manifest, dataset_root, object_ids)", validator)
         self.assertIn("_manifest_requires_rebuild(args.rebuild_manifest, manifest_audit)", validator)
         self.assertIn("EXPECTED_MESHFLEET_SCHEMA", validator)
-        self.assertIn("len(canonical_splits) != 1", validator)
+        self.assertIn('"--object-id-file"', validator)
+        self.assertIn("manifest missing-ID inventory differs", validator)
+        self.assertIn("dynamic dataset discovery produced an empty manifest", validator)
         self.assertIn('test_environment["GRAFT_GS_MESHFLEET_ROOT"]', validator)
         self.assertIn("unexpected_skip_reasons", validator)
         self.assertIn("requirements_sha256", environment)
@@ -219,6 +222,17 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn('--requirements "$ROOT/requirements.txt"', launcher)
         self.assertIn('"$PYTHON_BIN" -m torch.distributed.run', launcher)
         self.assertNotIn("\ntorchrun \\", launcher)
+
+    def test_training_uses_catalog_filtered_complete_meshfleet_records(self) -> None:
+        meshfleet = source("graft_gs/data/meshfleet.py")
+        trainer = source("scripts/train_a800.py")
+        config = source("configs/graft_gs_a800_native.yaml")
+        self.assertIn("def load_meshfleet_object_ids", meshfleet)
+        self.assertIn("def meshfleet_record_admission_reasons", meshfleet)
+        self.assertIn("object is absent from configured ID catalog", meshfleet)
+        self.assertIn("dataset_object_id_catalog_sha256=object_id_digest", trainer)
+        self.assertIn("dataset_coverage_", trainer)
+        self.assertNotIn("object_id_file:", config)
 
 
 if __name__ == "__main__":

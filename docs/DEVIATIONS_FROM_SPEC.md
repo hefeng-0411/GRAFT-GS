@@ -137,3 +137,10 @@
     records the `requirements.txt` SHA-256. This is an execution-contract
     strengthening, not evidence that dependency identity alone validates the
     numerical architecture.
+30. **Physical modality intersection replaces enumerated dataset membership.**
+    The specification assumes an object dataset but does not define how a
+    partially completed, modality-centric preprocessing corpus determines
+    membership. The implementation uses a primary-modality union followed by
+    a configurable required-modality intersection, records optional absence,
+    and retains rejected candidates separately. An optional ID file can narrow
+    the result but is never the default source of truth.

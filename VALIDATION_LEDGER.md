@@ -177,3 +177,28 @@ Exact next server command is the reference invocation in
 declared requirements, dataset root, manifest, and JSON output arguments. Its
 result remains pending and must replace—not be merged with—the failing supplied
 76-test report.
+
+Dynamic dataset discovery cycle (2026-07-17): whole-tree `compileall` passed
+under the bundled Python 3.12 runtime. A real local manifest was regenerated
+from `D:\VsCode\MVG\Base\MeshFleet_TRELLIS`; it found one primary candidate,
+admitted that candidate through the required intersection, recorded all nine
+available modalities, preserved the audited non-manifold topology contract,
+and produced zero rejections. The focused command executed 43 tests: 42 passed
+and one tensor-loader execution was skipped because the bundled desktop Python
+has no PyTorch. The passing cases include synthetic multi-split discovery,
+model-nested latent paths, incomplete-required rejection, optional-modality
+retention, deterministic manifest/rejection bytes, real-manifest deterministic
+regeneration, stale remote-manifest rejection, many-object order independence,
+and all scientific production-path static guards. A follow-up ambiguity and
+path-containment increment raised the final focused inventory to 49 tests: 48
+passed and the same one PyTorch-dependent loader execution remained skipped.
+It verifies that multiple optional model variants are recorded but not guessed
+and that a manifest path cannot escape the configured root. The loader tensor
+case is implemented and server-ready but is not reported as locally passed.
+
+Exact local command:
+`C:\Users\10992\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe
+-m compileall -q graft_gs scripts tests`, followed by
+`-m unittest tests.test_meshfleet_dynamic_discovery
+tests.test_meshfleet_manifest_static tests.test_server_manifest_handoff_static
+tests.test_scientific_trace_static -v`.

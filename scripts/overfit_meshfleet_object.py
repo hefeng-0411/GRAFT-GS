@@ -35,6 +35,7 @@ def main() -> None:
     parser.add_argument("dataset_root", type=Path)
     parser.add_argument("manifest", type=Path)
     parser.add_argument("--split", default="test")
+    parser.add_argument("--object-id-file", type=Path)
     parser.add_argument("--object-id")
     parser.add_argument("--view-set", default="renders")
     parser.add_argument("--maximum-views", type=int, default=12)
@@ -48,6 +49,10 @@ def main() -> None:
     args = parser.parse_args()
 
     model_config, training_config, _, dataset_config = load_server_config(args.config)
+    configured_id_file = dataset_config.get("object_id_file")
+    object_id_file = args.object_id_file or (
+        Path(str(configured_id_file)) if configured_id_file is not None else None
+    )
     loss_weights = load_loss_weights(args.config)
     prior_config = load_trellis_prior_config(args.config)
     use_prior = bool(prior_config["enabled_after_phase_a"])
@@ -58,6 +63,7 @@ def main() -> None:
         MeshFleetDatasetConfig(
             root=args.dataset_root,
             manifest=args.manifest,
+            object_id_file=object_id_file,
             split=args.split,
             input_view_set=args.view_set,
             image_size=(int(image_size[0]), int(image_size[1])),
@@ -82,6 +88,14 @@ def main() -> None:
                 dataset_config.get("trellis_latent_pseudo_confidence", 0.5)
             ),
             require_surface_voxels=True,
+            require_requested_modalities=bool(
+                dataset_config.get("require_requested_modalities", True)
+            ),
+            require_complete_input_view_set=bool(
+                dataset_config.get("require_complete_input_view_set", True)
+            ),
+            require_normalization=bool(dataset_config.get("require_normalization", True)),
+            require_render_mesh=bool(dataset_config.get("require_render_mesh", False)),
             topology_supervision_mode=str(
                 dataset_config.get("topology_supervision_mode", "validated_or_repaired")
             ),

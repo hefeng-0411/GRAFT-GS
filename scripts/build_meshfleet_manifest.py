@@ -17,7 +17,7 @@ def _load_manifest_builder():
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
     spec.loader.exec_module(module)
-    return module.build_meshfleet_manifest
+    return module
 
 
 def main() -> None:
@@ -36,13 +36,61 @@ def main() -> None:
         dest="object_ids",
         help="audit only these object IDs; repeat for multiple objects",
     )
+    parser.add_argument(
+        "--object-id-file",
+        type=Path,
+        help="audit the validated 64-hex ID catalog across all selected splits",
+    )
+    parser.add_argument(
+        "--primary-modality",
+        action="append",
+        dest="primary_modalities",
+        help="candidate-ID source modality; repeat to form a union",
+    )
+    parser.add_argument(
+        "--required-modality",
+        action="append",
+        dest="required_modalities",
+        help="modality required for admission to the manifest; repeat as needed",
+    )
+    parser.add_argument(
+        "--optional-modality",
+        action="append",
+        dest="optional_modalities",
+        help="audited modality whose absence does not reject an object",
+    )
     args = parser.parse_args()
-    summary = _load_manifest_builder()(
+    module = _load_manifest_builder()
+    required_modalities = (
+        tuple(args.required_modalities)
+        if args.required_modalities
+        else module.DEFAULT_REQUIRED_MODALITIES
+    )
+    optional_modalities = (
+        tuple(args.optional_modalities)
+        if args.optional_modalities
+        else tuple(
+            name
+            for name in module.MESHFLEET_MODALITIES
+            if name not in required_modalities
+        )
+    )
+    summary = module.build_meshfleet_manifest(
         args.dataset_root,
         args.output,
         splits=args.splits,
         inspect_image_headers=not args.skip_image_headers,
         object_ids=args.object_ids,
+        object_id_file=args.object_id_file,
+        primary_modalities=(
+            args.primary_modalities or module.DEFAULT_PRIMARY_MODALITIES
+        ),
+        required_modalities=(
+            required_modalities
+        ),
+        optional_modalities=(
+            optional_modalities
+        ),
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
 

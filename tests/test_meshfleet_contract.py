@@ -30,7 +30,6 @@ from graft_gs.integration import GraftGS, GraftGSConfig
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-CANONICAL_OBJECT_ID = "17a53839ae5da04c75ea21335d4bdc8ddc26b45f7bb9d0e18f5afaa397e43a17"
 AUDIT_MANIFEST = Path(
     os.environ.get(
         "GRAFT_GS_MESHFLEET_MANIFEST",
@@ -42,7 +41,7 @@ LOCAL_DATASET = Path(
 )
 
 
-def _canonical_manifest_record():
+def _audited_nonmanifold_record():
     records = [
         json.loads(line)
         for line in AUDIT_MANIFEST.read_text(encoding="utf8").splitlines()
@@ -50,23 +49,30 @@ def _canonical_manifest_record():
     ]
     matches = [
         record for record in records
-        if record["object_id"] == CANONICAL_OBJECT_ID
+        if record.get("checks", {}).get("render_mesh_topology", {}).get(
+            "connected_components"
+        ) == 8
+        and record.get("checks", {}).get("render_mesh_topology", {}).get(
+            "nonmanifold_edge_count"
+        ) == 313
     ]
     if len(matches) != 1:
         raise AssertionError(
-            f"canonical object must occur exactly once, found {len(matches)}"
+            "audited non-manifold topology fixture must occur exactly once, "
+            f"found {len(matches)}"
         )
     return matches[0]
 
 
-def _canonical_dataset_index(dataset: MeshFleetObjectDataset) -> int:
+def _audited_dataset_index(dataset: MeshFleetObjectDataset) -> int:
+    audited_id = _audited_nonmanifold_record()["object_id"]
     matches = [
         index for index, record in enumerate(dataset.records)
-        if record.object_id == CANONICAL_OBJECT_ID
+        if record.object_id == audited_id
     ]
     if len(matches) != 1:
         raise AssertionError(
-            f"canonical dataset object must occur exactly once, found {len(matches)}"
+            f"audited dataset object must occur exactly once, found {len(matches)}"
         )
     return matches[0]
 
@@ -138,7 +144,7 @@ class CameraContractTest(unittest.TestCase):
 
 class MeshFleetAuditTest(unittest.TestCase):
     def test_checked_manifest_records_physical_schema(self) -> None:
-        record = _canonical_manifest_record()
+        record = _audited_nonmanifold_record()
         self.assertTrue(record["checks"]["feature_indices_equal_latent_coords"])
         self.assertTrue(record["checks"]["surface_voxel_indices_equal_feature_indices"])
         self.assertEqual(record["checks"]["surface_voxel_grid"]["maximum_center_residual"], 0.0)
@@ -164,7 +170,7 @@ class MeshFleetAuditTest(unittest.TestCase):
                 load_trellis_latents=True,
             )
         )
-        sample = dataset[_canonical_dataset_index(dataset)]
+        sample = dataset[_audited_dataset_index(dataset)]
         self.assertEqual(tuple(sample["images"].shape), (3, 3, 64, 64))
         self.assertEqual(tuple(sample["valid_mask"].shape), (3, 1, 64, 64))
         self.assertEqual(sample["valid_mask"].dtype, torch.bool)
@@ -223,7 +229,7 @@ class MeshFleetAuditTest(unittest.TestCase):
                 load_surface_voxels=True,
             )
         )
-        sample = dataset[_canonical_dataset_index(dataset)]
+        sample = dataset[_audited_dataset_index(dataset)]
         target = MeshGroundTruthRasterizer(torch.device("cuda"))(
             sample["modality_paths"]["render_mesh"],
             sample["extrinsics_world_to_camera"].cuda(),

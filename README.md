@@ -94,6 +94,15 @@ python scripts/build_meshfleet_manifest.py /data/MeshFleet_TRELLIS \
   data_manifests/meshfleet_server.jsonl
 ```
 
+Discovery is dynamic and modality-centric. Candidate IDs are collected once
+from `latents` and `mesh_normalized`; the default manifest intersection requires
+`renders`, `latents`, and a complete normalized mesh directory. DINO features,
+structure latents, conditional/evaluation renders, and surface voxels are
+optional at discovery time and are recorded explicitly when present or absent.
+Training phases apply their own stronger admission policy through the dataset
+configuration. Use repeated `--primary-modality`, `--required-modality`, and
+`--optional-modality` flags only when intentionally changing this contract.
+
 Run phases in order and initialize each new phase from the preceding model:
 
 ```bash

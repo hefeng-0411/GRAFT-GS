@@ -73,11 +73,11 @@ checkpoints, data, or a compiled server dependency.
   gradient, certificate-dtype, prior-reliability, remote-manifest, and strict
   environment repairs. The corrected suite must be rerun with
   `/mnt/sda1/miniforge3/envs/CRAFT/bin/python scripts/validate_server.py` and
-  the declared `/mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97`
+  the declared `/mnt/sda2/hef/Base/dataset`
   root. No corrected numerical result is claimed yet.
 - The manifest handoff now locally passes stale-schema, wrong-root,
-  record-count, canonical-identity, missing-summary, compatible-reuse, and
-  many-object ordering tests. What remains external is executing the full
+  record-count, modality-intersection, discovered-ID-digest, missing-summary,
+  compatible-reuse, and many-object ordering tests. What remains external is executing the full
   rebuild against the large mounted remote corpus and retaining its digest and
   measured build duration.
 - The reference command intentionally does not execute six-rank DDP or a real

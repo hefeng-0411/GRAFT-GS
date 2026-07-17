@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 
@@ -16,6 +17,8 @@ from graft_gs.data import (
     MANIFEST_SCHEMA,
     MeshFleetDatasetConfig,
     MeshFleetObjectDataset,
+    load_meshfleet_object_ids,
+    meshfleet_object_id_digest,
     meshfleet_single_object_collate,
     single_object_collate,
 )
@@ -34,6 +37,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("dataset", type=Path)
     parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--object-id-file", type=Path)
     parser.add_argument("--dataset-format", choices=("auto", "meshfleet", "folders"), default="auto")
     parser.add_argument("--split", default="train")
     parser.add_argument("--phase", choices=list("ABCDEF"), required=True)
@@ -53,6 +57,18 @@ def main() -> None:
     model_config, training_config, distributed_config, dataset_config = load_server_config(args.config)
     loss_weights = load_loss_weights(args.config)
     prior_config = load_trellis_prior_config(args.config)
+    configured_id_file = dataset_config.get("object_id_file")
+    object_id_file = args.object_id_file or (
+        Path(str(configured_id_file)) if configured_id_file is not None else None
+    )
+    object_ids = (
+        load_meshfleet_object_ids(object_id_file)
+        if object_id_file is not None
+        else None
+    )
+    object_id_digest = (
+        meshfleet_object_id_digest(object_ids) if object_ids is not None else None
+    )
     use_prior = bool(prior_config["enabled_after_phase_a"]) and phase is not TrainingPhase.EVIDENCE_CALIBRATION
     if use_prior and args.trellis_checkpoint is None:
         raise ValueError("Phases B-F require --trellis-checkpoint when the structured prior is enabled")
@@ -178,6 +194,11 @@ def main() -> None:
             or bool(distributed_config.get("synchronize_object_atlas", False)),
             dataset_manifest=str(args.manifest.resolve()) if args.manifest is not None else None,
             dataset_manifest_sha256=manifest_digest,
+            dataset_object_id_catalog=(
+                str(object_id_file.resolve()) if object_id_file is not None else None
+            ),
+            dataset_object_id_catalog_sha256=object_id_digest,
+            dataset_object_id_count=len(object_ids) if object_ids is not None else None,
             dataset_split=args.split if args.manifest is not None else None,
             dataset_view_set=str(dataset_config.get("input_view_set", "renders"))
             if args.manifest is not None
@@ -266,6 +287,7 @@ def main() -> None:
             MeshFleetDatasetConfig(
                 root=args.dataset,
                 manifest=args.manifest,
+                object_id_file=object_id_file,
                 split=args.split,
                 input_view_set=str(dataset_config.get("input_view_set", "renders")),
                 image_size=(int(image_size[0]), int(image_size[1])),
@@ -292,6 +314,16 @@ def main() -> None:
                     dataset_config.get("trellis_latent_pseudo_confidence", 0.5)
                 ),
                 require_surface_voxels=bool(dataset_config.get("require_surface_voxels", True)),
+                require_requested_modalities=bool(
+                    dataset_config.get("require_requested_modalities", True)
+                ),
+                require_complete_input_view_set=bool(
+                    dataset_config.get("require_complete_input_view_set", True)
+                ),
+                require_normalization=bool(
+                    dataset_config.get("require_normalization", True)
+                ),
+                require_render_mesh=bool(dataset_config.get("require_render_mesh", False)),
                 topology_supervision_mode=str(
                     dataset_config.get("topology_supervision_mode", "validated_or_repaired")
                 ),
@@ -309,6 +341,24 @@ def main() -> None:
             )
         )
         collate = meshfleet_single_object_collate
+        if trainer.context.rank == 0:
+            coverage_path = Path(args.output) / f"dataset_coverage_{args.split}.json"
+            coverage_path.parent.mkdir(parents=True, exist_ok=True)
+            coverage_path.write_text(
+                json.dumps(
+                    {
+                        "coverage": dataset.coverage,
+                        "admitted_object_ids": [
+                            record.object_id for record in dataset.records
+                        ],
+                        "excluded": dataset.excluded,
+                    },
+                    indent=2,
+                    sort_keys=True,
+                )
+                + "\n",
+                encoding="utf8",
+            )
     else:
         dataset = FolderMultiviewDataset(
             args.dataset,

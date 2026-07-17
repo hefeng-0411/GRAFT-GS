@@ -11,7 +11,7 @@ export VGGT_CHECKPOINT=/checkpoints/VGGT-1B
 export TRELLIS_CHECKPOINT=/checkpoints/TRELLIS-image-large
 export GRAFT_GS_CHECKPOINT=/checkpoints/graft-gs-phase-f.pt
 export GRAFT_GS_REAL_IMAGE_DIR=/data/real_multiview_object/images
-export GRAFT_GS_MESHFLEET_ROOT=/mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97
+export GRAFT_GS_MESHFLEET_ROOT=/mnt/sda2/hef/Base/dataset
 export GRAFT_GS_MESHFLEET_MANIFEST=$PWD/outputs/validation/meshfleet_server.jsonl
 export GRAFT_GS_TEACHER_BUNDLES=/data/graft_gs_teacher_bundles
 export GRAFT_GS_RUN_TRAINING_TESTS=1
@@ -49,12 +49,30 @@ python scripts/build_meshfleet_manifest.py \
 sha256sum "$GRAFT_GS_MESHFLEET_MANIFEST" | tee outputs/manifest.sha256
 ```
 
+The builder scans the modality trees once per split, forms candidate IDs from
+`latents` and `mesh_normalized`, and admits the intersection containing
+`renders`, `latents`, and `mesh_normalized`. Missing optional modalities are
+recorded per object; rejected candidates and their missing required modalities
+are written to `meshfleet_server.jsonl.rejected.jsonl`. No object ID catalog or
+example-object ordering is assumed. Select a complete training fixture only
+when a single-object command requires one:
+
+```bash
+export GRAFT_GS_OBJECT_ID=$($GRAFT_GS_PYTHON -c '
+import json, os
+p = os.environ["GRAFT_GS_MESHFLEET_MANIFEST"]
+records = [json.loads(x) for x in open(p) if x.strip()]
+ids = sorted(r["object_id"] for r in records if r["split"] == "train")
+if not ids: raise SystemExit("manifest contains no admitted train object")
+print(ids[0])')
+```
+
 ## High-precision reference suite
 
 ```bash
 CUDA_VISIBLE_DEVICES=0 /mnt/sda1/miniforge3/envs/CRAFT/bin/python scripts/validate_server.py \
   --requirements requirements.txt \
-  --dataset-root /mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97 \
+  --dataset-root /mnt/sda2/hef/Base/dataset \
   --manifest outputs/validation/meshfleet_server.jsonl \
   --output outputs/validation/reference.json 2>&1 | tee outputs/validation/reference.log
 ```
@@ -70,10 +88,11 @@ subprocess. It rejects dataset/backend skips; only the separate six-rank DDP
 launch and a separately configured real-image/checkpoint run may remain skipped
 in this single-GPU reference command.
 
-Manifest reuse is conditional on all of: resolved root equality, schema
-`meshfleet-trellis-object-v2`, summary/JSONL record-count equality, readable
-JSON objects, and exactly one occurrence of the canonical schema ID. Any failed
-condition invokes the deterministic builder before importing the dataset. Use
+Manifest reuse is conditional on resolved-root equality, schema
+`meshfleet-trellis-object-v2`, the modality-centric intersection policy,
+summary/JSONL and split-count equality, valid 64-hex IDs, train/test disjointness,
+and the discovered-object digest. Any failed condition invokes the deterministic
+builder before importing the dataset. Use
 `--rebuild-manifest` to force a fresh full-corpus audit even when those identity
 checks pass.
 
@@ -126,7 +145,7 @@ ranks, not inferred from rank zero alone.
 CUDA_VISIBLE_DEVICES=0 python scripts/refine_teacher_bundle.py \
   "$GRAFT_GS_MESHFLEET_ROOT" "$GRAFT_GS_MESHFLEET_MANIFEST" \
   outputs/phase_d/final.pt \
-  17a53839ae5da04c75ea21335d4bdc8ddc26b45f7bb9d0e18f5afaa397e43a17 \
+  "$GRAFT_GS_OBJECT_ID" \
   "$GRAFT_GS_TEACHER_BUNDLES" --split test \
   --vggt-checkpoint "$VGGT_CHECKPOINT" \
   --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
@@ -143,18 +162,19 @@ training requires generating the same schema for every admitted train object.
 ```bash
 torchrun --standalone --nproc-per-node=6 scripts/overfit_meshfleet_object.py \
   "$GRAFT_GS_MESHFLEET_ROOT" "$GRAFT_GS_MESHFLEET_MANIFEST" \
-  --object-id 17a53839ae5da04c75ea21335d4bdc8ddc26b45f7bb9d0e18f5afaa397e43a17 \
+  --object-id "$GRAFT_GS_OBJECT_ID" \
   --config configs/graft_gs_a800_native.yaml \
   --vggt-checkpoint "$VGGT_CHECKPOINT" \
   --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
-  --steps 1000 --output outputs/overfit_canonical \
-  2>&1 | tee outputs/overfit_canonical/run.log
+  --steps 1000 --output outputs/overfit_fixture \
+  2>&1 | tee outputs/overfit_fixture/run.log
 ```
 
 Required artifacts: periodic and final checkpoints, `metrics.jsonl`, decreasing
 overfit objective, input-view renders, deterministic PLY/GLB, reload metrics,
-and no activation of hard raw-mesh topology loss. Because this canonical mesh
-is nonmanifold, success does not include matching its raw Betti numbers.
+and no activation of inadmissible hard raw-mesh topology loss. Topology
+expectations are taken from each record's provenance-aware contract, never
+from the selected object's ID.
 
 ## Full staged training and exact phase boundaries
 
@@ -183,7 +203,7 @@ CUDA_VISIBLE_DEVICES=0 python scripts/infer_multiview.py \
 CUDA_VISIBLE_DEVICES=0 python scripts/infer_meshfleet.py \
   "$GRAFT_GS_MESHFLEET_ROOT" "$GRAFT_GS_MESHFLEET_MANIFEST" \
   "$GRAFT_GS_CHECKPOINT" outputs/meshfleet_inference \
-  --object-id 17a53839ae5da04c75ea21335d4bdc8ddc26b45f7bb9d0e18f5afaa397e43a17 \
+  --object-id "$GRAFT_GS_OBJECT_ID" \
   --vggt-checkpoint "$VGGT_CHECKPOINT" \
   --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
   --quantization-query-error "$MEASURED_QK_ERROR" \
@@ -199,6 +219,19 @@ The two quantization arguments must come from the same pinned quantized
 checkpoint/server precision path. Retain all emitted inequality terms; do not
 interpret `certified=true` as unconditional beyond the recorded Lipschitz,
 support-stratum, and barrier assumptions.
+
+Corpus evaluation must use the complete admitted test split rather than a
+sample-ID allowlist:
+
+```bash
+$GRAFT_GS_PYTHON -m torch.distributed.run --standalone --nproc-per-node=6 \
+  scripts/evaluate_meshfleet.py \
+  "$GRAFT_GS_MESHFLEET_ROOT" "$GRAFT_GS_MESHFLEET_MANIFEST" \
+  "$GRAFT_GS_CHECKPOINT" outputs/meshfleet_evaluation \
+  --splits test --vggt-checkpoint "$VGGT_CHECKPOINT" \
+  --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
+  2>&1 | tee outputs/meshfleet_evaluation/run.log
+```
 
 ## Ablations
 

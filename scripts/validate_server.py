@@ -17,10 +17,10 @@ from validate_environment import audit_environment
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SERVER_DATASET = Path(
-    "/mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97"
+    "/mnt/sda2/hef/Base/dataset"
 )
 EXPECTED_MESHFLEET_SCHEMA = "meshfleet-trellis-object-v2"
-CANONICAL_OBJECT_ID = "17a53839ae5da04c75ea21335d4bdc8ddc26b45f7bb9d0e18f5afaa397e43a17"
+EXPECTED_DISCOVERY_REQUIRED_MODALITIES = ("renders", "latents", "mesh_normalized")
 ALLOWED_REFERENCE_SKIP_REASONS = (
     "launch with torchrun",
     "set GRAFT_GS_REAL_IMAGE_DIR on the server",
@@ -125,7 +125,36 @@ def _write_record(path: Path, record: dict[str, object]) -> None:
     path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf8")
 
 
-def _inspect_manifest_contract(manifest: Path, dataset_root: Path) -> dict[str, object]:
+def _load_object_id_catalog(path: Path) -> tuple[str, ...]:
+    identifiers: list[str] = []
+    seen: set[str] = set()
+    for line_number, raw_line in enumerate(
+        path.read_text(encoding="utf-8-sig").splitlines(), 1
+    ):
+        value = raw_line.split("#", 1)[0].strip()
+        if not value:
+            continue
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ValueError(f"invalid object ID at {path}:{line_number}")
+        if value in seen:
+            raise ValueError(f"duplicate object ID at {path}:{line_number}: {value}")
+        seen.add(value)
+        identifiers.append(value)
+    if not identifiers:
+        raise ValueError(f"object ID catalog is empty: {path}")
+    return tuple(identifiers)
+
+
+def _object_id_digest(identifiers: tuple[str, ...]) -> str:
+    payload = "".join(f"{value}\n" for value in sorted(identifiers)).encode("ascii")
+    return hashlib.sha256(payload).hexdigest()
+
+
+def _inspect_manifest_contract(
+    manifest: Path,
+    dataset_root: Path,
+    expected_object_ids: tuple[str, ...] | None = None,
+) -> dict[str, object]:
     """Audit manifest identity without importing model or dataset dependencies."""
 
     errors: list[str] = []
@@ -159,9 +188,19 @@ def _inspect_manifest_contract(manifest: Path, dataset_root: Path) -> dict[str, 
         errors.append("manifest summary belongs to a different dataset root")
     if summary.get("schema") != EXPECTED_MESHFLEET_SCHEMA:
         errors.append("manifest schema does not match the loader contract")
+    discovery_policy = summary.get("discovery_policy")
+    if not isinstance(discovery_policy, dict):
+        errors.append("manifest summary has no modality discovery policy")
+    else:
+        if discovery_policy.get("layout") != "modality-centric":
+            errors.append("manifest was not built from the modality-centric layout")
+        if tuple(discovery_policy.get("required_modalities", ())) != (
+            EXPECTED_DISCOVERY_REQUIRED_MODALITIES
+        ):
+            errors.append("manifest required-modality intersection differs")
 
     manifest_count = 0
-    canonical_splits: list[object] = []
+    manifest_ids: list[str] = []
     try:
         with manifest.open("r", encoding="utf8") as file:
             for line_number, line in enumerate(file, 1):
@@ -172,22 +211,76 @@ def _inspect_manifest_contract(manifest: Path, dataset_root: Path) -> dict[str, 
                 if not isinstance(item, dict):
                     errors.append(f"manifest line {line_number} is not a JSON object")
                     continue
-                if item.get("object_id") == CANONICAL_OBJECT_ID:
-                    canonical_splits.append(item.get("split"))
+                object_id = item.get("object_id")
+                if isinstance(object_id, str) and re.fullmatch(
+                    r"[0-9a-f]{64}", object_id
+                ) is not None:
+                    manifest_ids.append(object_id)
+                else:
+                    errors.append(f"manifest line {line_number} has an invalid object ID")
+                if item.get("split") not in {"train", "test"}:
+                    errors.append(f"manifest line {line_number} has an invalid split")
+                discovery = item.get("discovery")
+                if not isinstance(discovery, dict):
+                    errors.append(
+                        f"manifest line {line_number} has no modality discovery contract"
+                    )
+                else:
+                    available = discovery.get("available_modalities", ())
+                    missing = [
+                        name
+                        for name in EXPECTED_DISCOVERY_REQUIRED_MODALITIES
+                        if name not in available
+                    ]
+                    if missing:
+                        errors.append(
+                            f"manifest line {line_number} violates required-modality intersection"
+                        )
     except (OSError, TypeError, ValueError, json.JSONDecodeError) as error:
         errors.append(f"manifest is unreadable: {error}")
     if summary.get("record_count") != manifest_count:
         errors.append("manifest record count does not match its summary")
-    if len(canonical_splits) != 1:
-        errors.append(
-            f"canonical object occurs {len(canonical_splits)} times instead of exactly once"
-        )
+    split_counts = summary.get("split_counts")
+    if not isinstance(split_counts, dict) or sum(
+        int(value) for value in split_counts.values()
+    ) != manifest_count:
+        errors.append("manifest split counts do not match its records")
+    if manifest_count == 0:
+        errors.append("dynamic dataset discovery produced an empty manifest")
+    duplicated_ids = sorted(
+        object_id for object_id in set(manifest_ids)
+        if manifest_ids.count(object_id) > 1
+    )
+    if duplicated_ids:
+        errors.append("manifest contains duplicate object IDs across train/test")
+    if summary.get("discovered_object_ids_sha256") != _object_id_digest(
+        tuple(manifest_ids)
+    ):
+        errors.append("manifest discovered-object digest differs")
+    if expected_object_ids is not None:
+        expected = set(expected_object_ids)
+        actual = set(manifest_ids)
+        catalog = summary.get("object_id_catalog", {})
+        expected_missing = sorted(expected - actual)
+        if not isinstance(catalog, dict) or catalog.get("enabled") is not True:
+            errors.append("manifest summary has no active object ID catalog")
+        else:
+            if catalog.get("count") != len(expected_object_ids):
+                errors.append("manifest object ID catalog count differs")
+            if catalog.get("sha256") != _object_id_digest(expected_object_ids):
+                errors.append("manifest object ID catalog digest differs")
+            if catalog.get("discovered_count") != len(actual):
+                errors.append("manifest discovered ID count differs")
+            if catalog.get("missing_ids") != expected_missing:
+                errors.append("manifest missing-ID inventory differs")
+        if actual - expected:
+            errors.append("manifest contains IDs outside the configured catalog")
     return {
         "valid": not errors,
         "errors": errors,
         "summary": summary,
         "record_count": manifest_count,
-        "canonical_split": canonical_splits[0] if len(canonical_splits) == 1 else None,
+        "discovered_object_count": len(set(manifest_ids)),
     }
 
 
@@ -203,12 +296,18 @@ def main() -> None:
     parser.add_argument("--requirements", type=Path, default=ROOT / "requirements.txt")
     parser.add_argument("--dataset-root", type=Path)
     parser.add_argument("--manifest", type=Path)
+    parser.add_argument("--object-id-file", type=Path)
     parser.add_argument(
         "--rebuild-manifest",
         action="store_true",
         help="re-audit the full remote dataset even when the manifest already exists",
     )
     args = parser.parse_args()
+    object_ids = (
+        _load_object_id_catalog(args.object_id_file.resolve())
+        if args.object_id_file is not None
+        else None
+    )
     overall_start = time.perf_counter()
     record: dict[str, object] = {
         "command": [sys.executable, *sys.argv],
@@ -258,10 +357,6 @@ def main() -> None:
         _write_record(output_path, record)
         print(json.dumps(record, indent=2, sort_keys=True))
         raise SystemExit(2)
-    for split in ("train", "test"):
-        if not (dataset_root / split).is_dir():
-            raise FileNotFoundError(f"remote dataset is missing {split!r}: {dataset_root / split}")
-
     manifest = (
         args.manifest.resolve()
         if args.manifest is not None
@@ -273,16 +368,19 @@ def main() -> None:
         ).resolve()
     )
     manifest_build = None
-    manifest_audit = _inspect_manifest_contract(manifest, dataset_root)
+    manifest_audit = _inspect_manifest_contract(manifest, dataset_root, object_ids)
     if _manifest_requires_rebuild(args.rebuild_manifest, manifest_audit):
-        manifest_build = _run(
-            [
-                sys.executable,
-                str(ROOT / "scripts" / "build_meshfleet_manifest.py"),
-                str(dataset_root),
-                str(manifest),
-            ]
-        )
+        manifest_command = [
+            sys.executable,
+            str(ROOT / "scripts" / "build_meshfleet_manifest.py"),
+            str(dataset_root),
+            str(manifest),
+        ]
+        if args.object_id_file is not None:
+            manifest_command.extend(
+                ("--object-id-file", str(args.object_id_file.resolve()))
+            )
+        manifest_build = _run(manifest_command)
         if manifest_build["returncode"] != 0:
             record["manifest_build"] = manifest_build
             record["returncode"] = int(manifest_build["returncode"])
@@ -291,7 +389,7 @@ def main() -> None:
             sys.stdout.write(str(manifest_build["stdout"]))
             sys.stderr.write(str(manifest_build["stderr"]))
             raise SystemExit(int(manifest_build["returncode"]))
-        manifest_audit = _inspect_manifest_contract(manifest, dataset_root)
+        manifest_audit = _inspect_manifest_contract(manifest, dataset_root, object_ids)
     if not manifest_audit["valid"]:
         record["dataset"] = {
             "valid": False,
@@ -311,7 +409,16 @@ def main() -> None:
         "manifest": str(manifest),
         "manifest_sha256": hashlib.sha256(manifest.read_bytes()).hexdigest(),
         "summary": summary,
-        "canonical_split": manifest_audit["canonical_split"],
+        "discovered_object_count": manifest_audit["discovered_object_count"],
+        "object_id_catalog": (
+            {
+                "path": str(args.object_id_file.resolve()),
+                "count": len(object_ids),
+                "sha256": _object_id_digest(object_ids),
+            }
+            if object_ids is not None
+            else None
+        ),
         "build": manifest_build,
     }
 

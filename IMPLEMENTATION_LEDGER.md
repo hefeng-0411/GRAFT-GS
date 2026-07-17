@@ -388,3 +388,39 @@ is an editing environment only; no numerical result is inferred from it.
 The full conditional validity domain is maintained in
 `docs/MATHEMATICAL_ASSUMPTIONS.md`; architectural choices and deviations are in
 `docs/RESEARCH_DECISIONS.md` and `docs/DEVIATIONS_FROM_SPEC.md`.
+
+## 2026-07-17 dynamic modality-intersection discovery
+
+- Requirement: discover every complete object in the remote `train` and
+  `test` modality trees without using an example ID or a fixed ID catalog.
+- Production path: `scripts/build_meshfleet_manifest.py` ->
+  `build_meshfleet_manifest` -> `MeshFleetObjectDataset` -> staged
+  training/inference/evaluation entry points.
+- Replaced per-object recursive path searches with one deterministic artifact
+  index per split and modality. The index follows the inspected TRELLIS
+  serializers, including model-nested
+  `features|latents|ss_latents/<model>/<id>.npz` leaves.
+- Candidate IDs are the union of the configured primary modalities
+  (`latents`, `mesh_normalized`). The default required intersection is
+  `renders`, `latents`, and complete `mesh_normalized` artifacts. Conditional
+  and evaluation renders, features, structure latents, and surface voxels are
+  optional at discovery time and remain available to stronger phase-specific
+  admission policies.
+- Every admitted record now carries available/missing-optional modalities and
+  an exact relative structural map. Rejected candidates are retained in a
+  deterministic `.rejected.jsonl` inventory with explicit missing required
+  modalities; summary counts distinguish candidates, admitted records, and
+  rejections for each split.
+- Multiple optional model variants are never chosen by lexical accident: all
+  paths remain in the structural map, the ambiguous decoded modality is
+  omitted with a warning, and required ambiguity rejects the candidate.
+- Dataset paths remain root-relative in the manifest and are resolved through
+  a containment-checked configurable root at load time. The loader also
+  rejects a manifest summary belonging to a different resolved root.
+- The optional `id.txt` catalog remains an explicit allowlist feature only; it
+  is not enabled by the training config, manifest builder, evaluator, or
+  server validator by default.
+- Server manifest reuse now additionally requires the modality-centric policy,
+  required-modality intersection, valid 64-hex identities, valid split names,
+  consistent split counts, and discovered-ID digest. No canonical object or
+  record ordering is assumed.
