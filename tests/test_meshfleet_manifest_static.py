@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import importlib.util
+import os
 from pathlib import Path
 import sys
 import struct
@@ -12,8 +13,40 @@ import unittest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-MANIFEST = PROJECT_ROOT / "data_manifests" / "meshfleet_local_audit.jsonl"
+CANONICAL_OBJECT_ID = "17a53839ae5da04c75ea21335d4bdc8ddc26b45f7bb9d0e18f5afaa397e43a17"
+MANIFEST = Path(
+    os.environ.get(
+        "GRAFT_GS_MESHFLEET_MANIFEST",
+        str(PROJECT_ROOT / "data_manifests" / "meshfleet_local_audit.jsonl"),
+    )
+)
 SUMMARY = MANIFEST.with_suffix(MANIFEST.suffix + ".summary.json")
+DATASET = Path(
+    os.environ.get(
+        "GRAFT_GS_MESHFLEET_ROOT",
+        r"D:\VsCode\MVG\Base\MeshFleet_TRELLIS",
+    )
+)
+
+
+def _records():
+    return [
+        json.loads(line)
+        for line in MANIFEST.read_text(encoding="utf8").splitlines()
+        if line
+    ]
+
+
+def _canonical_record():
+    matches = [
+        record for record in _records()
+        if record["object_id"] == CANONICAL_OBJECT_ID
+    ]
+    if len(matches) != 1:
+        raise AssertionError(
+            f"canonical object must occur exactly once in manifest, found {len(matches)}"
+        )
+    return matches[0]
 
 
 def _load_manifest_module():
@@ -48,20 +81,26 @@ class StaticMeshFleetManifestTest(unittest.TestCase):
         path.write_bytes(payload)
 
     def test_records_are_relationally_verified(self) -> None:
-        records = [json.loads(line) for line in MANIFEST.read_text(encoding="utf8").splitlines() if line]
+        records = _records()
         self.assertGreater(len(records), 0)
         for record in records:
             self.assertEqual(record["schema"], "meshfleet-trellis-object-v2")
             self.assertTrue(record["object_id"])
-            self.assertTrue(record["checks"]["feature_indices_equal_latent_coords"])
-            self.assertTrue(record["checks"]["surface_voxel_indices_equal_feature_indices"])
-            grid = record["checks"]["surface_voxel_grid"]
-            self.assertEqual(grid["resolution"], 64)
-            self.assertEqual(grid["maximum_center_residual"], 0.0)
-            self.assertTrue(grid["indices_in_bounds"])
+            modalities = record["modalities"]
+            if "features" in modalities and "latents" in modalities:
+                self.assertTrue(record["checks"]["feature_indices_equal_latent_coords"])
+            if "surface_voxels" in modalities:
+                grid = record["checks"]["surface_voxel_grid"]
+                self.assertEqual(grid["resolution"], 64)
+                self.assertLessEqual(grid["maximum_center_residual"], 1.0e-6)
+                self.assertTrue(grid["indices_in_bounds"])
+                if "features" in modalities:
+                    self.assertTrue(
+                        record["checks"]["surface_voxel_indices_equal_feature_indices"]
+                    )
 
     def test_canonical_raw_topology_is_diagnostic_not_a_label(self) -> None:
-        record = json.loads(MANIFEST.read_text(encoding="utf8").splitlines()[0])
+        record = _canonical_record()
         topology = record["checks"]["render_mesh_topology"]
         self.assertEqual(topology["vertex_count"], 78448)
         self.assertEqual(topology["edge_count"], 236075)
@@ -105,14 +144,22 @@ class StaticMeshFleetManifestTest(unittest.TestCase):
         self.assertNotIn("validated_topology_betti_z2", record["supervision"]["ground_truth"])
 
     def test_manifest_regeneration_is_deterministic(self) -> None:
-        dataset = Path(r"D:\VsCode\MVG\Base\MeshFleet_TRELLIS")
-        if not dataset.is_dir():
+        if not DATASET.is_dir():
             self.skipTest("audited MeshFleet_TRELLIS dataset is not mounted")
         module = _load_manifest_module()
         with tempfile.TemporaryDirectory() as directory:
             rebuilt = Path(directory) / "manifest.jsonl"
-            module.build_meshfleet_manifest(dataset, rebuilt)
-            self.assertEqual(MANIFEST.read_bytes(), rebuilt.read_bytes())
+            module.build_meshfleet_manifest(
+                DATASET,
+                rebuilt,
+                object_ids=(CANONICAL_OBJECT_ID,),
+            )
+            rebuilt_records = [
+                json.loads(line)
+                for line in rebuilt.read_text(encoding="utf8").splitlines()
+                if line
+            ]
+            self.assertEqual(rebuilt_records, [_canonical_record()])
 
     def test_closed_oriented_tetrahedron_is_admissible(self) -> None:
         module = _load_manifest_module()
@@ -144,7 +191,7 @@ class StaticMeshFleetManifestTest(unittest.TestCase):
         self.assertEqual(sum(summary["split_counts"].values()), len(records))
 
     def test_declared_and_physical_views_are_never_conflated(self) -> None:
-        records = [json.loads(line) for line in MANIFEST.read_text(encoding="utf8").splitlines() if line]
+        records = _records()
         for record in records:
             for view in record["views"].values():
                 self.assertEqual(

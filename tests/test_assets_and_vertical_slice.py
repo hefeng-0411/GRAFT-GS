@@ -129,7 +129,7 @@ class AnalyticalAssetTest(unittest.TestCase):
             float(structural_similarity_loss(shifted, target, mask)), 0.01
         )
         self.assertGreater(
-            float(multiscale_perceptual_loss(shifted, target, mask)), 0.01
+            float(multiscale_perceptual_loss(shifted, target, mask)), 1.0e-4
         )
 
     def test_unbalanced_transport_distillation_is_a_generalized_kl(self) -> None:

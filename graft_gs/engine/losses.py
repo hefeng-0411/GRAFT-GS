@@ -450,11 +450,22 @@ def multiview_reprojection_cycle_loss(
                     * visibility
                     * inside.to(depth.dtype)
                 )
-                world_error = torch.linalg.vector_norm(
-                    sampled_world - source_world, dim=-1
+                # Debiased Charbonnier norms are exactly zero at a closed
+                # cycle but have finite derivatives there. Raw sqrt(sum r^2)
+                # yields the indeterminate backward product 0*inf in torch
+                # 2.4, poisoning otherwise valid depth gradients with NaNs.
+                norm_epsilon = depth.new_tensor(1.0e-8)
+                world_squared = (sampled_world - source_world).square().sum(-1)
+                world_error = (
+                    torch.sqrt(world_squared + norm_epsilon.square())
+                    - norm_epsilon
                 ) / source_depth.clamp_min(1.0e-4)
-                pixel_error = torch.sqrt(
-                    (cycle_x - pixel_x).square() + (cycle_y - pixel_y).square()
+                pixel_squared = (cycle_x - pixel_x).square() + (
+                    cycle_y - pixel_y
+                ).square()
+                pixel_error = (
+                    torch.sqrt(pixel_squared + norm_epsilon.square())
+                    - norm_epsilon
                 ) / float(max(height, width))
                 losses.append(torch.sum((world_error + pixel_error) * weight))
                 weights.append(weight.sum())

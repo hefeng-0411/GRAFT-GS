@@ -30,12 +30,19 @@ def main() -> None:
         action="store_true",
         help="inventory physical frames without opening image headers",
     )
+    parser.add_argument(
+        "--object-id",
+        action="append",
+        dest="object_ids",
+        help="audit only these object IDs; repeat for multiple objects",
+    )
     args = parser.parse_args()
     summary = _load_manifest_builder()(
         args.dataset_root,
         args.output,
         splits=args.splits,
         inspect_image_headers=not args.skip_image_headers,
+        object_ids=args.object_ids,
     )
     print(json.dumps(summary, indent=2, sort_keys=True))
 

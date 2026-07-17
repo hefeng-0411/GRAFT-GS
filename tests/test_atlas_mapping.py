@@ -289,7 +289,16 @@ class PersistentAtlasTest(unittest.TestCase):
         result = operator(atlas, evidence)
         self.assertEqual(result.graph.target_count, evidence.positions.shape[0])
         self.assertEqual(int(result.graph.target.max()), evidence.positions.shape[0] - 1)
-        self.assertTrue(torch.all((result.observation_reliability > 0) & (result.observation_reliability < 1)))
+        self.assertTrue(
+            torch.all(
+                (result.observation_reliability >= 0)
+                & (result.observation_reliability < 1)
+            )
+        )
+        observed_row = atlas.evidence_mass[result.graph.atlas_node_index] > 0
+        self.assertTrue(
+            torch.all(result.observation_reliability[observed_row] > 0)
+        )
         source, target = result.graph.source, result.graph.target
         raw_center = torch.zeros_like(result.transported_centers)
         raw_center.index_add_(0, source, result.plan[:, None] * evidence.positions[target])

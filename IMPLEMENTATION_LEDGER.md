@@ -259,6 +259,48 @@ is an editing environment only; no numerical result is inferred from it.
     Attention/flow configuration domains are validated, and the fixed-topology
     ablation now disables both persistence-critical and adaptive-quantile cuts
     rather than accidentally retaining the newly strengthened proposal path.
+52. The first pinned A800 reference run exposed four numerical contracts and
+    one orchestration gap. Persistent root cell sizes now broadcast a tensor
+    scale instead of passing it as `full_like`'s Python-number argument, so the
+    continuous root-bound gradient is retained under PyTorch 2.4. Exact-zero
+    reprojection cycles use a debiased Charbonnier norm with finite derivative;
+    quantization certificates inherit the float64 geometric-margin dtype; and
+    hidden-prior-only atlas rows explicitly permit zero observation reliability
+    while observed rows remain positive. Server validation now audits all 444
+    exact requirement pins before importing the model, binds the verified
+    multi-object remote root, regenerates missing/stale manifests, selects the
+    canonical contract object by ID, and treats unexpected dataset/backend
+    skips as failures.
+53. Remote manifest handoff is now a typed pre-model contract rather than a
+    path-existence check. `validate_server.py` parses the v2 summary and every
+    JSONL identity record once, checks resolved dataset root, schema, declared
+    versus physical record count, and exactly one canonical object occurrence.
+    A missing, malformed, stale, wrong-root, count-drifted, or canonical-invalid
+    manifest forces deterministic full regeneration; a compatible multi-object
+    manifest is reused. Canonical validation selects its 64-hex ID regardless
+    of JSONL order, so the large remote corpus cannot silently substitute its
+    first train object.
+54. Reference validation now probes the accelerator in a subprocess after the
+    exact package and `pip check` gates but before dataset/model import. The
+    structured record includes PyTorch/CUDA versions, visible-device count,
+    names, compute capabilities, and physical memory. The native baseline
+    rejects non-CUDA, non-CUDA-11.8, non-BF16, empty-device, and non-A800 paths;
+    this prevents a locally convenient GPU or mismatched CUDA build from being
+    reported as the A800 reference environment.
+55. The distributed validator now establishes the six-rank execution contract
+    before testing global evidence: it audits exact dependencies on every
+    process, binds each NCCL rank to its local CUDA device, gathers hostname/
+    local-rank/device identity, rejects duplicate device assignments or any
+    world size other than six, and applies the CUDA-11.8/BF16/A800 gate to all
+    gathered ranks. Rank zero serializes preflight and per-rank test completion;
+    a global MIN reduction prevents one passing rank from masking another
+    rank's failed unittest suite.
+56. The six-GPU phase launcher no longer resolves an arbitrary `torchrun` from
+    `PATH`. It requires the configured CRAFT interpreter (defaulting to the
+    verified remote conda path), audits all exact pins before every training
+    launch, records that audit, and enters `torch.distributed.run` through the
+    same interpreter. Phase A-F commands therefore share the validated Python
+    environment by construction.
 
 ## Generated verification paths
 

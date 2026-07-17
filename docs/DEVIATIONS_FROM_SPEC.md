@@ -131,3 +131,9 @@
     exactly for the retained constraint stratum, but requires `L_v` to be
     supplied as an explicit server measurement. If it is absent, inference
     emits no certificate rather than substituting a configuration heuristic.
+29. **Strict pinned-environment gate.** The mathematical specification does
+    not define Python package identity, but the production reference harness
+    now rejects missing or mismatched versions before importing the model and
+    records the `requirements.txt` SHA-256. This is an execution-contract
+    strengthening, not evidence that dependency identity alone validates the
+    numerical architecture.

@@ -192,3 +192,15 @@
   boxed one-step result is conditional on a conservative measured downstream
   vector-field Lipschitz upper bound; local spectral normalization alone is not
   asserted to provide that bound.
+- Reprojection cycle norms use a debiased Charbonnier radius with
+  `epsilon=1e-8` in the depth tensor dtype. It preserves a zero loss at exact
+  closure and a finite zero gradient; residuals far above epsilon retain the
+  Euclidean-distance interpretation.
+- Observation reliability is evidence provenance, not atlas existence:
+  TRELLIS-only hidden-support rows may have exactly zero observation
+  reliability. Any row with positive transported evidence mass must have
+  strictly positive reliability, and all rows remain below one under the
+  finite Beta posterior contract.
+- Environment validation assumes every active `requirements.txt` entry is one
+  unconditional exact distribution pin. CUDA driver compatibility and external
+  VGGT/TRELLIS checkpoint identity are separate recorded preconditions.

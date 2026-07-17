@@ -173,6 +173,53 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("child.set_operator_scale(config.spectral_bound)", flow)
         self.assertIn("self.operator_scale * torch.einsum", attention)
 
+    def test_pytorch_24_reference_failures_have_production_repairs(self) -> None:
+        atlas = source("graft_gs/geometry/atlas.py")
+        losses = source("graft_gs/engine/losses.py")
+        quantization = source("graft_gs/optimization/quantization.py")
+        self.assertNotIn("torch.full_like(unique_codes, config.chart_radius_scale * side", atlas)
+        self.assertIn("torch.ones_like(unique_codes, dtype=positions.dtype) * side", atlas)
+        self.assertIn("torch.sqrt(world_squared + norm_epsilon.square())", losses)
+        self.assertIn("torch.sqrt(pixel_squared + norm_epsilon.square())", losses)
+        margin_position = quantization.index("margin = projector.topology_boundary_margin(state)")
+        error_position = quantization.index("query_error_tensor = torch.as_tensor")
+        self.assertLess(margin_position, error_position)
+        self.assertIn("query_error, dtype=margin.dtype, device=margin.device", quantization)
+
+    def test_server_validator_binds_exact_environment_and_remote_dataset(self) -> None:
+        validator = source("scripts/validate_server.py")
+        environment = source("scripts/validate_environment.py")
+        self.assertIn("audit_environment(args.requirements)", validator)
+        self.assertIn('[sys.executable, "-m", "pip", "check"]', validator)
+        self.assertIn('record["accelerator"] = accelerator', validator)
+        self.assertIn('details.get("torch_cuda") != "11.8"', validator)
+        self.assertIn("c9028d206944a33af776f1b6967a6d82af385e97", validator)
+        self.assertIn("_inspect_manifest_contract(manifest, dataset_root)", validator)
+        self.assertIn("_manifest_requires_rebuild(args.rebuild_manifest, manifest_audit)", validator)
+        self.assertIn("EXPECTED_MESHFLEET_SCHEMA", validator)
+        self.assertIn("len(canonical_splits) != 1", validator)
+        self.assertIn('test_environment["GRAFT_GS_MESHFLEET_ROOT"]', validator)
+        self.assertIn("unexpected_skip_reasons", validator)
+        self.assertIn("requirements_sha256", environment)
+
+    def test_six_rank_validator_records_distinct_a800_contract(self) -> None:
+        validator = source("scripts/validate_ddp_server.py")
+        self.assertIn("world_size != 6", validator)
+        self.assertIn("audit_environment(args.requirements)", validator)
+        self.assertIn("_accelerator_contract_errors(accelerator_details)", validator)
+        self.assertIn("len(set(rank_keys)) != world_size", validator)
+        self.assertIn("torch.cuda.set_device(local_rank)", validator)
+        self.assertIn("successful_on_every_rank", validator)
+        self.assertIn("dist.all_reduce(success, op=dist.ReduceOp.MIN)", validator)
+
+    def test_six_gpu_training_launcher_cannot_bypass_pinned_interpreter(self) -> None:
+        launcher = source("scripts/launch_a800_6gpu.sh")
+        self.assertIn("/mnt/sda1/miniforge3/envs/CRAFT/bin/python", launcher)
+        self.assertIn('"$ROOT/scripts/validate_environment.py"', launcher)
+        self.assertIn('--requirements "$ROOT/requirements.txt"', launcher)
+        self.assertIn('"$PYTHON_BIN" -m torch.distributed.run', launcher)
+        self.assertNotIn("\ntorchrun \\", launcher)
+
 
 if __name__ == "__main__":
     unittest.main()

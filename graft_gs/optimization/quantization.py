@@ -204,7 +204,19 @@ def certify_topology_quantization_step(
     collision family, current state, and evidence Riemannian metric.
     """
 
-    score_bound = attention_score_error_bound(query_error, temperature)
+    # The topology margin is high-precision geometric state and defines the
+    # numerical domain of the certificate. Constructing Python scalar inputs
+    # first would silently select float32 and round the measured margin.
+    margin = projector.topology_boundary_margin(state)
+    query_error_tensor = torch.as_tensor(
+        query_error, dtype=margin.dtype, device=margin.device
+    )
+    temperature_tensor = torch.as_tensor(
+        temperature, dtype=margin.dtype, device=margin.device
+    )
+    score_bound = attention_score_error_bound(
+        query_error_tensor, temperature_tensor
+    )
     lipschitz = torch.as_tensor(
         vector_field_lipschitz,
         dtype=score_bound.dtype,
@@ -215,10 +227,6 @@ def certify_topology_quantization_step(
         raise ValueError("Lipschitz bound must be non-negative and step size positive")
     field_bound = lipschitz * score_bound
     displacement_bound = step * field_bound
-    margin = projector.topology_boundary_margin(state).to(score_bound)
-    query_error_tensor = torch.as_tensor(
-        query_error, dtype=score_bound.dtype, device=score_bound.device
-    )
     return QuantizationTopologyCertificate(
         query_error=query_error_tensor,
         attention_score_error_bound=score_bound,

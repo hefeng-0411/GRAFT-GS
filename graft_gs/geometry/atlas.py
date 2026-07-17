@@ -426,12 +426,21 @@ class PersistentOctreeAtlas(nn.Module):
             node_chunks["child_slot"].append(slots)
             node_chunks["active"].append(torch.full_like(unique_codes, level == config.base_level, dtype=torch.bool))
             node_chunks["cell_centers"].append(cell_centers)
-            node_chunks["cell_sides"].append(torch.full_like(unique_codes, side, dtype=positions.dtype))
+            # `side` can retain a gradient to evidence-derived root bounds.
+            # `full_like` requires a Python number on torch 2.4 and would force
+            # an invalid detach; multiplication broadcasts the scalar tensor
+            # while preserving the continuous geometry graph.
+            node_chunks["cell_sides"].append(
+                torch.ones_like(unique_codes, dtype=positions.dtype) * side
+            )
             node_chunks["chart_centers"].append(means)
             node_chunks["chart_frames"].append(frames)
             node_chunks["chart_covariance"].append(cov)
             node_chunks["curvature"].append(curv)
-            node_chunks["chart_radii"].append(torch.full_like(unique_codes, config.chart_radius_scale * side, dtype=positions.dtype))
+            node_chunks["chart_radii"].append(
+                torch.ones_like(unique_codes, dtype=positions.dtype)
+                * (config.chart_radius_scale * side)
+            )
             node_chunks["evidence_mass"].append(observed_wsum)
             node_chunks["prior_mass"].append(prior_wsum)
             node_chunks["prior_mass_variance"].append(prior_variance_sum)

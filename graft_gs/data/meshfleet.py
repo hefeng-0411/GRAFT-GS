@@ -669,6 +669,7 @@ def build_meshfleet_manifest(
     output_path: str | Path,
     splits: Sequence[str] = ("train", "test"),
     inspect_image_headers: bool = True,
+    object_ids: Optional[Sequence[str]] = None,
 ) -> dict[str, Any]:
     """Audit all physical modalities and write deterministic JSON Lines records."""
 
@@ -676,12 +677,15 @@ def build_meshfleet_manifest(
     output_path = Path(output_path)
     records: list[ObjectManifestRecord] = []
     split_counts: dict[str, int] = {}
+    requested_ids = set(object_ids) if object_ids is not None else None
     for split in splits:
         split_root = root / split
         if not split_root.is_dir():
             split_counts[split] = 0
             continue
         identifiers = sorted(_discover_object_ids(split_root))
+        if requested_ids is not None:
+            identifiers = [value for value in identifiers if value in requested_ids]
         split_counts[split] = len(identifiers)
         for object_id in identifiers:
             record = ObjectManifestRecord(

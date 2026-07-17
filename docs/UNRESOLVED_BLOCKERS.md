@@ -66,3 +66,32 @@ checkpoints, data, or a compiled server dependency.
   kernel interface. Implementation/build remains gated on passing the A800
   sparse UOT, implicit-gradient, equivariance, and production-path baselines
   and on the server compiler/backend versions.
+
+## 2026-07-17 pinned A800 rerun boundary
+
+- The supplied 76-test A800 report predates the tensor-broadcast, finite-cycle-
+  gradient, certificate-dtype, prior-reliability, remote-manifest, and strict
+  environment repairs. The corrected suite must be rerun with
+  `/mnt/sda1/miniforge3/envs/CRAFT/bin/python scripts/validate_server.py` and
+  the declared `/mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97`
+  root. No corrected numerical result is claimed yet.
+- The manifest handoff now locally passes stale-schema, wrong-root,
+  record-count, canonical-identity, missing-summary, compatible-reuse, and
+  many-object ordering tests. What remains external is executing the full
+  rebuild against the large mounted remote corpus and retaining its digest and
+  measured build duration.
+- The reference command intentionally does not execute six-rank DDP or a real
+  image/checkpoint inference corpus. Those retain their dedicated commands in
+  `docs/A800_VALIDATION_PROTOCOL.md`; all dataset, CUDA renderer, and
+  nvdiffrast skips in the reference suite are now hard orchestration failures.
+- The accelerator probe contract is locally tested with synthetic metadata,
+  but its CUDA 11.8, BF16, A800 identity, compute capability, and memory record
+  remains pending until `validate_server.py` is rerun on the enterprise host.
+- The six-rank validator now rejects world-size/device aliasing and aggregates
+  pass/fail across ranks, but NCCL initialization, distinct A800 assignment,
+  global-evidence gradients, prior broadcast, and rank-local RNG replay remain
+  genuinely external until its structured JSON/log is produced on the server.
+- Phase launches are now pinned to the exact CRAFT interpreter and audit its
+  requirements first. Executing the Bash launcher, NCCL initialization, staged
+  backward passes, checkpoint boundaries, runtime, and peak memory remains an
+  external six-A800 task.

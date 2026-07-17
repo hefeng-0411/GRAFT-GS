@@ -113,3 +113,67 @@ Final local completion pass (2026-07-16): whole-tree `compileall` passed in
 tests all passed (22/22 in 3.078 seconds). No CUDA/PyTorch numerical result,
 GPU memory figure, render, asset, or checkpoint result is inferred from these
 static executions.
+
+Pinned A800 reference repair cycle (2026-07-17): the supplied server report
+executed 76 tests under PyTorch 2.4 and reported 9 errors, 4 failures, and 9
+skips. All nine errors shared one invalid tensor-valued `torch.full_like`
+argument in persistent atlas construction. The four independent failures were
+a finite-but-overstrict fixed-feature threshold, prior-only reliability being
+correctly zero, a zero-norm reprojection derivative producing NaN, and a
+float64 topology margin rounded through a float32 caller scalar. Each root
+cause has a production or semantically targeted test repair. The server harness
+now checks the exact 444-pin `requirements.txt`, `pip check`, the declared
+remote train/test root, manifest ownership/digest, and unexpected skip reasons.
+Locally, the final whole-tree `compileall` rerun passed and 28/28 executable
+tests passed in 3.317 s: 4 environment-contract, 6 canonical MeshFleet
+manifest/topology, and 18 production trace tests. The corrected PyTorch numerical suite has not been
+rerun locally or on A800; its status is server-ready and unexecuted, not passed.
+
+Network-recovery manifest handoff cycle (2026-07-17): inspected the interrupted
+validator/static-guard writes against `MANIFEST_SCHEMA =
+meshfleet-trellis-object-v2`, the builder's summary contract, and the checked
+local summary. No truncation or duplicate block was present. Factored the
+handoff into `_inspect_manifest_contract` and `_manifest_requires_rebuild`, then
+executed six pure-Python adversarial cases: stale schema, record-count drift,
+wrong root, missing/duplicate canonical identity, missing/malformed summary,
+and a compatible three-object manifest whose canonical object is second. All
+made the expected rebuild/reuse decision. Whole-tree `compileall` and the exact
+four-suite recovery command passed 34/34 tests in 3.807 s (4 environment, 6
+handoff, 6 MeshFleet manifest/topology, 18 scientific trace). No remote manifest
+was modified and no A800 numerical result is inferred.
+
+Accelerator-provenance increment (2026-07-17): added pure contract checks for
+CUDA availability, the pinned CUDA 11.8 PyTorch build, native BF16 support, and
+visible NVIDIA A800 identity, with subprocess-only runtime probing so the
+validator remains import-light until environment identity passes. Whole-tree
+`compileall` and the four local recovery suites passed 35/35 in 3.465 s. The
+synthetic contract test rejects CUDA 12.1, RTX 2060, absent CUDA, and absent
+BF16; it does not claim that the inaccessible remote hardware has passed.
+
+Six-rank validation-entry increment (2026-07-17): `validate_ddp_server.py` now
+records exact-environment agreement, six unique host/local CUDA assignments,
+A800/CUDA-11.8/BF16 properties, and all-rank unittest success before returning
+zero. Whole-tree `compileall` and the four local static/manifest suites passed
+36/36 in 3.890 s. The NCCL process-group path remains A800-unexecuted; only its
+source contract and import syntax were locally validated.
+
+Pinned training-launch increment (2026-07-17): the Phase A-F shell launcher now
+uses `/mnt/sda1/miniforge3/envs/CRAFT/bin/python` (or explicit
+`GRAFT_GS_PYTHON`), executes the exact-pin audit, and invokes
+`torch.distributed.run` through that same interpreter. Whole-tree `compileall`
+and the four local suites passed 37/37 in 4.135 s. Bash/NCCL execution remains
+server-pending; the local result is a source/contract validation only.
+
+Exact final local command:
+`C:\Users\10992\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe
+-m compileall -q graft_gs scripts tests`, followed by
+`-m unittest tests.test_environment_contract_static
+tests.test_server_manifest_handoff_static tests.test_meshfleet_manifest_static
+tests.test_scientific_trace_static -v`.
+
+Exact next server command is the reference invocation in
+`docs/A800_VALIDATION_PROTOCOL.md`, using
+`/mnt/sda1/miniforge3/envs/CRAFT/bin/python scripts/validate_server.py` with the
+declared requirements, dataset root, manifest, and JSON output arguments. Its
+result remains pending and must replace—not be merged with—the failing supplied
+76-test report.

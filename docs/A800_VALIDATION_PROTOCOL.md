@@ -11,12 +11,35 @@ export VGGT_CHECKPOINT=/checkpoints/VGGT-1B
 export TRELLIS_CHECKPOINT=/checkpoints/TRELLIS-image-large
 export GRAFT_GS_CHECKPOINT=/checkpoints/graft-gs-phase-f.pt
 export GRAFT_GS_REAL_IMAGE_DIR=/data/real_multiview_object/images
-export GRAFT_GS_MESHFLEET_ROOT=/data/MeshFleet_TRELLIS
-export GRAFT_GS_MESHFLEET_MANIFEST=$PWD/data_manifests/meshfleet_server.jsonl
+export GRAFT_GS_MESHFLEET_ROOT=/mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97
+export GRAFT_GS_MESHFLEET_MANIFEST=$PWD/outputs/validation/meshfleet_server.jsonl
 export GRAFT_GS_TEACHER_BUNDLES=/data/graft_gs_teacher_bundles
 export GRAFT_GS_RUN_TRAINING_TESTS=1
+export GRAFT_GS_PYTHON=/mnt/sda1/miniforge3/envs/CRAFT/bin/python
 export PYTHONHASHSEED=0
 ```
+
+Before importing PyTorch, verify that the active interpreter has every one of
+the 444 exact versions pinned by the repository. This check is metadata-only;
+it never installs or upgrades packages:
+
+```bash
+/mnt/sda1/miniforge3/envs/CRAFT/bin/python scripts/validate_environment.py \
+  --requirements requirements.txt \
+  --output outputs/validation/environment.json
+/mnt/sda1/miniforge3/envs/CRAFT/bin/python -m pip check
+```
+
+A nonzero result is an environment failure. Synchronize that conda environment
+from `requirements.txt` before validation; do not interpret tests from a
+different dependency set as repository validation.
+
+`validate_server.py` then performs a subprocess-isolated runtime probe and
+records the PyTorch/CUDA version, visible A800 names, compute capabilities,
+memory, and BF16 support. The reference path requires the pinned CUDA 11.8
+build and at least one visible A800. With `CUDA_VISIBLE_DEVICES=0`, one visible
+device is correct here; the dedicated `torchrun --nproc-per-node=6` suite
+validates all six devices and collectives separately.
 
 Build the manifest from the mounted data and retain its SHA-256 digest:
 
@@ -29,7 +52,10 @@ sha256sum "$GRAFT_GS_MESHFLEET_MANIFEST" | tee outputs/manifest.sha256
 ## High-precision reference suite
 
 ```bash
-CUDA_VISIBLE_DEVICES=0 python scripts/validate_server.py \
+CUDA_VISIBLE_DEVICES=0 /mnt/sda1/miniforge3/envs/CRAFT/bin/python scripts/validate_server.py \
+  --requirements requirements.txt \
+  --dataset-root /mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97 \
+  --manifest outputs/validation/meshfleet_server.jsonl \
   --output outputs/validation/reference.json 2>&1 | tee outputs/validation/reference.log
 ```
 
@@ -38,6 +64,18 @@ analytical asset, renderer-backward, checkpoint, MeshFleet real-contract, and
 checkpoint-backed multiview tests. Any NaN, failed gradient assertion, skipped
 test lacking an explicitly unavailable optional backend, or nonzero exit status
 is a failure.
+
+The validator injects the audited dataset root and manifest into the test
+subprocess. It rejects dataset/backend skips; only the separate six-rank DDP
+launch and a separately configured real-image/checkpoint run may remain skipped
+in this single-GPU reference command.
+
+Manifest reuse is conditional on all of: resolved root equality, schema
+`meshfleet-trellis-object-v2`, summary/JSONL record-count equality, readable
+JSON objects, and exactly one occurrence of the canonical schema ID. Any failed
+condition invokes the deterministic builder before importing the dataset. Use
+`--rebuild-manifest` to force a fresh full-corpus audit even when those identity
+checks pass.
 
 ## Reference/CUDA renderer equivalence
 
@@ -67,7 +105,10 @@ and reproduce the next Torch random sample exactly.
 ## Same-object distributed evidence and rank-local RNG
 
 ```bash
-torchrun --standalone --nproc-per-node=6 scripts/validate_ddp_server.py \
+$GRAFT_GS_PYTHON -m torch.distributed.run --standalone --nproc-per-node=6 \
+  scripts/validate_ddp_server.py \
+  --requirements requirements.txt \
+  --output outputs/validation/ddp_environment.json \
   2>&1 | tee outputs/validation/ddp_six_rank.log
 ```
 
@@ -75,7 +116,9 @@ The suite must show identical global evidence/prior inputs while retaining
 nonzero rank-local autograd. It also restores each rank's Torch CPU/CUDA,
 NumPy, and Python stream and verifies the six streams do not collapse. A
 format-5 trainer checkpoint must additionally reject a different resume world
-size before mutating model state.
+size before mutating model state. Its JSON preflight must contain six distinct
+host/local-rank assignments and six A800 records; success is reduced across all
+ranks, not inferred from rank zero alone.
 
 ## Offline teacher bundle refinement
 
