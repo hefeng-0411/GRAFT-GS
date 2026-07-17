@@ -1,9 +1,10 @@
-__pycache__/
-*.pyc
-*.pyo
 *.pth
 *.ply
 *.bin
 __pycache__/
 wandb/
 output/
+*.egg-info/
+dist/
+build/
+.env
