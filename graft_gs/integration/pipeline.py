@@ -264,19 +264,30 @@ class GraftGS(nn.Module):
                         prior_images = distributed_synchronizer.aggregate_prior_images(
                             prior_images
                         )
-                    prior = self.trellis_prior.sample(
-                        prior_images, seed=int(trellis_prior_seed) + batch_index
+                    should_sample = (
+                        distributed_synchronizer is None
+                        or not hasattr(
+                            distributed_synchronizer,
+                            "should_sample_trellis_prior",
+                        )
+                        or distributed_synchronizer.should_sample_trellis_prior()
                     )
-                    prior_measure = self.trellis_prior.support_measure(
-                        prior,
-                        root_bounds[0],
-                        root_bounds[1],
-                    )
+                    if should_sample:
+                        prior = self.trellis_prior.sample(
+                            prior_images,
+                            seed=int(trellis_prior_seed) + batch_index,
+                        )
+                        prior_measure = self.trellis_prior.support_measure(
+                            prior,
+                            root_bounds[0],
+                            root_bounds[1],
+                        )
                     if distributed_synchronizer is not None and hasattr(
                         distributed_synchronizer, "synchronize_trellis_prior_measure"
                     ):
                         prior_measure = distributed_synchronizer.synchronize_trellis_prior_measure(
-                            prior_measure
+                            prior_measure,
+                            dtype=root_bounds[0].dtype,
                         )
             with record_function("graft_gs/atlas_initialize"):
                 atlas = PersistentOctreeAtlas.from_evidence(

@@ -132,30 +132,44 @@ class DistributedEvidenceTest(unittest.TestCase):
 
     def test_rank_zero_hidden_support_broadcast(self) -> None:
         context = DistributedContext.initialize()
-        local_count = 2 if context.rank == 0 else 1
+        local_count = 2
         coordinates = torch.arange(local_count * 3, device=context.device).reshape(
             local_count, 3
         )
-        measure = TrellisPriorMeasure(
-            coordinates=coordinates,
-            positions=coordinates.to(torch.float32) / 16.0 - 0.5,
-            probability=torch.linspace(
-                0.6, 0.75, local_count, device=context.device
-            ),
-            mass=torch.linspace(0.01, 0.02, local_count, device=context.device),
-            mass_variance=torch.linspace(
-                1.0e-5, 2.0e-5, local_count, device=context.device
-            ),
-            vote_count=torch.arange(
-                1, local_count + 1, dtype=torch.int64, device=context.device
-            ),
-            sample_count=8 + context.rank,
-            resolution=64,
+        measure = (
+            TrellisPriorMeasure(
+                coordinates=coordinates,
+                positions=coordinates.to(torch.float64) / 16.0 - 0.5,
+                probability=torch.linspace(
+                    0.6, 0.75, local_count, device=context.device, dtype=torch.float64
+                ),
+                mass=torch.linspace(
+                    0.01, 0.02, local_count, device=context.device, dtype=torch.float64
+                ),
+                mass_variance=torch.linspace(
+                    1.0e-5,
+                    2.0e-5,
+                    local_count,
+                    device=context.device,
+                    dtype=torch.float64,
+                ),
+                vote_count=torch.arange(
+                    1, local_count + 1, dtype=torch.int64, device=context.device
+                ),
+                sample_count=8,
+                resolution=64,
+            )
+            if context.rank == 0
+            else None
         )
-        synchronized = AtlasDDPSynchronizer(
-            context
-        ).synchronize_trellis_prior_measure(measure)
+        synchronizer = AtlasDDPSynchronizer(context)
+        self.assertEqual(synchronizer.should_sample_trellis_prior(), context.rank == 0)
+        synchronized = synchronizer.synchronize_trellis_prior_measure(
+            measure,
+            dtype=torch.float64,
+        )
         self.assertEqual(synchronized.positions.shape, (2, 3))
+        self.assertEqual(synchronized.positions.dtype, torch.float64)
         self.assertEqual(synchronized.sample_count, 8)
         self.assertEqual(synchronized.resolution, 64)
         gathered = [

@@ -9,7 +9,13 @@ from pathlib import Path
 import torch
 
 from graft_gs.engine import GraftGSTrainer, TrainerConfig, TrainingPhase
-from graft_gs.integration import GraftGS, GraftGSConfig, VGGTAdapter
+from graft_gs.integration import (
+    GraftGS,
+    GraftGSConfig,
+    VGGTAdapter,
+    import_external_module,
+    resolve_vggt_checkpoint,
+)
 
 
 class RepeatedObject:
@@ -24,12 +30,15 @@ class RepeatedObject:
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("image_directory", type=Path)
-    parser.add_argument("--checkpoint", default="facebook/VGGT-1B")
+    parser.add_argument("--checkpoint")
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--output", default="outputs/one_object")
     parser.add_argument("--minimum-relative-improvement", type=float, default=0.01)
     args = parser.parse_args()
-    from vggt.utils.load_fn import load_and_preprocess_images
+    args.checkpoint = resolve_vggt_checkpoint(args.checkpoint)
+    load_and_preprocess_images = getattr(
+        import_external_module("vggt.utils.load_fn"), "load_and_preprocess_images"
+    )
 
     paths = sorted(path for path in args.image_directory.iterdir() if path.suffix.lower() in {".png", ".jpg", ".jpeg"})
     if len(paths) < 2:

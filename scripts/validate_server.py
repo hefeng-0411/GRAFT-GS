@@ -422,6 +422,33 @@ def main() -> None:
         "build": manifest_build,
     }
 
+    # Exercise the exact GRAFT-GS adapters against real dynamically selected
+    # MeshFleet views. Keep VGGT and TRELLIS in separate subprocesses so model
+    # memory is released between checkpoints and the validation peak is useful.
+    external_models: dict[str, object] = {}
+    for component in ("vggt", "trellis"):
+        component_output = output_path.parent / f"external_{component}.json"
+        command = [
+            sys.executable,
+            str(ROOT / "scripts" / "validate_external_models.py"),
+            component,
+            str(dataset_root),
+            str(manifest),
+            "--output",
+            str(component_output),
+        ]
+        validation = _run(command)
+        external_models[component] = validation
+        if validation["returncode"] != 0:
+            record["external_models"] = external_models
+            record["returncode"] = int(validation["returncode"])
+            record["seconds"] = time.perf_counter() - overall_start
+            _write_record(output_path, record)
+            sys.stdout.write(str(validation["stdout"]))
+            sys.stderr.write(str(validation["stderr"]))
+            raise SystemExit(int(validation["returncode"]))
+    record["external_models"] = external_models
+
     test_environment = os.environ.copy()
     test_environment["GRAFT_GS_MESHFLEET_ROOT"] = str(dataset_root)
     test_environment["GRAFT_GS_MESHFLEET_MANIFEST"] = str(manifest)

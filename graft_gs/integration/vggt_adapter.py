@@ -16,6 +16,12 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 import torch.nn.utils.parametrize as parametrize
 
+from .external import (
+    external_module_provenance,
+    import_external_module,
+    resolve_vggt_checkpoint,
+)
+
 
 @dataclass
 class VGGTGeometryOutput:
@@ -52,6 +58,7 @@ def _dct_projection(rows: int, columns: int) -> Tensor:
 class VGGTAdapter(nn.Module):
     def __init__(self, model: nn.Module, feature_dim: int = 1024, freeze_backbone: bool = True) -> None:
         super().__init__()
+        self._validate_upstream_contract(model)
         self.model = model
         self.feature_projection = nn.Linear(2048, feature_dim, bias=False)
         self.tap_logits = nn.Parameter(torch.zeros(4))
@@ -61,6 +68,27 @@ class VGGTAdapter(nn.Module):
             for parameter in self.model.parameters():
                 parameter.requires_grad_(False)
         self._lora_modules: list[nn.Module] = []
+
+    @staticmethod
+    def _validate_upstream_contract(model: nn.Module) -> None:
+        required = ("aggregator", "camera_head", "depth_head", "point_head")
+        missing = [name for name in required if getattr(model, name, None) is None]
+        if missing:
+            raise TypeError(
+                "VGGT checkpoint lacks required released components: "
+                + ",".join(missing)
+            )
+        aggregator = model.aggregator
+        for name in ("frame_blocks", "global_blocks", "cached_layer_indices"):
+            if not hasattr(aggregator, name):
+                raise TypeError(f"VGGT aggregator lacks required attribute {name!r}")
+        if len(aggregator.cached_layer_indices) != 4:
+            raise ValueError("GRAFT-GS requires the released four VGGT cached taps")
+        normalized_shape = tuple(model.camera_head.token_norm.normalized_shape)
+        if normalized_shape != (2048,):
+            raise ValueError(
+                "GRAFT-GS expects released concatenated VGGT taps with width 2048"
+            )
 
     def install_late_lora(self, last_blocks: int = 4, rank: int = 8, alpha: float = 8.0) -> int:
         """Install low-rank updates in released VGGT late attention/FFN maps."""
@@ -83,16 +111,34 @@ class VGGTAdapter(nn.Module):
             yield from module.parameters()
 
     @classmethod
-    def from_pretrained(cls, checkpoint: str = "facebook/VGGT-1B", feature_dim: int = 1024, freeze_backbone: bool = True) -> "VGGTAdapter":
-        from vggt.models.vggt import VGGT
-
-        return cls(VGGT.from_pretrained(checkpoint), feature_dim, freeze_backbone)
+    def from_pretrained(
+        cls,
+        checkpoint: Optional[str] = None,
+        feature_dim: int = 1024,
+        freeze_backbone: bool = True,
+    ) -> "VGGTAdapter":
+        checkpoint = resolve_vggt_checkpoint(checkpoint)
+        module = import_external_module("vggt.models.vggt")
+        model_class = getattr(module, "VGGT")
+        adapter = cls(
+            model_class.from_pretrained(checkpoint), feature_dim, freeze_backbone
+        )
+        adapter.upstream_provenance = external_module_provenance(module, checkpoint)
+        return adapter
 
     def forward(self, images: Tensor) -> VGGTGeometryOutput:
         if images.ndim == 4:
             images = images.unsqueeze(0)
         if images.ndim != 5:
             raise ValueError("images must have shape [B,K,3,H,W]")
+        if images.shape[0] < 1 or images.shape[1] < 1 or images.shape[2] != 3:
+            raise ValueError("images must contain at least one scene/view with RGB channels")
+        if not images.dtype.is_floating_point:
+            raise TypeError("VGGT image conditioning requires floating-point RGB")
+        if not bool(torch.all(torch.isfinite(images))):
+            raise ValueError("VGGT image conditioning contains non-finite values")
+        if bool(torch.any(images < 0)) or bool(torch.any(images > 1)):
+            raise ValueError("VGGT tensor inputs must use the released [0,1] RGB contract")
         use_bf16 = images.device.type == "cuda" and torch.cuda.is_bf16_supported()
         with torch.autocast(device_type=images.device.type, dtype=torch.bfloat16, enabled=use_bf16):
             taps, patch_start = self.model.aggregator(images)
@@ -106,8 +152,10 @@ class VGGTAdapter(nn.Module):
             pose_encoding = self.model.camera_head(taps)[-1].float()
             depth, depth_confidence = self.model.depth_head(taps, images=images, patch_start_idx=patch_start)
             world_points, world_points_confidence = self.model.point_head(taps, images=images, patch_start_idx=patch_start)
-            from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-
+            pose_module = import_external_module("vggt.utils.pose_enc")
+            pose_encoding_to_extri_intri = getattr(
+                pose_module, "pose_encoding_to_extri_intri"
+            )
             extrinsics, intrinsics = pose_encoding_to_extri_intri(pose_encoding, images.shape[-2:])
         return VGGTGeometryOutput(
             images=images,

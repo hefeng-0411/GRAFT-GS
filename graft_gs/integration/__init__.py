@@ -8,6 +8,13 @@ from .vggt_adapter import (
 )
 from .pipeline import GraftGS, GraftGSConfig, GraftGSOutput, RobustnessPerturbation, SceneOutput
 from .trellis_prior import TrellisPriorAdapter, TrellisPriorMeasure, TrellisStructurePrior
+from .external import (
+    DEFAULT_TRELLIS_CHECKPOINT,
+    DEFAULT_VGGT_CHECKPOINT,
+    import_external_module,
+    resolve_trellis_checkpoint,
+    resolve_vggt_checkpoint,
+)
 
 __all__ = [
     "GraftGS",
@@ -22,4 +29,9 @@ __all__ = [
     "VGGTAdapter",
     "VGGTGeometryOutput",
     "align_vggt_to_supervised_cameras",
+    "DEFAULT_TRELLIS_CHECKPOINT",
+    "DEFAULT_VGGT_CHECKPOINT",
+    "import_external_module",
+    "resolve_trellis_checkpoint",
+    "resolve_vggt_checkpoint",
 ]

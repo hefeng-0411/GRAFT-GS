@@ -8,14 +8,21 @@ occupancy as an additive surface hazard before topology proposal.
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from contextlib import nullcontext
 from dataclasses import dataclass
+import hashlib
 from typing import Optional
 
 import torch
 from torch import Tensor
 
 from ..geometry.atlas import PersistentOctreeAtlas
+from .external import (
+    external_module_provenance,
+    import_external_module,
+    resolve_trellis_checkpoint,
+)
 
 
 @dataclass
@@ -82,59 +89,120 @@ class TrellisPriorAdapter:
         strength: float = 0.35,
         minimum_probability: float = 0.0,
         uncertainty_discount: float = 0.5,
+        cache_entries: int = 64,
     ) -> None:
         if samples < 1 or sampler_steps < 1:
             raise ValueError("TRELLIS prior samples and sampler steps must be positive")
         if strength < 0 or not 0.0 <= minimum_probability < 1.0 or uncertainty_discount < 0:
             raise ValueError("TRELLIS prior strength/threshold are outside their domains")
+        if cache_entries < 0:
+            raise ValueError("TRELLIS prior cache_entries must be non-negative")
         self.pipeline = pipeline
+        if pipeline is not None:
+            self._validate_upstream_contract(pipeline)
         self.samples = samples
         self.sampler_steps = sampler_steps
         self.strength = strength
         self.minimum_probability = minimum_probability
         self.uncertainty_discount = uncertainty_discount
+        self.cache_entries = cache_entries
+        self._sample_cache: OrderedDict[str, TrellisStructurePrior] = OrderedDict()
+
+    @staticmethod
+    def _validate_upstream_contract(pipeline: object) -> None:
+        methods = (
+            "get_cond",
+            "sample_sparse_structure",
+            "inject_sampler_multi_image",
+            "to",
+        )
+        missing = [name for name in methods if not callable(getattr(pipeline, name, None))]
+        if missing:
+            raise TypeError(
+                "TRELLIS pipeline lacks required released methods: "
+                + ",".join(missing)
+            )
+        models = getattr(pipeline, "models", None)
+        required_models = {
+            "image_cond_model",
+            "sparse_structure_flow_model",
+            "sparse_structure_decoder",
+        }
+        if not isinstance(models, dict) or not required_models <= set(models):
+            raise TypeError("TRELLIS pipeline lacks required image/structure models")
+        sampler = getattr(pipeline, "sparse_structure_sampler", None)
+        if sampler is None or not callable(getattr(sampler, "sample", None)):
+            raise TypeError("TRELLIS sparse-structure sampler is unavailable")
+        resolution = getattr(models["sparse_structure_flow_model"], "resolution", None)
+        if not isinstance(resolution, int) or resolution < 1:
+            raise ValueError("TRELLIS sparse-structure resolution is invalid")
 
     @classmethod
     def from_pretrained(
         cls,
-        checkpoint: str = "microsoft/TRELLIS-image-large",
+        checkpoint: Optional[str] = None,
         samples: int = 8,
         sampler_steps: int = 12,
         strength: float = 0.35,
         minimum_probability: float = 0.0,
         uncertainty_discount: float = 0.5,
+        cache_entries: int = 64,
         device: Optional[torch.device | str] = None,
     ) -> "TrellisPriorAdapter":
-        from trellis.pipelines import TrellisImageTo3DPipeline
-
-        pipeline = TrellisImageTo3DPipeline.from_pretrained(checkpoint)
+        checkpoint = resolve_trellis_checkpoint(checkpoint)
+        module = import_external_module("trellis.pipelines")
+        pipeline_class = getattr(module, "TrellisImageTo3DPipeline")
+        pipeline = pipeline_class.from_pretrained(checkpoint)
         pipeline.to(torch.device("cuda") if device is None else torch.device(device))
-        return cls(
+        adapter = cls(
             pipeline,
             samples,
             sampler_steps,
             strength,
             minimum_probability,
             uncertainty_discount,
+            cache_entries,
         )
+        adapter.upstream_provenance = external_module_provenance(module, checkpoint)
+        return adapter
 
     @torch.no_grad()
     def sample(self, scene_images: Tensor, seed: int = 0) -> TrellisStructurePrior:
         if scene_images.ndim != 4:
             raise ValueError("scene_images must have shape [K,3,H,W]")
+        if scene_images.shape[0] < 1 or scene_images.shape[1] != 3:
+            raise ValueError("scene_images must contain at least one RGB view")
+        if not scene_images.dtype.is_floating_point:
+            raise TypeError("TRELLIS image conditioning requires floating-point RGB")
+        if not bool(torch.all(torch.isfinite(scene_images))):
+            raise ValueError("TRELLIS image conditioning contains non-finite values")
+        if bool(torch.any(scene_images < 0)) or bool(torch.any(scene_images > 1)):
+            raise ValueError("TRELLIS tensor inputs must use the released [0,1] RGB contract")
+        cache_key = self._sample_cache_key(scene_images, seed)
+        if cache_key is not None and cache_key in self._sample_cache:
+            cached = self._sample_cache.pop(cache_key)
+            self._sample_cache[cache_key] = cached
+            return TrellisStructurePrior(
+                [value.to(device=scene_images.device).clone() for value in cached.coordinates],
+                cached.resolution,
+            )
         condition = self.pipeline.get_cond(scene_images)
+        if not isinstance(condition, dict) or not {"cond", "neg_cond"} <= set(condition):
+            raise TypeError("TRELLIS get_cond must return cond and neg_cond tensors")
         condition["neg_cond"] = condition["neg_cond"][:1]
         structures = []
         parameters = {"steps": self.sampler_steps}
-        sampler = self.pipeline.sparse_structure_sampler
-        context = self.pipeline.inject_sampler_multi_image(
-            "sparse_structure_sampler",
-            scene_images.shape[0],
-            self.sampler_steps,
-            mode="multidiffusion",
-        ) if scene_images.shape[0] > 1 else nullcontext()
-        with context:
-            for sample_index in range(self.samples):
+        for sample_index in range(self.samples):
+            # The released injector installs run-local sampler state. Recreate
+            # that state for every posterior draw instead of reusing a context
+            # whose callback counters/conditioning schedule have been consumed.
+            context = self.pipeline.inject_sampler_multi_image(
+                "sparse_structure_sampler",
+                scene_images.shape[0],
+                self.sampler_steps,
+                mode="multidiffusion",
+            ) if scene_images.shape[0] > 1 else nullcontext()
+            with context:
                 devices = [scene_images.device] if scene_images.is_cuda else []
                 # TRELLIS does not expose a generator argument. Isolate its
                 # sampling RNG so topology priors cannot perturb flow-time or
@@ -150,7 +218,29 @@ class TrellisPriorAdapter:
         resolution = int(self.pipeline.models["sparse_structure_flow_model"].resolution)
         prior = TrellisStructurePrior(structures, resolution)
         prior.validate()
+        if cache_key is not None:
+            self._sample_cache[cache_key] = TrellisStructurePrior(
+                [value.detach().to(device="cpu").clone() for value in prior.coordinates],
+                prior.resolution,
+            )
+            while len(self._sample_cache) > self.cache_entries:
+                self._sample_cache.popitem(last=False)
         return prior
+
+    def _sample_cache_key(self, scene_images: Tensor, seed: int) -> Optional[str]:
+        """Hash exact conditioning values; cache hits never approximate images."""
+
+        if self.cache_entries == 0:
+            return None
+        values = scene_images.detach().to(device="cpu").contiguous()
+        digest = hashlib.sha256()
+        digest.update(str(tuple(values.shape)).encode("ascii"))
+        digest.update(str(values.dtype).encode("ascii"))
+        digest.update(
+            f"{int(seed)}\0{self.samples}\0{self.sampler_steps}\0".encode("ascii")
+        )
+        digest.update(values.view(torch.uint8).numpy().tobytes(order="C"))
+        return digest.hexdigest()
 
     def support_measure(
         self,

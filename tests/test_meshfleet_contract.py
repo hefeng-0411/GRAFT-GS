@@ -36,9 +36,25 @@ AUDIT_MANIFEST = Path(
         str(PROJECT_ROOT / "data_manifests" / "meshfleet_local_audit.jsonl"),
     )
 )
-LOCAL_DATASET = Path(
-    os.environ.get("GRAFT_GS_MESHFLEET_ROOT", r"D:\VsCode\MVG\Base\MeshFleet_TRELLIS")
-)
+
+
+def _configured_dataset_root() -> Path | None:
+    """Resolve server configuration or checked-manifest audit provenance."""
+
+    configured = os.environ.get("GRAFT_GS_MESHFLEET_ROOT")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    summary_path = AUDIT_MANIFEST.with_suffix(AUDIT_MANIFEST.suffix + ".summary.json")
+    if summary_path.is_file():
+        summary = json.loads(summary_path.read_text(encoding="utf8"))
+        root = summary.get("dataset_root")
+        if isinstance(root, str) and root.strip():
+            return Path(root).expanduser().resolve()
+    return None
+
+
+LOCAL_DATASET = _configured_dataset_root()
+LOCAL_DATASET_AVAILABLE = LOCAL_DATASET is not None and LOCAL_DATASET.is_dir()
 
 
 def _audited_nonmanifold_record():
@@ -155,7 +171,7 @@ class MeshFleetAuditTest(unittest.TestCase):
         self.assertEqual(topology["nonmanifold_edge_count"], 313)
         self.assertFalse(topology["hard_topology_supervision_admissible"])
 
-    @unittest.skipUnless(LOCAL_DATASET.is_dir(), "audited MeshFleet_TRELLIS dataset is not mounted")
+    @unittest.skipUnless(LOCAL_DATASET_AVAILABLE, "audited MeshFleet_TRELLIS dataset is not mounted")
     def test_object_loader_uses_only_available_frames(self) -> None:
         dataset = MeshFleetObjectDataset(
             MeshFleetDatasetConfig(
@@ -210,7 +226,7 @@ class MeshFleetAuditTest(unittest.TestCase):
         self.assertEqual(tuple(batch["atlas_root_bounds"].shape), (1, 2, 3))
 
     @unittest.skipUnless(
-        LOCAL_DATASET.is_dir()
+        LOCAL_DATASET_AVAILABLE
         and torch.cuda.is_available()
         and importlib.util.find_spec("nvdiffrast") is not None,
         "mesh target rasterization requires the A800 nvdiffrast environment",

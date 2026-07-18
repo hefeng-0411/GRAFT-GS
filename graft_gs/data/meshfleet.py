@@ -71,6 +71,7 @@ class MeshFleetDatasetConfig:
     split: str = "train"
     manifest: Optional[str | Path] = None
     object_id_file: Optional[str | Path] = None
+    include_object_ids: Optional[tuple[str, ...]] = None
     input_view_set: str = "renders"
     image_size: tuple[int, int] = (518, 518)
     minimum_views: int = 2
@@ -129,6 +130,18 @@ class MeshFleetDatasetConfig:
             raise ValueError("minimum teacher-bundle confidence must lie in [0,1]")
         if self.require_teacher_bundle and self.teacher_bundle_root is None:
             raise ValueError("required teacher bundles need an explicit root")
+        if self.include_object_ids is not None:
+            if not self.include_object_ids:
+                raise ValueError("include_object_ids cannot be empty")
+            if len(set(self.include_object_ids)) != len(self.include_object_ids):
+                raise ValueError("include_object_ids contains duplicates")
+            invalid = [
+                value
+                for value in self.include_object_ids
+                if _OBJECT_ID_RE.fullmatch(value) is None
+            ]
+            if invalid:
+                raise ValueError(f"include_object_ids contains invalid IDs: {invalid[:4]}")
 
 
 @dataclass
@@ -1478,6 +1491,18 @@ class MeshFleetObjectDataset:
                     "MeshFleet manifest was not built from the configured object ID catalog"
                 )
         catalog = set(self.object_ids) if self.object_ids is not None else None
+        runtime_selection = (
+            set(config.include_object_ids)
+            if config.include_object_ids is not None
+            else None
+        )
+        if catalog is not None and runtime_selection is not None:
+            outside_catalog = sorted(runtime_selection - catalog)
+            if outside_catalog:
+                raise ValueError(
+                    "runtime MeshFleet selection contains IDs outside the manifest catalog: "
+                    + ",".join(outside_catalog[:16])
+                )
         membership: dict[str, set[str]] = {}
         for record in records:
             membership.setdefault(record.object_id, set()).add(record.split)
@@ -1499,6 +1524,8 @@ class MeshFleetObjectDataset:
         self.excluded: dict[str, str] = {}
         for record in records:
             if record.split != config.split:
+                continue
+            if runtime_selection is not None and record.object_id not in runtime_selection:
                 continue
             if catalog is not None and record.object_id not in catalog:
                 self.excluded[record.object_id] = "object is absent from configured ID catalog"
@@ -1530,9 +1557,25 @@ class MeshFleetObjectDataset:
             "catalog_ids_absent_from_split": (
                 sorted(catalog - present_in_split) if catalog is not None else []
             ),
+            "runtime_selection_count": (
+                len(runtime_selection) if runtime_selection is not None else None
+            ),
+            "runtime_selection_absent_from_split": (
+                sorted(runtime_selection - present_in_split)
+                if runtime_selection is not None
+                else []
+            ),
         }
         if not self.records:
-            detail = "; ".join(f"{key}: {value}" for key, value in sorted(self.excluded.items()))
+            diagnostics = dict(self.excluded)
+            if runtime_selection is not None:
+                for object_id in sorted(runtime_selection - present_in_split):
+                    diagnostics[object_id] = (
+                        f"object is absent from configured split {config.split!r}"
+                    )
+            detail = "; ".join(
+                f"{key}: {value}" for key, value in sorted(diagnostics.items())
+            )
             raise ValueError(f"no usable MeshFleet objects for split {config.split!r}. {detail}")
         self.epoch = 0
 

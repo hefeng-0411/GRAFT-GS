@@ -31,7 +31,13 @@ from graft_gs.engine import (
     load_server_config,
     load_trellis_prior_config,
 )
-from graft_gs.integration import GraftGS, TrellisPriorAdapter, VGGTAdapter
+from graft_gs.integration import (
+    GraftGS,
+    TrellisPriorAdapter,
+    VGGTAdapter,
+    resolve_trellis_checkpoint,
+    resolve_vggt_checkpoint,
+)
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -42,7 +48,7 @@ def main() -> None:
     parser.add_argument("--split", default="train")
     parser.add_argument("--phase", choices=list("ABCDEF"), required=True)
     parser.add_argument("--steps", type=int, required=True)
-    parser.add_argument("--vggt-checkpoint", default="facebook/VGGT-1B")
+    parser.add_argument("--vggt-checkpoint")
     parser.add_argument("--trellis-checkpoint")
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--initialize-from", type=Path)
@@ -53,6 +59,7 @@ def main() -> None:
     parser.add_argument("--same-object-view-shards", action="store_true")
     parser.add_argument("--config", type=Path, default=Path("configs/graft_gs_a800_native.yaml"))
     args = parser.parse_args()
+    args.vggt_checkpoint = resolve_vggt_checkpoint(args.vggt_checkpoint)
     phase = TrainingPhase(args.phase)
     model_config, training_config, distributed_config, dataset_config = load_server_config(args.config)
     loss_weights = load_loss_weights(args.config)
@@ -70,8 +77,8 @@ def main() -> None:
         meshfleet_object_id_digest(object_ids) if object_ids is not None else None
     )
     use_prior = bool(prior_config["enabled_after_phase_a"]) and phase is not TrainingPhase.EVIDENCE_CALIBRATION
-    if use_prior and args.trellis_checkpoint is None:
-        raise ValueError("Phases B-F require --trellis-checkpoint when the structured prior is enabled")
+    if use_prior:
+        args.trellis_checkpoint = resolve_trellis_checkpoint(args.trellis_checkpoint)
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if torch.cuda.is_available():
         torch.cuda.set_device(local_rank)

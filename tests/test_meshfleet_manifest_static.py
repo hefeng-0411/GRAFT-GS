@@ -21,12 +21,22 @@ MANIFEST = Path(
     )
 )
 SUMMARY = MANIFEST.with_suffix(MANIFEST.suffix + ".summary.json")
-DATASET = Path(
-    os.environ.get(
-        "GRAFT_GS_MESHFLEET_ROOT",
-        r"D:\VsCode\MVG\Base\MeshFleet_TRELLIS",
-    )
-)
+
+
+def _configured_dataset_root() -> Path | None:
+    configured = os.environ.get("GRAFT_GS_MESHFLEET_ROOT")
+    if configured:
+        return Path(configured).expanduser().resolve()
+    if SUMMARY.is_file():
+        summary = json.loads(SUMMARY.read_text(encoding="utf8"))
+        root = summary.get("dataset_root")
+        if isinstance(root, str) and root.strip():
+            return Path(root).expanduser().resolve()
+    return None
+
+
+DATASET = _configured_dataset_root()
+DATASET_AVAILABLE = DATASET is not None and DATASET.is_dir()
 
 
 def _records():
@@ -82,6 +92,8 @@ class StaticMeshFleetManifestTest(unittest.TestCase):
         )
 
     def test_catalog_manifest_reports_missing_ids_and_admits_complete_sample(self) -> None:
+        if not DATASET_AVAILABLE:
+            self.skipTest("audited MeshFleet_TRELLIS dataset is not mounted")
         module = _load_manifest_module()
         audited_id = _audited_nonmanifold_record()["object_id"]
         absent = "f" * 64
@@ -128,7 +140,7 @@ class StaticMeshFleetManifestTest(unittest.TestCase):
         reasons = module.meshfleet_record_admission_reasons(
             record,
             module.MeshFleetDatasetConfig(
-                root=DATASET,
+                root=DATASET if DATASET is not None else PROJECT_ROOT,
                 manifest=MANIFEST,
                 split="test",
                 load_trellis_features=True,
@@ -217,7 +229,7 @@ class StaticMeshFleetManifestTest(unittest.TestCase):
         self.assertNotIn("validated_topology_betti_z2", record["supervision"]["ground_truth"])
 
     def test_manifest_regeneration_is_deterministic(self) -> None:
-        if not DATASET.is_dir():
+        if not DATASET_AVAILABLE:
             self.skipTest("audited MeshFleet_TRELLIS dataset is not mounted")
         module = _load_manifest_module()
         audited = _audited_nonmanifold_record()

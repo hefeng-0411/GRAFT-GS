@@ -16,19 +16,29 @@ from graft_gs.engine import (
     load_trellis_prior_config,
     validate_trellis_prior_policy,
 )
-from graft_gs.integration import GraftGS, TrellisPriorAdapter, VGGTAdapter
+from graft_gs.integration import (
+    GraftGS,
+    TrellisPriorAdapter,
+    VGGTAdapter,
+    import_external_module,
+    resolve_trellis_checkpoint,
+    resolve_vggt_checkpoint,
+)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("image_directory", type=Path)
-    parser.add_argument("--vggt-checkpoint", default="facebook/VGGT-1B")
+    parser.add_argument("--vggt-checkpoint")
     parser.add_argument("--trellis-checkpoint")
     parser.add_argument("--graft-checkpoint", type=Path, required=True)
     parser.add_argument("--config", type=Path, default=Path("configs/graft_gs_a800_native.yaml"))
     parser.add_argument("--output", type=Path, default=Path("outputs/ablations.json"))
     args = parser.parse_args()
-    from vggt.utils.load_fn import load_and_preprocess_images
+    args.vggt_checkpoint = resolve_vggt_checkpoint(args.vggt_checkpoint)
+    load_and_preprocess_images = getattr(
+        import_external_module("vggt.utils.load_fn"), "load_and_preprocess_images"
+    )
 
     paths = sorted(path for path in args.image_directory.iterdir() if path.suffix.lower() in {".png", ".jpg", ".jpeg"})[:8]
     if len(paths) < 2:
@@ -37,8 +47,9 @@ def main() -> None:
     images = load_and_preprocess_images([str(path) for path in paths])[None].to(device)
     base, _, _, _ = load_server_config(args.config)
     prior_config = load_trellis_prior_config(args.config)
-    if bool(prior_config["enabled_after_phase_a"]) and args.trellis_checkpoint is None:
-        raise ValueError("reference ablation requires --trellis-checkpoint")
+    use_prior = bool(prior_config["enabled_after_phase_a"])
+    if use_prior:
+        args.trellis_checkpoint = resolve_trellis_checkpoint(args.trellis_checkpoint)
     prior = (
         TrellisPriorAdapter.from_pretrained(
             args.trellis_checkpoint,
@@ -49,7 +60,7 @@ def main() -> None:
             uncertainty_discount=float(prior_config["uncertainty_discount"]),
             device=device,
         )
-        if args.trellis_checkpoint
+        if use_prior
         else None
     )
     adapter = VGGTAdapter.from_pretrained(

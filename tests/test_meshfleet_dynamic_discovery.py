@@ -226,6 +226,43 @@ class DynamicMeshFleetDiscoveryTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "escapes the dataset root"):
             MESHFLEET._resolve_manifest_path(self.root, "../outside.npz")
 
+    def test_runtime_object_selection_is_not_a_manifest_identity_catalog(self) -> None:
+        second = "4" * 64
+        _write_required_object(self.root, "train", second)
+        build_meshfleet_manifest(self.root, self.manifest)
+        dataset = MeshFleetObjectDataset(
+            MeshFleetDatasetConfig(
+                root=self.root,
+                manifest=self.manifest,
+                split="train",
+                include_object_ids=(second,),
+                minimum_views=1,
+                maximum_views=1,
+                require_complete_input_view_set=True,
+            )
+        )
+        self.assertEqual([record.object_id for record in dataset.records], [second])
+        self.assertIsNone(dataset.coverage["catalog_count"])
+        self.assertEqual(dataset.coverage["runtime_selection_count"], 1)
+        self.assertEqual(dataset.coverage["runtime_selection_absent_from_split"], [])
+
+        absent = "5" * 64
+        with self.assertRaisesRegex(
+            ValueError,
+            rf"{absent}: object is absent from configured split 'train'",
+        ):
+            MeshFleetObjectDataset(
+                MeshFleetDatasetConfig(
+                    root=self.root,
+                    manifest=self.manifest,
+                    split="train",
+                    include_object_ids=(absent,),
+                    minimum_views=1,
+                    maximum_views=1,
+                    require_complete_input_view_set=True,
+                )
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -20,7 +20,13 @@ from graft_gs.engine import (
     validate_trellis_prior_policy,
 )
 from graft_gs.engine.losses import symmetric_surface_chamfer
-from graft_gs.integration import GraftGS, TrellisPriorAdapter, VGGTAdapter
+from graft_gs.integration import (
+    GraftGS,
+    TrellisPriorAdapter,
+    VGGTAdapter,
+    resolve_trellis_checkpoint,
+    resolve_vggt_checkpoint,
+)
 from graft_gs.manifold import BarrierProjector
 from graft_gs.optimization import certify_topology_quantization_step
 
@@ -62,7 +68,7 @@ def main() -> None:
     parser.add_argument("--object-id-file", type=Path)
     parser.add_argument("--view-set", default="renders")
     parser.add_argument("--maximum-views", type=int, default=12)
-    parser.add_argument("--vggt-checkpoint", default="facebook/VGGT-1B")
+    parser.add_argument("--vggt-checkpoint")
     parser.add_argument("--trellis-checkpoint")
     parser.add_argument("--disable-trellis-prior", action="store_true")
     parser.add_argument("--config", type=Path, default=Path("configs/graft_gs_a800_native.yaml"))
@@ -70,6 +76,7 @@ def main() -> None:
     parser.add_argument("--quantization-query-error", type=float)
     parser.add_argument("--vector-field-lipschitz-bound", type=float)
     args = parser.parse_args()
+    args.vggt_checkpoint = resolve_vggt_checkpoint(args.vggt_checkpoint)
     if (args.quantization_query_error is None) != (
         args.vector_field_lipschitz_bound is None
     ):
@@ -85,8 +92,8 @@ def main() -> None:
     )
     prior_config = load_trellis_prior_config(args.config)
     use_prior = bool(prior_config["enabled_after_phase_a"]) and not args.disable_trellis_prior
-    if use_prior and args.trellis_checkpoint is None:
-        raise ValueError("inference requires --trellis-checkpoint unless the prior is explicitly disabled")
+    if use_prior:
+        args.trellis_checkpoint = resolve_trellis_checkpoint(args.trellis_checkpoint)
     image_size = dataset_config.get("image_size", [518, 518])
     dataset = MeshFleetObjectDataset(
         MeshFleetDatasetConfig(

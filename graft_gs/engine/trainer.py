@@ -340,46 +340,104 @@ class AtlasDDPSynchronizer:
 
     def synchronize_trellis_prior_measure(
         self,
-        measure: TrellisPriorMeasure,
+        measure: Optional[TrellisPriorMeasure],
+        dtype: torch.dtype = torch.float32,
     ) -> TrellisPriorMeasure:
-        """Broadcast rank-zero hidden support before persistent atlas creation."""
+        """Broadcast source-only hidden support before persistent atlas creation.
+
+        TRELLIS is frozen and sampled under ``no_grad``. Running it on every
+        same-object rank is therefore redundant rather than an autograd path.
+        Non-source ranks pass ``None`` and allocate from broadcast metadata.
+        """
 
         if not self.context.distributed:
+            if measure is None:
+                raise ValueError("single-rank TRELLIS synchronization requires a measure")
             return measure
+        if self.context.rank == self.source_rank:
+            if measure is None:
+                raise ValueError("the TRELLIS source rank did not produce a prior measure")
+            metadata_values = (
+                measure.positions.shape[0],
+                measure.sample_count,
+                measure.resolution,
+            )
+        else:
+            if measure is not None:
+                raise ValueError("non-source TRELLIS rank must not sample a redundant prior")
+            metadata_values = (0, 0, 0)
         metadata = torch.tensor(
-            [measure.positions.shape[0], measure.sample_count, measure.resolution],
+            metadata_values,
             dtype=torch.int64,
             device=self.context.device,
         )
         dist.broadcast(metadata, src=self.source_rank)
         count, sample_count, resolution = map(int, metadata.tolist())
 
-        def synchronize(value: Tensor, shape: tuple[int, ...], dtype: torch.dtype) -> Tensor:
+        def synchronize(
+            value: Optional[Tensor],
+            shape: tuple[int, ...],
+            value_dtype: torch.dtype,
+        ) -> Tensor:
             if self.context.rank == self.source_rank:
-                tensor = value.to(device=self.context.device, dtype=dtype).contiguous()
+                if value is None:
+                    raise RuntimeError("source TRELLIS tensor is unavailable")
+                tensor = value.to(
+                    device=self.context.device,
+                    dtype=value_dtype,
+                ).contiguous()
                 if tuple(tensor.shape) != shape:
                     raise RuntimeError("rank-zero TRELLIS prior has inconsistent metadata")
             else:
-                tensor = torch.empty(shape, dtype=dtype, device=self.context.device)
+                tensor = torch.empty(
+                    shape,
+                    dtype=value_dtype,
+                    device=self.context.device,
+                )
             dist.broadcast(tensor, src=self.source_rank)
             return tensor
 
         synchronized = TrellisPriorMeasure(
-            coordinates=synchronize(measure.coordinates, (count, 3), torch.int64),
-            positions=synchronize(measure.positions, (count, 3), measure.positions.dtype),
+            coordinates=synchronize(
+                measure.coordinates if measure is not None else None,
+                (count, 3),
+                torch.int64,
+            ),
+            positions=synchronize(
+                measure.positions if measure is not None else None,
+                (count, 3),
+                dtype,
+            ),
             probability=synchronize(
-                measure.probability, (count,), measure.probability.dtype
+                measure.probability if measure is not None else None,
+                (count,),
+                dtype,
             ),
-            mass=synchronize(measure.mass, (count,), measure.mass.dtype),
+            mass=synchronize(
+                measure.mass if measure is not None else None,
+                (count,),
+                dtype,
+            ),
             mass_variance=synchronize(
-                measure.mass_variance, (count,), measure.mass_variance.dtype
+                measure.mass_variance if measure is not None else None,
+                (count,),
+                dtype,
             ),
-            vote_count=synchronize(measure.vote_count, (count,), torch.int64),
+            vote_count=synchronize(
+                measure.vote_count if measure is not None else None,
+                (count,),
+                torch.int64,
+            ),
             sample_count=sample_count,
             resolution=resolution,
         )
         synchronized.validate()
         return synchronized
+
+    def should_sample_trellis_prior(self) -> bool:
+        """Whether this rank owns frozen TRELLIS sampling in same-object DDP."""
+
+        return not self.context.distributed or self.context.rank == self.source_rank
 
     def aggregate_prior_images(self, images: Tensor) -> Tensor:
         """Gather disjoint same-object view shards for TRELLIS conditioning."""

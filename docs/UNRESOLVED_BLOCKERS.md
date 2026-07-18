@@ -1,22 +1,26 @@
 # Unresolved blockers and incomplete research work
 
-Updated 2026-07-16. An item is called externally blocked only when code or a
+Updated 2026-07-17. An item is called externally blocked only when code or a
 server validation definition exists and progress requires unavailable hardware,
 checkpoints, data, or a compiled server dependency.
 
 ## External execution blockers
 
-- Full VGGT/TRELLIS/GRAFT checkpoint forward and backward require the enterprise
-  A800 environment and checkpoint access.
+- Full VGGT/TRELLIS adapter forwards require execution of the new real-view
+  preflight in the enterprise A800 environment. The user reports that both
+  released checkpoints exist in the server's default caches; their GRAFT-GS
+  adapter results and provenance JSON have not yet been returned to this local
+  workspace. A trained GRAFT checkpoint still requires staged training.
 - CUDA/reference raster equivalence requires the server-built
   `diff_gaussian_rasterization` extension.
 - Six-rank DDP equivalence, rank-local RNG resume, peak memory, and throughput
   measurements require a multi-A800 `torchrun` execution.
-- One-object overfitting and real multiview inference require an actual training
-  subset and trained GRAFT-GS phase checkpoints. The audited local MeshFleet
-  tree has one canonical test object and no usable train population.
-- TRELLIS hidden-support and structured-latent behavior cannot be numerically
-  validated without the pinned external TRELLIS checkpoint.
+- One-object overfitting and real multiview inference require the remote full
+  train/test corpus and trained GRAFT-GS phase checkpoints. The local single
+  sample is schema/audit provenance only and is never a production root.
+- TRELLIS hidden-support and structured-latent behavior remains numerically
+  pending until the server executes its cached released checkpoint through
+  `scripts/validate_external_models.py trellis` and the production suite.
 - Learned VGG perceptual behavior cannot be validated without an explicitly
   pinned local checkpoint; the implementation deliberately has no downloader.
 - The one-step quantization inequality requires a conservative A800-measured

@@ -30,7 +30,14 @@ class FolderMultiviewDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, object]:
         directory, paths, target = self.objects[index]
-        from vggt.utils.load_fn import load_and_preprocess_images
+        # Resolve installed packages and explicit server checkouts through the
+        # same provenance-aware boundary used by the production adapter.
+        from ..integration.external import import_external_module
+
+        load_and_preprocess_images = getattr(
+            import_external_module("vggt.utils.load_fn"),
+            "load_and_preprocess_images",
+        )
 
         result: dict[str, object] = {
             "object_id": directory.name,

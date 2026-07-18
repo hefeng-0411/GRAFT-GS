@@ -7,8 +7,10 @@ the pinned VGGT/TRELLIS/PyTorch environment.
 ## Required environment
 
 ```bash
-export VGGT_CHECKPOINT=/checkpoints/VGGT-1B
-export TRELLIS_CHECKPOINT=/checkpoints/TRELLIS-image-large
+export GRAFT_GS_VGGT_CHECKPOINT=facebook/VGGT-1B
+export GRAFT_GS_TRELLIS_CHECKPOINT=microsoft/TRELLIS-image-large
+export VGGT_CHECKPOINT="$GRAFT_GS_VGGT_CHECKPOINT"
+export TRELLIS_CHECKPOINT="$GRAFT_GS_TRELLIS_CHECKPOINT"
 export GRAFT_GS_CHECKPOINT=/checkpoints/graft-gs-phase-f.pt
 export GRAFT_GS_REAL_IMAGE_DIR=/data/real_multiview_object/images
 export GRAFT_GS_MESHFLEET_ROOT=/mnt/sda2/hef/Base/dataset
@@ -18,6 +20,13 @@ export GRAFT_GS_RUN_TRAINING_TESTS=1
 export GRAFT_GS_PYTHON=/mnt/sda1/miniforge3/envs/CRAFT/bin/python
 export PYTHONHASHSEED=0
 ```
+
+The two model variables may be omitted when the released checkpoints already
+exist in the default Hugging Face cache. Resolution is CLI override, then the
+`GRAFT_GS_*` variable above, then the compatible legacy upstream variable,
+then the official identifier. Set `GRAFT_GS_VGGT_ROOT` or
+`GRAFT_GS_TRELLIS_ROOT` only when the upstream package is not installed and an
+explicit server checkout must be imported.
 
 Before importing PyTorch, verify that the active interpreter has every one of
 the 444 exact versions pinned by the repository. This check is metadata-only;
@@ -87,6 +96,20 @@ The validator injects the audited dataset root and manifest into the test
 subprocess. It rejects dataset/backend skips; only the separate six-rank DDP
 launch and a separately configured real-image/checkpoint run may remain skipped
 in this single-GPU reference command.
+
+Before the unittest suite, the validator runs
+`scripts/validate_external_models.py` twice in isolated processes. The VGGT
+pass loads the resolved checkpoint, runs the production adapter on two real
+manifest-selected views, verifies finite camera/depth/point outputs and SO(3)
+margins, and records peak VRAM. The TRELLIS pass loads its resolved checkpoint,
+runs two multi-image sparse-structure posterior draws, forms the Jeffreys
+support measure, and records resolution/support/probability bounds and peak
+VRAM. Selection is by an explicit object ID when supplied to that script, or a
+documented lexicographic smoke-record policy; no canonical ID or first-manifest
+assumption is used. The policy evaluates the production task-admission
+predicate first and passes the winning ID through the bounded runtime selector,
+so only one object is constructed even when the manifest contains the complete
+remote corpus.
 
 Manifest reuse is conditional on resolved-root equality, schema
 `meshfleet-trellis-object-v2`, the modality-centric intersection policy,

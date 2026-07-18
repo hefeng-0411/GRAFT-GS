@@ -25,6 +25,11 @@ integration.  Upstream directories remain unmodified.
   four 2048-wide taps are fused with learned scalar tap weights and a
   deterministically orthogonal-initialized 2048-to-1024 projection. Late
   attention/FFN maps can receive LoRA only in phases D-F.
+- The released checkpoint also contains a query-conditioned iterative track
+  head. It is not the `[B,K,1369,256]` descriptor tensor asserted by the
+  Markdown and there is no released normal head. GRAFT-GS therefore uses the
+  released camera/depth/point outputs to derive dense projective cycles and
+  world normals instead of fabricating unavailable descriptor fields.
 
 ## TRELLIS
 
@@ -43,11 +48,24 @@ integration.  Upstream directories remain unmodified.
   shape prior and architectural initialization source. Its independent asset
   decoders are excluded because they would break the one-atlas PLY/GLB
   invariant.
+- The audited tensor conditioning contract is floating RGB `[K,3,518,518]` in
+  `[0,1]`; MeshFleet's black-alpha composite matches the producer's TRELLIS
+  feature extraction path. Multi-image injection is run-scoped and is created
+  once per posterior sampler call. Same-object DDP samples on source rank only
+  and broadcasts the resulting typed prior measure.
 
 ## Integration and execution boundary
 
 - `scripts/reproduce_baseline.py` calls the untouched public VGGT and TRELLIS
   pipelines and emits control artifacts on the server.
+- `scripts/validate_external_models.py` executes the actual GRAFT-GS adapters
+  on two real views selected dynamically from admitted manifest records. VGGT
+  and TRELLIS run in separate subprocesses and record upstream module/checkpoint
+  provenance, tensor/support contracts, runtime, and peak CUDA allocation.
+- Every production entry point uses `CLI -> environment -> official hub ID`
+  checkpoint resolution. Installed packages are preferred; explicit checkouts
+  use `GRAFT_GS_VGGT_ROOT` or `GRAFT_GS_TRELLIS_ROOT`. No Windows path appears
+  in executable source or configuration.
 - `scripts/infer_multiview.py` runs the GRAFT-GS vertical slice and exports both
   formats from the selected atlas.
 - Both inference paths optionally emit a computed metric topology-margin

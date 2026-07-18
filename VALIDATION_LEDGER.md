@@ -202,3 +202,51 @@ Exact local command:
 `-m unittest tests.test_meshfleet_dynamic_discovery
 tests.test_meshfleet_manifest_static tests.test_server_manifest_handoff_static
 tests.test_scientific_trace_static -v`.
+
+Released-model integration cycle (2026-07-17): upstream VGGT, TRELLIS, and
+MeshFleet producer source was re-read at the adapter boundaries. Whole-tree
+`compileall` passed after checkpoint-resolution, sampler-lifetime,
+source-rank-prior, and remote-path repairs. The final locally executable command
+ran 53 tests: 52 passed and one PyTorch-dependent dynamic-loader test was
+skipped because the bundled desktop runtime has no PyTorch. This inventory
+includes five exact-environment/checkpoint-resolution tests, eight server
+manifest/accelerator handoff tests, seven dynamic-discovery tests, ten checked
+manifest/topology tests, and twenty-three scientific production-path static
+guards. No A800/model forward result is inferred.
+
+Server-ready additions not locally executed: `tests/test_external_adapters.py`
+checks per-posterior TRELLIS injection ownership, tensor-domain rejection, and
+RNG isolation under PyTorch; the updated six-rank test supplies a prior only on
+rank zero and verifies float64 typed broadcast; and
+`scripts/validate_external_models.py` runs actual cached VGGT/TRELLIS
+checkpoints on real dynamically selected MeshFleet views. `validate_server.py`
+now fails before the main suite if either checkpoint-backed adapter preflight
+fails. Expected output records are `outputs/validation/external_vggt.json`,
+`external_trellis.json`, and the enclosing `reference.json`.
+
+Bounded remote smoke-record cycle (2026-07-17): whole-tree `compileall` passed.
+The final focused command executed 55 tests: 54 passed and the one
+PyTorch-dependent tensor-loader test was skipped because the bundled desktop
+runtime has no PyTorch. New meaningful failure cases verify that runtime
+selection is not confused with a manifest catalog, an ID absent from the
+selected split is named explicitly, and the checkpoint preflight applies the
+production admission predicate before constructing exactly one object-level
+dataset. Requirement `DATA-REMOTE-SELECT-01` is locally validated at the
+manifest/orchestration boundary; actual image tensors and released checkpoint
+forwards remain A800-pending.
+
+Exact command:
+`C:\Users\10992\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe
+-m compileall -q graft_gs scripts tests`, followed by
+`-m unittest -v tests.test_meshfleet_dynamic_discovery
+tests.test_scientific_trace_static tests.test_environment_contract_static
+tests.test_server_manifest_handoff_static tests.test_meshfleet_manifest_static`.
+
+Released input-domain cycle (2026-07-17): whole-tree `compileall` and the 33
+locally executable scientific/dynamic-discovery tests passed with the one
+expected PyTorch loader skip. Static production tracing confirms the VGGT
+`[0,1]` guard. Two PyTorch mock-boundary tests were added to
+`tests/test_external_adapters.py`; they are discovered by the server suite but
+were not executed in the bundled no-PyTorch desktop runtime. Requirement
+`UPSTREAM-INPUT-01` is therefore syntax/static validated locally and awaits
+the exact pinned server Python for its numerical execution.

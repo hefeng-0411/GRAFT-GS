@@ -10,19 +10,25 @@ from __future__ import annotations
 
 import argparse
 from pathlib import Path
-import sys
 
 import torch
 
-
-ROOT = Path(__file__).resolve().parents[1]
+from graft_gs.integration.external import (
+    import_external_module,
+    resolve_trellis_checkpoint,
+    resolve_vggt_checkpoint,
+)
 
 
 def reproduce_vggt(images_directory: Path, output: Path, checkpoint: str) -> None:
-    sys.path.insert(0, str(ROOT / "vggt"))
-    from vggt.models.vggt import VGGT
-    from vggt.utils.load_fn import load_and_preprocess_images
-    from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+    VGGT = getattr(import_external_module("vggt.models.vggt"), "VGGT")
+    load_and_preprocess_images = getattr(
+        import_external_module("vggt.utils.load_fn"), "load_and_preprocess_images"
+    )
+    pose_encoding_to_extri_intri = getattr(
+        import_external_module("vggt.utils.pose_enc"),
+        "pose_encoding_to_extri_intri",
+    )
 
     paths = sorted(
         path for path in images_directory.iterdir() if path.suffix.lower() in {".png", ".jpg", ".jpeg", ".webp"}
@@ -54,10 +60,11 @@ def reproduce_vggt(images_directory: Path, output: Path, checkpoint: str) -> Non
 
 
 def reproduce_trellis(image_path: Path, output_directory: Path, checkpoint: str, seed: int) -> None:
-    sys.path.insert(0, str(ROOT / "TRELLIS"))
     from PIL import Image
-    from trellis.pipelines import TrellisImageTo3DPipeline
-    from trellis.utils import postprocessing_utils
+    TrellisImageTo3DPipeline = getattr(
+        import_external_module("trellis.pipelines"), "TrellisImageTo3DPipeline"
+    )
+    postprocessing_utils = import_external_module("trellis.utils.postprocessing_utils")
 
     pipeline = TrellisImageTo3DPipeline.from_pretrained(checkpoint)
     pipeline.cuda()
@@ -79,17 +86,26 @@ def main() -> None:
     vggt = subparsers.add_parser("vggt")
     vggt.add_argument("images", type=Path)
     vggt.add_argument("--output", type=Path, default=Path("outputs/baselines/vggt.pt"))
-    vggt.add_argument("--checkpoint", default="facebook/VGGT-1B")
+    vggt.add_argument("--checkpoint")
     trellis = subparsers.add_parser("trellis")
     trellis.add_argument("image", type=Path)
     trellis.add_argument("--output", type=Path, default=Path("outputs/baselines/trellis"))
-    trellis.add_argument("--checkpoint", default="microsoft/TRELLIS-image-large")
+    trellis.add_argument("--checkpoint")
     trellis.add_argument("--seed", type=int, default=1)
     arguments = parser.parse_args()
     if arguments.baseline == "vggt":
-        reproduce_vggt(arguments.images, arguments.output, arguments.checkpoint)
+        reproduce_vggt(
+            arguments.images,
+            arguments.output,
+            resolve_vggt_checkpoint(arguments.checkpoint),
+        )
     else:
-        reproduce_trellis(arguments.image, arguments.output, arguments.checkpoint, arguments.seed)
+        reproduce_trellis(
+            arguments.image,
+            arguments.output,
+            resolve_trellis_checkpoint(arguments.checkpoint),
+            arguments.seed,
+        )
 
 
 if __name__ == "__main__":

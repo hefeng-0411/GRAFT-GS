@@ -10,13 +10,24 @@ import unittest
 import torch
 
 from graft_gs.engine import load_graft_checkpoint, validate_trellis_prior_policy
-from graft_gs.integration import GraftGS, GraftGSConfig, TrellisPriorAdapter, VGGTAdapter
+from graft_gs.integration import (
+    GraftGS,
+    GraftGSConfig,
+    TrellisPriorAdapter,
+    VGGTAdapter,
+    import_external_module,
+    resolve_trellis_checkpoint,
+    resolve_vggt_checkpoint,
+)
 
 
 @unittest.skipUnless(os.environ.get("GRAFT_GS_REAL_IMAGE_DIR"), "set GRAFT_GS_REAL_IMAGE_DIR on the server")
 class RealMultiviewTest(unittest.TestCase):
     def test_checkpoint_inference_export_and_reload(self) -> None:
-        from vggt.utils.load_fn import load_and_preprocess_images
+        load_and_preprocess_images = getattr(
+            import_external_module("vggt.utils.load_fn"),
+            "load_and_preprocess_images",
+        )
 
         image_directory = Path(os.environ["GRAFT_GS_REAL_IMAGE_DIR"])
         paths = sorted(
@@ -25,11 +36,11 @@ class RealMultiviewTest(unittest.TestCase):
         self.assertGreaterEqual(len(paths), 2)
         paths = paths[: int(os.environ.get("GRAFT_GS_REAL_VIEW_COUNT", "8"))]
         device = torch.device("cuda")
-        adapter = VGGTAdapter.from_pretrained(os.environ.get("VGGT_CHECKPOINT", "facebook/VGGT-1B"))
+        adapter = VGGTAdapter.from_pretrained(resolve_vggt_checkpoint())
         prior = None
         if os.environ.get("GRAFT_GS_USE_TRELLIS_PRIOR", "0") == "1":
             prior = TrellisPriorAdapter.from_pretrained(
-                os.environ.get("TRELLIS_CHECKPOINT", "microsoft/TRELLIS-image-large")
+                resolve_trellis_checkpoint()
             )
         model = GraftGS(adapter, GraftGSConfig(), prior)
         checkpoint = os.environ.get("GRAFT_GS_CHECKPOINT")
@@ -75,7 +86,7 @@ class RealMultiviewTest(unittest.TestCase):
     def test_trainer_checkpoint_round_trip(self) -> None:
         from graft_gs.engine import GraftGSTrainer, TrainerConfig, TrainingPhase
 
-        adapter = VGGTAdapter.from_pretrained(os.environ.get("VGGT_CHECKPOINT", "facebook/VGGT-1B"))
+        adapter = VGGTAdapter.from_pretrained(resolve_vggt_checkpoint())
         model = GraftGS(adapter, GraftGSConfig(run_flow=False))
         with tempfile.TemporaryDirectory() as directory:
             trainer = GraftGSTrainer(

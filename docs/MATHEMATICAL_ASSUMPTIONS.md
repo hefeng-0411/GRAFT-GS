@@ -1,5 +1,27 @@
 # Mathematical assumptions and validity domain
 
+## Released-model boundary
+
+- VGGT input is floating RGB in `[0,1]`, with shape `[B,K,3,H,W]`. The audited
+  released checkpoint has four non-null concatenated frame/global taps of width
+  2048 and camera/depth/point heads with the inspected signatures. An upstream
+  version changing these fields is rejected, not silently adapted.
+- VGGT camera conversion is OpenCV world-to-camera with pixel intrinsics. The
+  single supervised Sim(3) alignment is valid only for nondegenerate multi-view
+  camera centers and removes no per-camera residual.
+- Released VGGT includes a query-conditioned track head but not the
+  specification's dense patch-descriptor tensor. Projective track-cycle
+  supervision assumes depth/camera predictions describe the same static scene.
+- TRELLIS tensor conditioning is floating RGB `[K,3,H,W]` in `[0,1]`; its
+  sparse structure is `[batch,x,y,z]` on the declared integer resolution. The
+  empirical Beta-Bernoulli support assumes posterior draws are deterministic
+  under the recorded object seed and checkpoint. It is a prior, not calibrated
+  ground-truth occupancy.
+- In same-object DDP the TRELLIS pipeline is frozen and evaluated under
+  `no_grad`; source-only sampling followed by exact tensor broadcast is
+  mathematically equivalent to redundant identical-rank sampling conditional
+  on equal gathered images, checkpoint, sampler parameters, and RNG seed.
+
 ## Cameras and evidence
 
 - MeshFleet camera manifests are Blender/OpenGL camera-to-world transforms.
@@ -210,3 +232,12 @@
   optional modality absence is missing supervision, never a zero target.
   Multiple physical artifacts for the same `(split, modality, object, kind)`
   are ambiguous and are not silently resolved.
+- A runtime object subset is selection over an immutable audited manifest, not
+  a new corpus definition. Every selected ID must be a valid 64-hex identity,
+  must belong to the manifest catalog when a catalog was used, and must pass
+  the same split- and phase-relative admission predicate as an unfiltered
+  record before any tensor is loaded.
+- Released VGGT and TRELLIS tensor conditioning assumes finite floating RGB in
+  `[0,1]` with at least one physical view. Alpha compositing and resizing occur
+  in the audited MeshFleet loader; neither adapter silently rescales byte
+  images, clips outliers, fills invalid views, or imputes a missing channel.

@@ -134,6 +134,92 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("torch.log1p(-shape_prior)", topology)
         self.assertIn("def node_shape_probability", prior)
 
+    def test_released_model_adapters_preserve_upstream_runtime_contracts(self) -> None:
+        vggt = source("graft_gs/integration/vggt_adapter.py")
+        trellis = source("graft_gs/integration/trellis_prior.py")
+        external = source("graft_gs/integration/external.py")
+        self.assertIn('import_external_module("vggt.models.vggt")', vggt)
+        self.assertIn('import_external_module("vggt.utils.pose_enc")', vggt)
+        self.assertIn("released four VGGT cached taps", vggt)
+        self.assertIn("VGGT tensor inputs must use the released [0,1] RGB contract", vggt)
+        self.assertIn('import_external_module("trellis.pipelines")', trellis)
+        self.assertIn('mode="multidiffusion"', trellis)
+        self.assertIn("TRELLIS tensor inputs must use the released [0,1] RGB contract", trellis)
+        self.assertIn('values.view(torch.uint8).numpy().tobytes(order="C")', trellis)
+        self.assertIn("self._sample_cache.popitem(last=False)", trellis)
+        self.assertIn('DEFAULT_VGGT_CHECKPOINT = "facebook/VGGT-1B"', external)
+        self.assertIn(
+            'DEFAULT_TRELLIS_CHECKPOINT = "microsoft/TRELLIS-image-large"',
+            external,
+        )
+
+        tree = ast.parse(trellis)
+        sample = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef) and node.name == "sample"
+        )
+        posterior_loop = next(
+            node
+            for node in ast.walk(sample)
+            if isinstance(node, ast.For)
+            and isinstance(node.target, ast.Name)
+            and node.target.id == "sample_index"
+        )
+
+        def injection_calls(node: ast.AST) -> list[ast.Call]:
+            return [
+                value
+                for value in ast.walk(node)
+                if isinstance(value, ast.Call)
+                and isinstance(value.func, ast.Attribute)
+                and value.func.attr == "inject_sampler_multi_image"
+            ]
+
+        self.assertEqual(len(injection_calls(sample)), 1)
+        self.assertEqual(len(injection_calls(posterior_loop)), 1)
+
+    def test_same_object_ddp_samples_frozen_trellis_only_on_source_rank(self) -> None:
+        trainer = source("graft_gs/engine/trainer.py")
+        pipeline = source("graft_gs/integration/pipeline.py")
+        distributed_test = source("tests/test_distributed_evidence.py")
+        self.assertIn("def should_sample_trellis_prior", trainer)
+        self.assertIn("non-source TRELLIS rank must not sample", trainer)
+        self.assertIn("distributed_synchronizer.should_sample_trellis_prior()", pipeline)
+        self.assertIn("prior_measure,\n                            dtype=root_bounds[0].dtype", pipeline)
+        self.assertIn("if context.rank == 0\n            else None", distributed_test)
+
+    def test_remote_entry_points_resolve_checkpoint_environment_at_runtime(self) -> None:
+        scripts = (
+            "scripts/train_a800.py",
+            "scripts/evaluate_meshfleet.py",
+            "scripts/infer_meshfleet.py",
+            "scripts/infer_multiview.py",
+            "scripts/refine_teacher_bundle.py",
+            "scripts/run_ablations.py",
+            "scripts/overfit_meshfleet_object.py",
+        )
+        for script in scripts:
+            content = source(script)
+            self.assertIn("resolve_vggt_checkpoint", content, script)
+            self.assertIn("resolve_trellis_checkpoint", content, script)
+            self.assertNotIn("default=DEFAULT_VGGT_CHECKPOINT", content, script)
+            self.assertNotIn("default=DEFAULT_TRELLIS_CHECKPOINT", content, script)
+        for subtree in ("graft_gs", "scripts", "configs"):
+            for path in (ROOT / subtree).rglob("*"):
+                if path.is_file() and path.suffix in {".py", ".yaml", ".yml", ".sh"}:
+                    content = path.read_text(encoding="utf8")
+                    self.assertNotIn("D:\\VsCode", content, str(path))
+
+    def test_external_preflight_selects_one_manifest_record_before_loading(self) -> None:
+        content = source("scripts/validate_external_models.py")
+        self.assertIn("load_meshfleet_manifest(manifest)", content)
+        self.assertIn("meshfleet_record_admission_reasons(record, candidate_config)", content)
+        self.assertIn("include_object_ids=(record.object_id,)", content)
+        self.assertIn("MeshFleetObjectDataset(selected_config)", content)
+        self.assertNotIn('split="train"', content)
+        self.assertNotIn('split="test"', content)
+
     def test_octree_refinement_uses_retained_camera_reprojection(self) -> None:
         mapping = source("graft_gs/mapping/manifold_mapping.py")
         pipeline = source("graft_gs/integration/pipeline.py")
@@ -202,6 +288,8 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("manifest missing-ID inventory differs", validator)
         self.assertIn("dynamic dataset discovery produced an empty manifest", validator)
         self.assertIn('test_environment["GRAFT_GS_MESHFLEET_ROOT"]', validator)
+        self.assertIn('"validate_external_models.py"', validator)
+        self.assertIn('for component in ("vggt", "trellis")', validator)
         self.assertIn("unexpected_skip_reasons", validator)
         self.assertIn("requirements_sha256", environment)
 

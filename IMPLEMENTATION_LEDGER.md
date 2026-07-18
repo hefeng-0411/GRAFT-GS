@@ -424,3 +424,70 @@ The full conditional validity domain is maintained in
   required-modality intersection, valid 64-hex identities, valid split names,
   consistent split counts, and discovered-ID digest. No canonical object or
   record ordering is assumed.
+
+## 2026-07-17 released-model integration and remote-only deployment
+
+- Requirement: use the remote full corpus and default cached upstream models
+  without embedding local dataset/checkpoint/repository paths.
+- Production path: all training, inference, evaluation, overfit, ablation,
+  teacher-refinement, and baseline entry points now resolve checkpoints as
+  explicit CLI value, GRAFT-GS environment value, compatible legacy upstream
+  value, then official model-hub ID. Package import is installation-first with
+  optional `GRAFT_GS_VGGT_ROOT`/`GRAFT_GS_TRELLIS_ROOT` checkout provenance.
+- Verified against upstream source: VGGT aggregator cached taps
+  `{4,11,17,23}`, concatenated width 2048, camera/depth/point head signatures,
+  OpenCV pose conversion, and `[0,1]` input domain; TRELLIS tensor conditioning,
+  `cond/neg_cond`, multi-image sampler injection, `[batch,x,y,z]` structure
+  output, structure-flow resolution, and `Pipeline.to` contract.
+- Repaired TRELLIS posterior sampling so each sequential draw owns fresh
+  upstream injection state. Added finite/floating/[0,1] tensor validation and
+  explicit `cond`/`neg_cond` contract checks.
+- Added a bounded LRU for the frozen deterministic prior keyed by SHA-256 of
+  exact conditioning tensor bytes, dtype/shape, seed, sample count, and sampler
+  steps. It reuses only identical integer support and therefore removes
+  duplicate Phase-E teacher/student and Phase-F replay work without changing a
+  numerical result; changed views or perturbations cannot alias by policy.
+- Same-object DDP no longer executes the frozen TRELLIS sampler redundantly on
+  six ranks. All views are gathered, source rank samples, and a dtype-preserving
+  probability/mass/variance/vote measure is broadcast before every rank builds
+  the same persistent atlas. Ordinary object-level DDP is unchanged.
+- Added `scripts/validate_external_models.py`; `validate_server.py` invokes its
+  VGGT and TRELLIS real-view passes in separate processes and records upstream
+  provenance, tensor/support contracts, SO(3) error, runtime, and peak CUDA
+  allocation. The smoke object is manifest-selected, not hardcoded.
+- Removed executable-source workstation dataset defaults. Real-data tests use
+  the server environment or the generated manifest-summary provenance; only
+  `docs/DATASET_AUDIT.md` retains the local audit path as historical evidence.
+
+## 2026-07-17 bounded remote smoke-record selection
+
+- Requirement `DATA-REMOTE-SELECT-01`: checkpoint-backed VGGT/TRELLIS
+  validation must use the full remote manifest without constructing every
+  object in a split merely to load one smoke fixture.
+- Production path: `validate_server.py` -> `validate_external_models.py` ->
+  `MeshFleetDatasetConfig.include_object_ids` -> `MeshFleetObjectDataset`.
+- `include_object_ids` is an explicit runtime subset, separate from the
+  optional `object_id_file` manifest identity catalog. It is validated as a
+  unique set of 64-hex IDs; when both mechanisms are present, the runtime set
+  must be a subset of the catalog.
+- Selection is applied before phase-relative admission checks and tensor I/O.
+  Coverage reports selected and split-absent IDs, and an empty selection now
+  names every absent ID rather than emitting an uninformative empty detail.
+- The external-model preflight first applies the same
+  `meshfleet_record_admission_reasons` predicate as the loader, then chooses
+  one deterministic record and instantiates only that object. A record with
+  two render files but invalid task-specific normalization can no longer hide
+  a later valid record.
+
+## 2026-07-17 released input-domain parity
+
+- Requirement `UPSTREAM-INPUT-01`: both external adapters must enforce their
+  audited tensor contract before checkpoint code executes.
+- Production path: MeshFleet `[0,1]` composites -> `VGGTAdapter.forward` and
+  `TrellisPriorAdapter.sample`.
+- VGGT now matches the existing TRELLIS boundary by rejecting empty scene/view
+  batches, non-RGB shape, non-floating tensors, non-finite values, and values
+  outside `[0,1]`. This prevents invalid padding or normalization from entering
+  the released aggregator and producing opaque downstream geometry failures.
+- `test_external_adapters.py` contains CPU-safe mock-boundary tests whose mock
+  aggregator fails if invalid input reaches upstream inference.

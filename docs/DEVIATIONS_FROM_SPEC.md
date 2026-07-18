@@ -103,11 +103,33 @@
     product-manifold probe, with all teacher factors parallel-transported into
     the student tangent space. This is scalable but does not identify every
     singular direction of the Jacobian.
-24. **Derived VGGT tracks and normals.** The released adapter does not expose a
-    distinct correspondence or normal head. Rather than inventing tensors, the
-    implementation constructs track cycles by depth/camera unprojection and
-    derives world normals from adjacent depth rays, with confidence,
-    visibility, and explicit pseudo-label provenance.
+24. **Derived VGGT tracks and normals.** Released VGGT has a query-conditioned
+    track head, but it does not expose the Markdown's asserted
+    `[B,K,1369,256]` per-patch track-descriptor tensor and has no normal head.
+    Densely querying every patch would add a separate iterative correlation
+    solve and would still not produce the specified descriptor contract.
+    Rather than inventing that tensor, the reference path constructs dense
+    track cycles by depth/camera unprojection and derives world normals from
+    adjacent depth rays, with confidence, visibility, and explicit
+    pseudo-label provenance. The untouched baseline script remains available
+    for query-conditioned upstream tracking experiments.
+25. **Deployment-safe upstream discovery.** Production code imports installed
+    `vggt`/`trellis` packages or explicit server checkout roots; it contains no
+    developer-workstation path or sibling-repository assumption. Checkpoints
+    resolve in the order CLI, `GRAFT_GS_*_CHECKPOINT`, legacy upstream
+    environment variable, then the released model-hub identifier. This is an
+    execution-boundary clarification rather than a mathematical change.
+26. **Source-only TRELLIS sampling in same-object DDP.** The structured prior
+    is frozen and sampled under `no_grad`; sampling it independently on six
+    ranks cannot add a gradient. Same-object mode therefore gathers every view,
+    samples only on the designated source rank, and broadcasts the typed
+    probability/mass/variance measure before atlas construction. Object-level
+    DDP remains rank-local because its ranks contain different objects.
+27. **Exact frozen-prior reuse.** TRELLIS structure sampling is deterministic
+    for fixed checkpoint, tensor conditioning, sampler policy, and seed. A
+    bounded LRU hashes the exact float tensor bytes and all sampler identity
+    fields, then stores only integer coordinates. This is exact memoization,
+    not latent quantization or an approximate learned substitute.
 25. **Rendering-based offline bundle adjustment.** The specification writes
     sparse reprojection correspondences `u_kj`, but the released local contract
     provides no persistent cross-view track IDs. The teacher therefore refines

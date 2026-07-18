@@ -18,7 +18,13 @@ from graft_gs.engine import (
     load_server_config,
     load_trellis_prior_config,
 )
-from graft_gs.integration import GraftGS, TrellisPriorAdapter, VGGTAdapter
+from graft_gs.integration import (
+    GraftGS,
+    TrellisPriorAdapter,
+    VGGTAdapter,
+    resolve_trellis_checkpoint,
+    resolve_vggt_checkpoint,
+)
 
 
 class RepeatedMapping:
@@ -41,12 +47,13 @@ def main() -> None:
     parser.add_argument("--maximum-views", type=int, default=12)
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--minimum-relative-improvement", type=float, default=0.01)
-    parser.add_argument("--vggt-checkpoint", default="facebook/VGGT-1B")
+    parser.add_argument("--vggt-checkpoint")
     parser.add_argument("--trellis-checkpoint")
     parser.add_argument("--initialize-from", type=Path)
     parser.add_argument("--config", type=Path, default=Path("configs/graft_gs_a800_native.yaml"))
     parser.add_argument("--output", type=Path, default=Path("outputs/meshfleet_overfit"))
     args = parser.parse_args()
+    args.vggt_checkpoint = resolve_vggt_checkpoint(args.vggt_checkpoint)
 
     model_config, training_config, _, dataset_config = load_server_config(args.config)
     configured_id_file = dataset_config.get("object_id_file")
@@ -56,8 +63,8 @@ def main() -> None:
     loss_weights = load_loss_weights(args.config)
     prior_config = load_trellis_prior_config(args.config)
     use_prior = bool(prior_config["enabled_after_phase_a"])
-    if use_prior and args.trellis_checkpoint is None:
-        raise ValueError("Phase-B overfit requires --trellis-checkpoint")
+    if use_prior:
+        args.trellis_checkpoint = resolve_trellis_checkpoint(args.trellis_checkpoint)
     image_size = dataset_config.get("image_size", [518, 518])
     dataset = MeshFleetObjectDataset(
         MeshFleetDatasetConfig(

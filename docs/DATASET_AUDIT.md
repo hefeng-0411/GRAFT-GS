@@ -7,9 +7,15 @@ unmodified TRELLIS `dataset_toolkits` tree. The inspected data root was
 `D:/VsCode/MVG/Base/MeshFleet_TRELLIS`. The generated manifest is
 `data_manifests/meshfleet_local_audit.jsonl`.
 
-The supplied local data contains zero objects under `train` and one object
+These paths are audit provenance only. No executable source, configuration, or
+test default uses them as a production dataset location. Remote commands pass
+the corpus root explicitly or through `GRAFT_GS_MESHFLEET_ROOT`; every manifest
+artifact path is root-relative and containment checked.
+
+The supplied local audit copy contains zero objects under `train` and one object
 under `test`. Consequently, the requested cross-object train/test variation
-audit cannot be performed from the supplied files. The loader supports flat
+audit cannot be performed from the local files; the user reports that the
+remote root contains the complete train/test corpus. The loader supports flat
 and category-nested modality trees, but schema variation beyond the single
 physical object remains an external validation item. No additional objects or
 modalities are inferred.
