@@ -8,7 +8,13 @@ from .assets import (
     write_gaussian_ply,
     write_mesh_glb,
 )
-from .renderer import CameraBatch, CudaGaussianRenderer, ReferenceGaussianRenderer, RenderResult
+from .renderer import (
+    CameraBatch,
+    CudaGaussianRenderer,
+    RasterizationContract,
+    ReferenceGaussianRenderer,
+    RenderResult,
+)
 
 __all__ = [
     "AnalyticalReadoutConfig",
@@ -17,6 +23,7 @@ __all__ = [
     "CudaGaussianRenderer",
     "GaussianAsset",
     "MeshAsset",
+    "RasterizationContract",
     "ReferenceGaussianRenderer",
     "RenderResult",
     "write_gaussian_ply",

@@ -41,6 +41,7 @@ from .losses import (
     distillation_loss,
     view_conditioned_objectives,
 )
+from .precision import NativePrecisionPolicy
 
 
 class TrainingPhase(str, Enum):
@@ -108,8 +109,22 @@ class TrainerConfig:
     teacher_bundle_minimum_confidence: float = 0.0
     perceptual_checkpoint: Optional[str] = None
     perceptual_checkpoint_sha256: Optional[str] = None
+    precision_backbone: str = "bfloat16"
+    precision_geometric_state: str = "float32"
+    precision_analytical_solve: str = "float32"
+    precision_diagnostics: str = "float64"
+    precision_float32_matmul: str = "highest"
+    precision_allow_tf32: bool = False
 
     def __post_init__(self) -> None:
+        NativePrecisionPolicy(
+            backbone=self.precision_backbone,
+            geometric_state=self.precision_geometric_state,
+            analytical_solve=self.precision_analytical_solve,
+            diagnostics=self.precision_diagnostics,
+            float32_matmul_precision=self.precision_float32_matmul,
+            allow_tf32=self.precision_allow_tf32,
+        )
         if self.gradient_accumulation_steps < 1:
             raise ValueError("gradient_accumulation_steps must be positive")
         if self.maximum_gradient_norm <= 0:
@@ -646,6 +661,20 @@ class GraftGSTrainer:
         teacher: Optional[GraftGS] = None,
     ) -> None:
         self.config = config
+        self.precision_policy = NativePrecisionPolicy(
+            backbone=config.precision_backbone,
+            geometric_state=config.precision_geometric_state,
+            analytical_solve=config.precision_analytical_solve,
+            diagnostics=config.precision_diagnostics,
+            float32_matmul_precision=config.precision_float32_matmul,
+            allow_tf32=config.precision_allow_tf32,
+        )
+        self.precision_record = self.precision_policy.apply()
+        adapter_dtype = getattr(model.vggt, "backbone_dtype", None)
+        if adapter_dtype is not None and adapter_dtype != self.precision_policy.backbone_dtype:
+            raise ValueError(
+                "VGGT adapter backbone dtype differs from the trainer precision policy"
+            )
         self.context = DistributedContext.initialize()
         self._seed_everything(config.seed + self.context.rank)
         if config.phase in {
@@ -1352,7 +1381,7 @@ class GraftGSTrainer:
         path.parent.mkdir(parents=True, exist_ok=True)
         temporary = path.with_suffix(path.suffix + ".tmp")
         payload = {
-            "format_version": 5,
+            "format_version": 6,
             "global_step": self.global_step,
             "epoch": self.epoch,
             "microstep": self.microstep,
@@ -1363,6 +1392,7 @@ class GraftGSTrainer:
             "checkpoint_world_size": self.context.world_size,
             "rank_rng_states": rank_rng_states,
             "trainer_config": asdict(self.config),
+            "precision_runtime": self.precision_record,
             "loss_weights": asdict(self.loss.weights),
             "model_config": asdict(self.module.config),
             "gradient_purifier": (
@@ -1377,7 +1407,7 @@ class GraftGSTrainer:
     def load_checkpoint(self, path: str | Path) -> None:
         payload = torch.load(path, map_location=self.context.device, weights_only=False)
         format_version = payload.get("format_version")
-        if format_version not in {1, 2, 3, 4, 5}:
+        if format_version not in {1, 2, 3, 4, 5, 6}:
             raise ValueError("unsupported checkpoint format")
         if payload["phase"] != self.config.phase.value:
             raise ValueError("checkpoint phase does not match the configured trainer phase")
@@ -1385,6 +1415,8 @@ class GraftGSTrainer:
             raise ValueError("checkpoint model configuration does not match the trainer model")
         if format_version >= 4 and payload.get("loss_weights") != asdict(self.loss.weights):
             raise ValueError("checkpoint loss weights do not match the configured objective")
+        if format_version >= 6 and payload.get("precision_runtime") != self.precision_record:
+            raise ValueError("checkpoint runtime precision record differs from the active process")
         if format_version >= 4:
             checkpoint_world_size = int(payload.get("checkpoint_world_size", -1))
             if checkpoint_world_size != self.context.world_size:
@@ -1461,14 +1493,26 @@ class GraftGSTrainer:
                 "teacher_bundle_minimum_confidence",
                 "perceptual_checkpoint",
                 "perceptual_checkpoint_sha256",
+                "precision_backbone",
+                "precision_geometric_state",
+                "precision_analytical_solve",
+                "precision_diagnostics",
+                "precision_float32_matmul",
+                "precision_allow_tf32",
             )
             for field_name in resume_policy_fields:
                 if field_name not in checkpoint_trainer:
                     current_value = getattr(self.config, field_name)
                     legacy_default = {
                         "teacher_distillation_confidence": 1.0,
+                        "precision_backbone": "bfloat16",
+                        "precision_geometric_state": "float32",
+                        "precision_analytical_solve": "float32",
+                        "precision_diagnostics": "float64",
+                        "precision_float32_matmul": "highest",
+                        "precision_allow_tf32": False,
                     }.get(field_name, object())
-                    if format_version < 4 and current_value == legacy_default:
+                    if format_version < 6 and current_value == legacy_default:
                         continue
                     if current_value in {None, False, 0, 0.0}:
                         continue
@@ -1509,6 +1553,27 @@ class GraftGSTrainer:
             if payload["model_config"] != asdict(self.module.config):
                 raise ValueError("phase initialization checkpoint uses a different model configuration")
         source_trainer = payload.get("trainer_config", {}) if isinstance(payload, Mapping) else {}
+        if isinstance(source_trainer, Mapping):
+            precision_fields = (
+                "precision_backbone",
+                "precision_geometric_state",
+                "precision_analytical_solve",
+                "precision_diagnostics",
+                "precision_float32_matmul",
+                "precision_allow_tf32",
+            )
+            source_format = int(payload.get("format_version", 0))
+            for field_name in precision_fields:
+                if field_name not in source_trainer:
+                    if source_format >= 6:
+                        raise ValueError(
+                            f"phase initialization lacks precision provenance at {field_name}"
+                        )
+                    continue
+                if source_trainer.get(field_name) != getattr(self.config, field_name):
+                    raise ValueError(
+                        f"phase initialization changes native precision at {field_name}"
+                    )
         if self.config.trellis_prior_checkpoint is not None and isinstance(source_trainer, Mapping):
             source_prior = source_trainer.get("trellis_prior_checkpoint")
             source_phase = str(payload.get("phase", "")) if isinstance(payload, Mapping) else ""

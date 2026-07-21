@@ -3,15 +3,21 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
 import json
 from pathlib import Path
 
 import torch
 
-from graft_gs.engine import GraftGSTrainer, TrainerConfig, TrainingPhase
+from graft_gs.engine import (
+    GraftGSTrainer,
+    TrainerConfig,
+    TrainingPhase,
+    load_precision_policy,
+    load_server_config,
+)
 from graft_gs.integration import (
     GraftGS,
-    GraftGSConfig,
     VGGTAdapter,
     import_external_module,
     resolve_vggt_checkpoint,
@@ -34,6 +40,11 @@ def main() -> None:
     parser.add_argument("--steps", type=int, default=500)
     parser.add_argument("--output", default="outputs/one_object")
     parser.add_argument("--minimum-relative-improvement", type=float, default=0.01)
+    parser.add_argument(
+        "--config",
+        type=Path,
+        default=Path("configs/graft_gs_a800_native.yaml"),
+    )
     args = parser.parse_args()
     args.checkpoint = resolve_vggt_checkpoint(args.checkpoint)
     load_and_preprocess_images = getattr(
@@ -44,14 +55,27 @@ def main() -> None:
     if len(paths) < 2:
         raise ValueError("one-object overfit requires at least two views")
     images = load_and_preprocess_images([str(path) for path in paths[:8]])[None]
-    adapter = VGGTAdapter.from_pretrained(args.checkpoint)
-    model = GraftGS(adapter, GraftGSConfig(run_flow=False))
+    model_config, _, _, _ = load_server_config(args.config)
+    precision_policy = load_precision_policy(args.config)
+    precision_policy.apply()
+    adapter = VGGTAdapter.from_pretrained(
+        args.checkpoint,
+        feature_dim=model_config.feature_dim,
+        backbone_dtype=precision_policy.backbone_dtype,
+    )
+    model = GraftGS(adapter, replace(model_config, run_flow=False))
     trainer = GraftGSTrainer(
         model,
         TrainerConfig(
             phase=TrainingPhase.ATLAS_AUTOENCODING,
             output_directory=args.output,
             checkpoint_every=max(1, args.steps // 5),
+            precision_backbone=precision_policy.backbone,
+            precision_geometric_state=precision_policy.geometric_state,
+            precision_analytical_solve=precision_policy.analytical_solve,
+            precision_diagnostics=precision_policy.diagnostics,
+            precision_float32_matmul=precision_policy.float32_matmul_precision,
+            precision_allow_tf32=precision_policy.allow_tf32,
         ),
     )
     output_directory = Path(args.output)

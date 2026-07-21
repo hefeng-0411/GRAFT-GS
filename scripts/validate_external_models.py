@@ -21,6 +21,7 @@ from graft_gs.data import (
     load_meshfleet_manifest,
     meshfleet_record_admission_reasons,
 )
+from graft_gs.engine import NativePrecisionPolicy
 from graft_gs.integration import (
     TrellisPriorAdapter,
     VGGTAdapter,
@@ -179,6 +180,8 @@ def main() -> None:
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("external-model validation requires an A800 CUDA device")
+    precision = NativePrecisionPolicy()
+    precision_record = precision.apply()
     torch.cuda.reset_peak_memory_stats()
     sample, selection_policy = _real_multiview_sample(
         args.dataset_root.resolve(),
@@ -207,6 +210,7 @@ def main() -> None:
         "selection_policy": selection_policy,
         "input_shape": list(images.shape),
         "seconds": time.perf_counter() - start,
+        "precision": precision_record,
         "details": details,
     }
     payload = json.dumps(record, indent=2, sort_keys=True) + "\n"

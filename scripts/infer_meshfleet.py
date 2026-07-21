@@ -15,8 +15,10 @@ import torch
 from graft_gs.data import MeshFleetDatasetConfig, MeshFleetObjectDataset, meshfleet_single_object_collate
 from graft_gs.engine import (
     load_graft_checkpoint,
+    load_precision_policy,
     load_server_config,
     load_trellis_prior_config,
+    validate_precision_policy,
     validate_trellis_prior_policy,
 )
 from graft_gs.engine.losses import symmetric_surface_chamfer
@@ -86,6 +88,8 @@ def main() -> None:
         )
 
     model_config, _, _, dataset_config = load_server_config(args.config)
+    precision_policy = load_precision_policy(args.config)
+    precision_policy.apply()
     configured_id_file = dataset_config.get("object_id_file")
     object_id_file = args.object_id_file or (
         Path(str(configured_id_file)) if configured_id_file is not None else None
@@ -146,7 +150,11 @@ def main() -> None:
         else None
     )
     model = GraftGS(
-        VGGTAdapter.from_pretrained(args.vggt_checkpoint, feature_dim=model_config.feature_dim),
+        VGGTAdapter.from_pretrained(
+            args.vggt_checkpoint,
+            feature_dim=model_config.feature_dim,
+            backbone_dtype=precision_policy.backbone_dtype,
+        ),
         model_config,
         prior,
     )
@@ -157,6 +165,7 @@ def main() -> None:
         strict=True,
     )
     trainer_metadata = checkpoint_payload.get("trainer_config", {})
+    validate_precision_policy(checkpoint_payload, precision_policy)
     validate_trellis_prior_policy(
         checkpoint_payload,
         enabled=use_prior,

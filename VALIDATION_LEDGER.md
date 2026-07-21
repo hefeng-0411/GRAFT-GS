@@ -59,7 +59,7 @@ Status vocabulary: **generated** means executable verification code exists;
 | Unbalanced distillation | analytical asset test | generalized KL is zero only at equal measure and positive with finite nonzero gradient under mass mismatch; generated, pending |
 | Phase-C minibatch OT | analytical asset test | exact Hungarian coupling swaps two compatible targets to the lower product-manifold cost; generated, pending |
 | GLB PBR material | independent reload test | one deterministic material and primitive material index zero; generated, pending |
-| Rank-local RNG resume | format-5 checkpoint and distributed server suite | single-rank next-sample replay generated; six-rank independent-stream replay still A800 pending |
+| Rank-local RNG resume | format-6 checkpoint and distributed server suite | single-rank next-sample replay generated; scheduler-visible multi-rank independent-stream replay still A800 pending |
 | Robust multiview gradients | `test_gradient_purification.py` plus Phase-F server path | cone-boundary optimality, weighted-median outlier resistance, artifact-direction removal, Fisher state round trip, manual post-purification DDP synchronization; numerical suite generated/A800 pending, production wiring static local pass |
 | Quantization-scale adversary | `test_quantization.py` and Phase-F production trace | bounded log scale changes quantized forward, receives finite inner gradient, resets to zero, and reruns with restored RNG; numerical test generated/A800 pending, static wiring locally passed |
 | Dimensionless safety hardening | `differentiable_feasibility_loss` and production trace | zero is every hard boundary; configurable positive relative margin has consistent units across area/orientation/separation/covariance; static wiring locally passed, numerical margin test A800 pending |
@@ -150,9 +150,9 @@ validator remains import-light until environment identity passes. Whole-tree
 synthetic contract test rejects CUDA 12.1, RTX 2060, absent CUDA, and absent
 BF16; it does not claim that the inaccessible remote hardware has passed.
 
-Six-rank validation-entry increment (2026-07-17): `validate_ddp_server.py` now
-records exact-environment agreement, six unique host/local CUDA assignments,
-A800/CUDA-11.8/BF16 properties, and all-rank unittest success before returning
+Distributed validation-entry increment (2026-07-17, revised 2026-07-20):
+`validate_ddp_server.py` records exact-environment agreement, one unique
+host/local CUDA assignment per scheduler-visible rank, A800/CUDA-11.8/BF16 properties, and all-rank unittest success before returning
 zero. Whole-tree `compileall` and the four local static/manifest suites passed
 36/36 in 3.890 s. The NCCL process-group path remains A800-unexecuted; only its
 source contract and import syntax were locally validated.
@@ -216,7 +216,7 @@ guards. No A800/model forward result is inferred.
 
 Server-ready additions not locally executed: `tests/test_external_adapters.py`
 checks per-posterior TRELLIS injection ownership, tensor-domain rejection, and
-RNG isolation under PyTorch; the updated six-rank test supplies a prior only on
+RNG isolation under PyTorch; the updated visible-rank test supplies a prior only on
 rank zero and verifies float64 typed broadcast; and
 `scripts/validate_external_models.py` runs actual cached VGGT/TRELLIS
 checkpoints on real dynamically selected MeshFleet views. `validate_server.py`
@@ -250,3 +250,41 @@ expected PyTorch loader skip. Static production tracing confirms the VGGT
 were not executed in the bundled no-PyTorch desktop runtime. Requirement
 `UPSTREAM-INPUT-01` is therefore syntax/static validated locally and awaits
 the exact pinned server Python for its numerical execution.
+
+Dynamic deployment cycle (2026-07-20): whole-tree `compileall` passed. The
+focused environment, manifest, dynamic-discovery, topology, and scientific
+trace command ran 56 tests: 55 passed and one tensor-loader test was skipped
+because the bundled desktop runtime has no PyTorch. Guards now fail on a fixed
+`--nproc-per-node=6`, fixed configuration world size, stale parent dataset
+root, missing scheduler GPU mask, or absent dynamic device-count derivation.
+Requirements `DEPLOY-DYNAMIC-01` and `DEPLOY-ROOTS-01` are locally validated as
+source/orchestration contracts; the real paths, visible A800 identities, NCCL
+collectives, and checkpoint forwards remain server-pending.
+
+A800 renderer/precision repair cycle (2026-07-20): the supplied remote run is
+recorded as a genuine pre-repair failure, not overwritten: RGB had 14.2%
+mismatched elements and max absolute error 0.6104467; `pip check` also reported
+installed `jupyter-client==7.4.9` against ipykernel's `>=8.9.0` requirement.
+Source inspection of the exact local TRELLIS CUDA extension established the
+correct mip determinant factor, 0.1 kernel variance, NDC/pixel equation,
+16-pixel tiles, alpha thresholds, and packed-covariance ABI. Whole-tree
+`compileall` then passed under the bundled Python 3.12 runtime. The focused
+pure/static command ran 40 tests and all 40 passed: 5 exact-environment tests,
+26 scientific production-path guards, and 9 server manifest/accelerator
+handoff tests. A final expanded dataset/environment/static command then ran 57
+tests: 56 passed and the one PyTorch-dependent dynamic-loader case was skipped
+by the no-PyTorch desktop runtime. This does not execute PyTorch numerical
+rendering locally.
+
+New server tests are implemented but unexecuted: CPU/CUDA-independent OpenCV
+projection and mip-filter gradient tests, runtime precision flag/provenance
+tests, the existing reference renderer backward, and an upgraded A800 CUDA
+equivalence case using off-axis intrinsics, nonblack background, RGB, alpha,
+visible depth, and normal cosine. The exact rerun commands and the required
+`jupyter_client==8.9.1` synchronization are in
+`docs/A800_VALIDATION_PROTOCOL.md`. No post-repair A800 pass, runtime, VRAM,
+training convergence, or asset-quality result is claimed.
+
+Exact locally executed commands:
+`C:\Users\10992\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m compileall -q graft_gs scripts tests`, then
+`-m unittest -v tests.test_meshfleet_dynamic_discovery tests.test_meshfleet_manifest_static tests.test_server_manifest_handoff_static tests.test_scientific_trace_static tests.test_environment_contract_static`.

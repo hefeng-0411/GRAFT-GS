@@ -241,3 +241,23 @@
   `[0,1]` with at least one physical view. Alpha compositing and resizing occur
   in the audited MeshFleet loader; neither adapter silently rescales byte
   images, clips outliers, fills invalid views, or imputes a missing channel.
+- Distributed launches assume `CUDA_VISIBLE_DEVICES` is an explicit
+  scheduler-owned assignment of idle A800s. The logical CUDA indices are the
+  post-mask indices reported by PyTorch; the launcher never interprets them as
+  physical ordinals. Exact in-phase checkpoint continuation remains
+  conditional on unchanged world size, while model-only phase initialization
+  may use a different visible rank count.
+- Renderer equivalence is conditional on the audited TRELLIS mip-splatting ABI
+  and constants: a 16x16 tile, integer pixel samples, `kernel_size=0.1`, alpha
+  ceiling 0.99, alpha pruning below 1/255, and early termination below 1e-4
+  transmittance. Sorting, tile inclusion, pruning, and termination are discrete
+  visibility decisions. Retained contributions remain differentiable, but no
+  gradient is claimed across those event boundaries. The CUDA kernel performs
+  native FP32 accumulation; the PyTorch path is the transparent mathematical
+  reference, not evidence of bitwise CUDA determinism.
+- `highest` float32 matmul precision plus disabled CUDA/cuDNN TF32 is part of
+  the numerical model, not a performance hint. Checkpoint/inference
+  comparability assumes this policy is applied before model execution. BF16 is
+  permitted only within the configured VGGT aggregator; its camera, depth, and
+  point heads and all GRAFT-GS geometric state execute with autocast disabled
+  or explicit FP32 tensors.

@@ -52,10 +52,11 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
 
     def test_checkpoint_format_has_rank_local_rng_and_objective(self) -> None:
         trainer = source("graft_gs/engine/trainer.py")
-        self.assertIn('"format_version": 5', trainer)
+        self.assertIn('"format_version": 6', trainer)
         self.assertIn('"rank_rng_states": rank_rng_states', trainer)
         self.assertIn('"loss_weights": asdict(self.loss.weights)', trainer)
         self.assertIn("exact trainer resume requires the checkpoint world size", trainer)
+        self.assertIn('"precision_float32_matmul"', trainer)
 
     def test_topology_and_barrier_admissibility_are_hard_checks(self) -> None:
         topology = source("graft_gs/topology/strata.py")
@@ -152,6 +153,26 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
             'DEFAULT_TRELLIS_CHECKPOINT = "microsoft/TRELLIS-image-large"',
             external,
         )
+        self.assertIn(
+            'DEFAULT_VGGT_REPOSITORY_ROOT = Path("/mnt/sda2/hef/Base/vggt")',
+            external,
+        )
+        self.assertIn(
+            'DEFAULT_TRELLIS_REPOSITORY_ROOT = Path("/mnt/sda2/hef/Base/TRELLIS")',
+            external,
+        )
+        import_boundary = external.index("def import_external_module")
+        explicit_position = external.index("configured = repository_root", import_boundary)
+        environment_position = external.index("configured = os.environ.get", import_boundary)
+        default_position = external.index(
+            "_DEFAULT_REPOSITORY_ROOT[package] / package", import_boundary
+        )
+        import_position = external.index(
+            "module = importlib.import_module(module_name)", import_boundary
+        )
+        self.assertLess(explicit_position, environment_position)
+        self.assertLess(environment_position, default_position)
+        self.assertLess(default_position, import_position)
 
         tree = ast.parse(trellis)
         sample = next(
@@ -278,8 +299,14 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("audit_environment(args.requirements)", validator)
         self.assertIn('[sys.executable, "-m", "pip", "check"]', validator)
         self.assertIn('record["accelerator"] = accelerator', validator)
+        self.assertIn('record["upstream_repositories"] = upstream_repositories', validator)
+        self.assertIn('"entrypoint_sha256"', validator)
+        self.assertIn('"package_init_sha256"', validator)
         self.assertIn('details.get("torch_cuda") != "11.8"', validator)
-        self.assertIn('"/mnt/sda2/hef/Base/dataset"', validator)
+        self.assertIn(
+            '"/mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97"',
+            validator,
+        )
         self.assertNotIn("canonical schema ID", validator)
         self.assertIn("_inspect_manifest_contract(manifest, dataset_root, object_ids)", validator)
         self.assertIn("_manifest_requires_rebuild(args.rebuild_manifest, manifest_audit)", validator)
@@ -293,9 +320,12 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("unexpected_skip_reasons", validator)
         self.assertIn("requirements_sha256", environment)
 
-    def test_six_rank_validator_records_distinct_a800_contract(self) -> None:
+    def test_visible_rank_validator_records_distinct_a800_contract(self) -> None:
         validator = source("scripts/validate_ddp_server.py")
-        self.assertIn("world_size != 6", validator)
+        self.assertIn("visible_device_count != world_size", validator)
+        self.assertIn('"visible_device_count": visible_device_count', validator)
+        self.assertIn('"cuda_visible_devices": visible_device_mask', validator)
+        self.assertIn('"multi_rank": world_size > 1', validator)
         self.assertIn("audit_environment(args.requirements)", validator)
         self.assertIn("_accelerator_contract_errors(accelerator_details)", validator)
         self.assertIn("len(set(rank_keys)) != world_size", validator)
@@ -303,13 +333,46 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("successful_on_every_rank", validator)
         self.assertIn("dist.all_reduce(success, op=dist.ReduceOp.MIN)", validator)
 
-    def test_six_gpu_training_launcher_cannot_bypass_pinned_interpreter(self) -> None:
+    def test_visible_gpu_training_launcher_cannot_bypass_pinned_interpreter(self) -> None:
         launcher = source("scripts/launch_a800_6gpu.sh")
+        config = source("configs/graft_gs_a800_native.yaml")
         self.assertIn("/mnt/sda1/miniforge3/envs/CRAFT/bin/python", launcher)
         self.assertIn('"$ROOT/scripts/validate_environment.py"', launcher)
         self.assertIn('--requirements "$ROOT/requirements.txt"', launcher)
         self.assertIn('"$PYTHON_BIN" -m torch.distributed.run', launcher)
+        self.assertIn("torch.cuda.device_count()", launcher)
+        self.assertIn("CUDA_VISIBLE_DEVICES must name the scheduler-assigned idle GPU subset", launcher)
+        self.assertIn('--nproc-per-node="$NPROC_PER_NODE"', launcher)
+        self.assertNotIn("--nproc-per-node=6", launcher)
+        self.assertNotIn("world_size:", config)
+        self.assertIn(
+            "GRAFT_GS_VGGT_ROOT=${GRAFT_GS_VGGT_ROOT:-/mnt/sda2/hef/Base/vggt}",
+            launcher,
+        )
+        self.assertIn(
+            "GRAFT_GS_TRELLIS_ROOT=${GRAFT_GS_TRELLIS_ROOT:-/mnt/sda2/hef/Base/TRELLIS}",
+            launcher,
+        )
         self.assertNotIn("\ntorchrun \\", launcher)
+
+    def test_a800_precision_and_mip_renderer_contracts_are_production_applied(self) -> None:
+        precision = source("graft_gs/engine/precision.py")
+        renderer = source("graft_gs/readout/renderer.py")
+        barrier = source("graft_gs/manifold/barrier.py")
+        trainer_entry = source("scripts/train_a800.py")
+        config = source("configs/graft_gs_a800_native.yaml")
+        self.assertIn("torch.backends.cuda.matmul.allow_tf32 = self.allow_tf32", precision)
+        self.assertIn("torch.set_float32_matmul_precision", precision)
+        self.assertIn("precision_policy.apply()", trainer_entry)
+        self.assertIn("backbone_dtype=precision_policy.backbone_dtype", trainer_entry)
+        self.assertIn("float32_matmul_precision: highest", config)
+        self.assertIn("allow_tf32: false", config)
+        self.assertIn("cov3D_precomp=covariance_packed", renderer)
+        self.assertIn("kernel_size=self.contract.kernel_size", renderer)
+        self.assertIn("(2.0 * intrinsic[0, 2] + 1.0) / width", renderer)
+        self.assertNotIn("rotations=quaternion", renderer)
+        self.assertIn("state.position.detach().to(dtype=torch.float64)", barrier)
+        self.assertIn("state.evidence_metric.detach().to(dtype=torch.float64)", barrier)
 
     def test_training_uses_catalog_filtered_complete_meshfleet_records(self) -> None:
         meshfleet = source("graft_gs/data/meshfleet.py")

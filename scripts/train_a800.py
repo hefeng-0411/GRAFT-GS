@@ -1,4 +1,4 @@
-"""torchrun entry point for native-precision six-A800 staged training."""
+"""torchrun entry point for native-precision visible-A800 staged training."""
 
 from __future__ import annotations
 
@@ -28,8 +28,10 @@ from graft_gs.engine import (
     TrainingPhase,
     load_graft_checkpoint,
     load_loss_weights,
+    load_precision_policy,
     load_server_config,
     load_trellis_prior_config,
+    validate_precision_policy,
 )
 from graft_gs.integration import (
     GraftGS,
@@ -62,6 +64,8 @@ def main() -> None:
     args.vggt_checkpoint = resolve_vggt_checkpoint(args.vggt_checkpoint)
     phase = TrainingPhase(args.phase)
     model_config, training_config, distributed_config, dataset_config = load_server_config(args.config)
+    precision_policy = load_precision_policy(args.config)
+    precision_record = precision_policy.apply()
     loss_weights = load_loss_weights(args.config)
     prior_config = load_trellis_prior_config(args.config)
     configured_id_file = dataset_config.get("object_id_file")
@@ -95,20 +99,29 @@ def main() -> None:
         if use_prior
         else None
     )
-    adapter = VGGTAdapter.from_pretrained(args.vggt_checkpoint, feature_dim=model_config.feature_dim)
+    adapter = VGGTAdapter.from_pretrained(
+        args.vggt_checkpoint,
+        feature_dim=model_config.feature_dim,
+        backbone_dtype=precision_policy.backbone_dtype,
+    )
     model = GraftGS(adapter, model_config, prior)
     teacher = None
     if phase is TrainingPhase.QUANTIZATION_DISTILLATION:
         if args.teacher is None:
             raise ValueError("Phase E requires --teacher")
         teacher = GraftGS(
-            VGGTAdapter.from_pretrained(args.vggt_checkpoint, feature_dim=model_config.feature_dim),
+            VGGTAdapter.from_pretrained(
+                args.vggt_checkpoint,
+                feature_dim=model_config.feature_dim,
+                backbone_dtype=precision_policy.backbone_dtype,
+            ),
             model_config,
             prior,
         )
         teacher_payload, _ = load_graft_checkpoint(
             teacher, args.teacher, map_location="cpu", strict=True
         )
+        validate_precision_policy(teacher_payload, precision_policy)
         teacher_trainer = teacher_payload.get("trainer_config", {})
         if not isinstance(teacher_trainer, dict) or teacher_trainer.get(
             "trellis_prior_checkpoint"
@@ -275,10 +288,23 @@ def main() -> None:
                 else None
             ),
             perceptual_checkpoint_sha256=perceptual_digest,
+            precision_backbone=precision_policy.backbone,
+            precision_geometric_state=precision_policy.geometric_state,
+            precision_analytical_solve=precision_policy.analytical_solve,
+            precision_diagnostics=precision_policy.diagnostics,
+            precision_float32_matmul=precision_policy.float32_matmul_precision,
+            precision_allow_tf32=precision_policy.allow_tf32,
         ),
         loss_weights=loss_weights,
         teacher=teacher,
     )
+    if trainer.context.rank == 0:
+        precision_path = Path(args.output) / "precision_policy.json"
+        precision_path.parent.mkdir(parents=True, exist_ok=True)
+        precision_path.write_text(
+            json.dumps(precision_record, indent=2, sort_keys=True) + "\n",
+            encoding="utf8",
+        )
     dataset_format = args.dataset_format
     if dataset_format == "auto":
         dataset_format = (

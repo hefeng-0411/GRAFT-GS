@@ -15,6 +15,7 @@ from graft_gs.engine import (
     TrainerConfig,
     TrainingPhase,
     load_loss_weights,
+    load_precision_policy,
     load_server_config,
     load_trellis_prior_config,
 )
@@ -56,6 +57,8 @@ def main() -> None:
     args.vggt_checkpoint = resolve_vggt_checkpoint(args.vggt_checkpoint)
 
     model_config, training_config, _, dataset_config = load_server_config(args.config)
+    precision_policy = load_precision_policy(args.config)
+    precision_policy.apply()
     configured_id_file = dataset_config.get("object_id_file")
     object_id_file = args.object_id_file or (
         Path(str(configured_id_file)) if configured_id_file is not None else None
@@ -133,7 +136,11 @@ def main() -> None:
         else None
     )
     model = GraftGS(
-        VGGTAdapter.from_pretrained(args.vggt_checkpoint, feature_dim=model_config.feature_dim),
+        VGGTAdapter.from_pretrained(
+            args.vggt_checkpoint,
+            feature_dim=model_config.feature_dim,
+            backbone_dtype=precision_policy.backbone_dtype,
+        ),
         model_config,
         prior,
     )
@@ -163,6 +170,12 @@ def main() -> None:
             )
             if use_prior
             else 0.0,
+            precision_backbone=precision_policy.backbone,
+            precision_geometric_state=precision_policy.geometric_state,
+            precision_analytical_solve=precision_policy.analytical_solve,
+            precision_diagnostics=precision_policy.diagnostics,
+            precision_float32_matmul=precision_policy.float32_matmul_precision,
+            precision_allow_tf32=precision_policy.allow_tf32,
             dino_relational_pseudo_supervision=bool(
                 dataset_config.get("load_trellis_features", False)
             ),

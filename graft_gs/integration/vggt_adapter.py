@@ -56,10 +56,19 @@ def _dct_projection(rows: int, columns: int) -> Tensor:
 
 
 class VGGTAdapter(nn.Module):
-    def __init__(self, model: nn.Module, feature_dim: int = 1024, freeze_backbone: bool = True) -> None:
+    def __init__(
+        self,
+        model: nn.Module,
+        feature_dim: int = 1024,
+        freeze_backbone: bool = True,
+        backbone_dtype: torch.dtype = torch.bfloat16,
+    ) -> None:
         super().__init__()
+        if backbone_dtype not in {torch.bfloat16, torch.float16, torch.float32}:
+            raise ValueError("VGGT backbone dtype must be BF16, FP16, or FP32")
         self._validate_upstream_contract(model)
         self.model = model
+        self.backbone_dtype = backbone_dtype
         self.feature_projection = nn.Linear(2048, feature_dim, bias=False)
         self.tap_logits = nn.Parameter(torch.zeros(4))
         with torch.no_grad():
@@ -116,12 +125,16 @@ class VGGTAdapter(nn.Module):
         checkpoint: Optional[str] = None,
         feature_dim: int = 1024,
         freeze_backbone: bool = True,
+        backbone_dtype: torch.dtype = torch.bfloat16,
     ) -> "VGGTAdapter":
         checkpoint = resolve_vggt_checkpoint(checkpoint)
         module = import_external_module("vggt.models.vggt")
         model_class = getattr(module, "VGGT")
         adapter = cls(
-            model_class.from_pretrained(checkpoint), feature_dim, freeze_backbone
+            model_class.from_pretrained(checkpoint),
+            feature_dim,
+            freeze_backbone,
+            backbone_dtype,
         )
         adapter.upstream_provenance = external_module_provenance(module, checkpoint)
         return adapter
@@ -139,8 +152,14 @@ class VGGTAdapter(nn.Module):
             raise ValueError("VGGT image conditioning contains non-finite values")
         if bool(torch.any(images < 0)) or bool(torch.any(images > 1)):
             raise ValueError("VGGT tensor inputs must use the released [0,1] RGB contract")
-        use_bf16 = images.device.type == "cuda" and torch.cuda.is_bf16_supported()
-        with torch.autocast(device_type=images.device.type, dtype=torch.bfloat16, enabled=use_bf16):
+        use_low_precision = images.device.type == "cuda" and self.backbone_dtype != torch.float32
+        if use_low_precision and self.backbone_dtype == torch.bfloat16 and not torch.cuda.is_bf16_supported():
+            raise RuntimeError("configured VGGT BF16 execution is unavailable on this accelerator")
+        with torch.autocast(
+            device_type=images.device.type,
+            dtype=self.backbone_dtype,
+            enabled=use_low_precision,
+        ):
             taps, patch_start = self.model.aggregator(images)
         cached = [value for value in taps if value is not None]
         if len(cached) != 4:

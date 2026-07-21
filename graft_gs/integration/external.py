@@ -1,9 +1,10 @@
 """Deployment-safe discovery of the released VGGT and TRELLIS packages.
 
-The upstream packages are imported normally when installed in the active
-environment.  A server checkout can instead be exposed explicitly through
-``GRAFT_GS_VGGT_ROOT`` or ``GRAFT_GS_TRELLIS_ROOT``.  No workstation path or
-repository-relative sibling assumption is embedded in production code.
+The declared server checkouts are preferred when physically present. A
+different checkout can be exposed explicitly through ``GRAFT_GS_VGGT_ROOT``
+or ``GRAFT_GS_TRELLIS_ROOT``; an installed package is the portable fallback.
+No workstation path or repository-relative sibling assumption is embedded in
+production code.
 """
 
 from __future__ import annotations
@@ -18,10 +19,16 @@ from typing import Optional
 
 DEFAULT_VGGT_CHECKPOINT = "facebook/VGGT-1B"
 DEFAULT_TRELLIS_CHECKPOINT = "microsoft/TRELLIS-image-large"
+DEFAULT_VGGT_REPOSITORY_ROOT = Path("/mnt/sda2/hef/Base/vggt")
+DEFAULT_TRELLIS_REPOSITORY_ROOT = Path("/mnt/sda2/hef/Base/TRELLIS")
 
 _ROOT_ENVIRONMENT = {
     "vggt": "GRAFT_GS_VGGT_ROOT",
     "trellis": "GRAFT_GS_TRELLIS_ROOT",
+}
+_DEFAULT_REPOSITORY_ROOT = {
+    "vggt": DEFAULT_VGGT_REPOSITORY_ROOT,
+    "trellis": DEFAULT_TRELLIS_REPOSITORY_ROOT,
 }
 
 
@@ -70,6 +77,10 @@ def import_external_module(
     configured = repository_root
     if configured is None:
         configured = os.environ.get(_ROOT_ENVIRONMENT[package])
+    if (configured is None or not str(configured).strip()) and (
+        _DEFAULT_REPOSITORY_ROOT[package] / package
+    ).is_dir():
+        configured = _DEFAULT_REPOSITORY_ROOT[package]
     root: Optional[Path] = None
     if configured is not None and str(configured).strip():
         root = Path(configured).expanduser().resolve()
@@ -117,7 +128,9 @@ def external_module_provenance(module: ModuleType, checkpoint: str) -> dict[str,
 
 
 __all__ = [
+    "DEFAULT_TRELLIS_REPOSITORY_ROOT",
     "DEFAULT_TRELLIS_CHECKPOINT",
+    "DEFAULT_VGGT_REPOSITORY_ROOT",
     "DEFAULT_VGGT_CHECKPOINT",
     "external_module_provenance",
     "import_external_module",

@@ -35,7 +35,13 @@ from graft_gs.readout.assets import (
     write_gaussian_ply,
     write_mesh_glb,
 )
-from graft_gs.readout.renderer import CameraBatch, CudaGaussianRenderer, ReferenceGaussianRenderer
+from graft_gs.readout.renderer import (
+    CameraBatch,
+    CudaGaussianRenderer,
+    RasterizationContract,
+    ReferenceGaussianRenderer,
+    _mip_filter_covariance,
+)
 from graft_gs.topology.strata import SimplicialComplex, TopologyCandidate, TopologySelection, betti_numbers
 
 
@@ -87,6 +93,73 @@ def _fixture() -> tuple[PersistentOctreeAtlas, object, TopologySelection]:
 
 
 class AnalyticalAssetTest(unittest.TestCase):
+    def test_camera_batch_rejects_non_opencv_or_non_so3_frames(self) -> None:
+        extrinsic = torch.eye(4, dtype=torch.float64)[:3][None]
+        intrinsic = torch.tensor(
+            [[[12.0, 0.0, 8.0], [0.0, 12.0, 8.0], [0.0, 0.0, 1.0]]],
+            dtype=torch.float64,
+        )
+        CameraBatch(extrinsic, intrinsic, 16, 16)
+        invalid_intrinsic = intrinsic.clone()
+        invalid_intrinsic[:, 2, 0] = 0.1
+        with self.assertRaises(ValueError):
+            CameraBatch(extrinsic, invalid_intrinsic, 16, 16)
+        reflection = extrinsic.clone()
+        reflection[:, 0, 0] = -1.0
+        with self.assertRaises(ValueError):
+            CameraBatch(reflection, intrinsic, 16, 16)
+
+    def test_cuda_projection_preserves_opencv_integer_pixel_centers(self) -> None:
+        intrinsic = torch.tensor(
+            [[612.0, 0.0, 251.25], [0.0, 598.0, 260.75], [0.0, 0.0, 1.0]],
+            dtype=torch.float64,
+        )
+        height, width = 518, 518
+        point = torch.tensor([0.17, -0.11, 2.3, 1.0], dtype=torch.float64)
+        projection = CudaGaussianRenderer._projection(
+            intrinsic,
+            height,
+            width,
+            0.01,
+            100.0,
+        )
+        homogeneous = projection @ point
+        ndc = homogeneous[:2] / homogeneous[3]
+        cuda_pixel = torch.stack(
+            (
+                ((ndc[0] + 1.0) * width - 1.0) * 0.5,
+                ((ndc[1] + 1.0) * height - 1.0) * 0.5,
+            )
+        )
+        opencv_pixel = torch.stack(
+            (
+                intrinsic[0, 0] * point[0] / point[2] + intrinsic[0, 2],
+                intrinsic[1, 1] * point[1] / point[2] + intrinsic[1, 2],
+            )
+        )
+        torch.testing.assert_close(cuda_pixel, opencv_pixel, atol=1.0e-12, rtol=1.0e-12)
+
+    def test_mip_filter_preserves_integrated_measure_and_gradients(self) -> None:
+        covariance = torch.tensor(
+            [[[0.4, 0.07], [0.07, 0.9]]],
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        contract = RasterizationContract(kernel_size=0.1)
+        filtered, peak = _mip_filter_covariance(covariance, contract)
+        expected_filtered = covariance.detach() + 0.1 * torch.eye(2, dtype=torch.float64)
+        expected_peak = torch.sqrt(
+            torch.linalg.det(covariance.detach()).clamp_min(1.0e-6)
+            / (torch.linalg.det(expected_filtered).clamp_min(1.0e-6) + 1.0e-6)
+            + 1.0e-6
+        )
+        torch.testing.assert_close(filtered, expected_filtered)
+        torch.testing.assert_close(peak, expected_peak)
+        (filtered.square().sum() + peak.sum()).backward()
+        self.assertIsNotNone(covariance.grad)
+        self.assertTrue(torch.all(torch.isfinite(covariance.grad)))
+        self.assertGreater(float(covariance.grad.abs().sum()), 0.0)
+
     def test_flow_minibatch_ot_couples_only_compatible_strata(self) -> None:
         atlas, mapping, selection = _fixture()
         base = GraftGS._state_from_mapping(atlas, mapping, selection)
@@ -390,18 +463,32 @@ class AnalyticalAssetTest(unittest.TestCase):
         state = GraftGS._state_from_mapping(atlas, mapping, selection)
         gaussians, _ = AnalyticalSurfaceReadout().double()(atlas, state, mapping)
         gaussians = type(gaussians)(**{name: getattr(gaussians, name).float().cuda() for name in gaussians.__dataclass_fields__})
+        gaussians.covariance.retain_grad()
         extrinsic = torch.eye(4, device="cuda")[:3]
         extrinsic[:, 3] = torch.tensor([0.0, 0.0, 3.0], device="cuda")
-        intrinsic = torch.tensor([[12.0, 0.0, 8.0], [0.0, 12.0, 8.0], [0.0, 0.0, 1.0]], device="cuda")
+        intrinsic = torch.tensor([[12.0, 0.0, 7.25], [0.0, 12.0, 8.5], [0.0, 0.0, 1.0]], device="cuda")
         camera = CameraBatch(extrinsic[None], intrinsic[None], 16, 16)
-        reference = ReferenceGaussianRenderer()(gaussians, camera)
-        optimized = CudaGaussianRenderer()(gaussians, camera)
+        background = torch.tensor([0.15, 0.25, 0.35], device="cuda")
+        reference = ReferenceGaussianRenderer()(gaussians, camera, background=background)
+        optimized = CudaGaussianRenderer()(gaussians, camera, background=background)
+        self.assertEqual(optimized.color.dtype, torch.float32)
+        self.assertEqual(optimized.depth.dtype, torch.float32)
         torch.testing.assert_close(optimized.color, reference.color, atol=5.0e-2, rtol=8.0e-2)
         torch.testing.assert_close(optimized.alpha, reference.alpha, atol=5.0e-2, rtol=8.0e-2)
         visible = (optimized.alpha > 0.05) & (reference.alpha > 0.05)
         if bool(torch.any(visible)):
+            torch.testing.assert_close(
+                optimized.depth[visible],
+                reference.depth[visible],
+                atol=2.0e-2,
+                rtol=2.0e-2,
+            )
             cosine = torch.sum(optimized.normal * reference.normal, dim=1, keepdim=True).abs()
             self.assertGreater(float(cosine[visible].mean()), 0.9)
+        (optimized.color.mean() + optimized.alpha.mean() + optimized.depth.mean()).backward()
+        self.assertIsNotNone(gaussians.covariance.grad)
+        self.assertTrue(torch.all(torch.isfinite(gaussians.covariance.grad)))
+        self.assertGreater(float(gaussians.covariance.grad.abs().sum()), 0.0)
 
 
 if __name__ == "__main__":

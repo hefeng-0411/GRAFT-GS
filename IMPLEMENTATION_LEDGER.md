@@ -1,6 +1,7 @@
 # GRAFT-GS implementation ledger
 
-Target runtime: enterprise Linux server, 6x NVIDIA A800 80 GB. Native FP32
+Target runtime: enterprise Linux server with up to 6x NVIDIA A800 80 GB;
+the scheduler-visible subset is authoritative. Native FP32
 geometry and BF16/FP16 backbone execution are the baseline. The local RTX 2060
 is an editing environment only; no numerical result is inferred from it.
 
@@ -52,7 +53,7 @@ is an editing environment only; no numerical result is inferred from it.
     and cross-phase parametrization-key translation.
 15. Server entry points for untouched baseline reproduction, inference,
     deterministic assets/renders/metrics, one-object overfit with a required
-    loss reduction, six-GPU training, validation, profiling, and structural
+    loss reduction, visible-GPU training, validation, profiling, and structural
     ablations.
 16. Audited MeshFleet/TRELLIS object contract with a deterministic JSONL
     manifest, physical/declaration view reconciliation, relational sparse-grid
@@ -87,7 +88,7 @@ is an editing environment only; no numerical result is inferred from it.
     topology.
 22. Same-object DDP now autograd-all-gathers positions, rays, features, SPD
     covariance, confidence, mass, colors, and view identity, then replicates one
-    mathematically global sparse UOT solve. The previous sum of six nonlinear
+    mathematically global sparse UOT solve. The previous sum of rank-local nonlinear
     local UOT barycenters remains only as a rejected legacy approximation.
 23. Phase A is a genuine evidence-only stage: it stops before atlas/topology/
     flow construction and trains only confidence plus ray-aligned covariance
@@ -268,18 +269,18 @@ is an editing environment only; no numerical result is inferred from it.
     hidden-prior-only atlas rows explicitly permit zero observation reliability
     while observed rows remain positive. Server validation now audits all 444
     exact requirement pins before importing the model, binds the verified
-    multi-object remote root, regenerates missing/stale manifests, selects the
-    canonical contract object by ID, and treats unexpected dataset/backend
+    multi-object remote root, regenerates missing/stale manifests, dynamically
+    selects an admitted validation object, and treats unexpected dataset/backend
     skips as failures.
 53. Remote manifest handoff is now a typed pre-model contract rather than a
     path-existence check. `validate_server.py` parses the v2 summary and every
     JSONL identity record once, checks resolved dataset root, schema, declared
-    versus physical record count, and exactly one canonical object occurrence.
-    A missing, malformed, stale, wrong-root, count-drifted, or canonical-invalid
+    versus physical record count, and unique valid 64-hex object identities.
+    A missing, malformed, stale, wrong-root, count-drifted, or identity-invalid
     manifest forces deterministic full regeneration; a compatible multi-object
-    manifest is reused. Canonical validation selects its 64-hex ID regardless
-    of JSONL order, so the large remote corpus cannot silently substitute its
-    first train object.
+    manifest is reused. Validation applies the production admission predicate
+    and a documented deterministic selection policy rather than assuming the
+    first JSONL record or embedding a schema-object ID.
 54. Reference validation now probes the accelerator in a subprocess after the
     exact package and `pip check` gates but before dataset/model import. The
     structured record includes PyTorch/CUDA versions, visible-device count,
@@ -287,15 +288,15 @@ is an editing environment only; no numerical result is inferred from it.
     rejects non-CUDA, non-CUDA-11.8, non-BF16, empty-device, and non-A800 paths;
     this prevents a locally convenient GPU or mismatched CUDA build from being
     reported as the A800 reference environment.
-55. The distributed validator now establishes the six-rank execution contract
+55. The distributed validator now establishes the scheduler-visible execution contract
     before testing global evidence: it audits exact dependencies on every
     process, binds each NCCL rank to its local CUDA device, gathers hostname/
-    local-rank/device identity, rejects duplicate device assignments or any
-    world size other than six, and applies the CUDA-11.8/BF16/A800 gate to all
-    gathered ranks. Rank zero serializes preflight and per-rank test completion;
+    local-rank/device identity, rejects duplicate device assignments or a world
+    size different from `torch.cuda.device_count()` after masking, and applies
+    the CUDA-11.8/BF16/A800 gate to all gathered ranks. Rank zero serializes preflight and per-rank test completion;
     a global MIN reduction prevents one passing rank from masking another
     rank's failed unittest suite.
-56. The six-GPU phase launcher no longer resolves an arbitrary `torchrun` from
+56. The visible-GPU phase launcher no longer resolves an arbitrary `torchrun` from
     `PATH`. It requires the configured CRAFT interpreter (defaulting to the
     verified remote conda path), audits all exact pins before every training
     launch, records that audit, and enters `torch.distributed.run` through the
@@ -432,8 +433,9 @@ The full conditional validity domain is maintained in
 - Production path: all training, inference, evaluation, overfit, ablation,
   teacher-refinement, and baseline entry points now resolve checkpoints as
   explicit CLI value, GRAFT-GS environment value, compatible legacy upstream
-  value, then official model-hub ID. Package import is installation-first with
-  optional `GRAFT_GS_VGGT_ROOT`/`GRAFT_GS_TRELLIS_ROOT` checkout provenance.
+  value, then official model-hub ID. Package import prefers explicit roots,
+  then the physically present declared server checkouts, with an installed
+  package as the portable fallback and module-origin provenance throughout.
 - Verified against upstream source: VGGT aggregator cached taps
   `{4,11,17,23}`, concatenated width 2048, camera/depth/point head signatures,
   OpenCV pose conversion, and `[0,1]` input domain; TRELLIS tensor conditioning,
@@ -448,7 +450,7 @@ The full conditional validity domain is maintained in
   duplicate Phase-E teacher/student and Phase-F replay work without changing a
   numerical result; changed views or perturbations cannot alias by policy.
 - Same-object DDP no longer executes the frozen TRELLIS sampler redundantly on
-  six ranks. All views are gathered, source rank samples, and a dtype-preserving
+  every visible rank. All views are gathered, source rank samples, and a dtype-preserving
   probability/mass/variance/vote measure is broadcast before every rank builds
   the same persistent atlas. Ordinary object-level DDP is unchanged.
 - Added `scripts/validate_external_models.py`; `validate_server.py` invokes its
@@ -491,3 +493,71 @@ The full conditional validity domain is maintained in
   the released aggregator and producing opaque downstream geometry failures.
 - `test_external_adapters.py` contains CPU-safe mock-boundary tests whose mock
   aggregator fails if invalid input reaches upstream inference.
+
+## 2026-07-20 scheduler-visible A800 and declared upstream roots
+
+- Requirement `DEPLOY-DYNAMIC-01`: use exactly the idle GPU subset assigned by
+  `CUDA_VISIBLE_DEVICES`, never a hardcoded six processes or an unmasked
+  physical-device assumption.
+- Production path: `launch_a800_6gpu.sh` -> pinned CRAFT interpreter -> exact
+  environment audit -> `torch.cuda.device_count()` -> `torch.distributed.run`;
+  `validate_ddp_server.py` independently checks world-size/device-count
+  equality and unique rank bindings. The legacy launcher filename is retained
+  for compatibility, but its behavior is rank-count agnostic.
+- Requirement `DEPLOY-ROOTS-01`: the declared remote roots
+  `/mnt/sda2/hef/Base/vggt`, `/mnt/sda2/hef/Base/TRELLIS`, and
+  `/mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97`
+  are now the physically checked server defaults. Environment/CLI overrides
+  remain available; no Windows reference path enters production.
+- `validate_server.py` fails before accelerator/model work unless each declared
+  checkout contains its package and known runnable entrypoint
+  (`demo_gradio.py` or `app.py`). It records SHA-256 identities for both the
+  package initializer and entrypoint, then propagates the resolved roots into
+  every checkpoint preflight and test subprocess.
+- `integration/external.py` prefers an explicit root, then the declared root
+  when it contains the expected package, then a portable installed package.
+  Existing module-origin verification proves the imported source is inside the
+  chosen checkout. Checkpoints still resolve from explicit CLI/environment to
+  the official cached hub identifier.
+
+## 2026-07-20 A800 renderer-equivalence and executable-precision repair
+
+- Requirement `RENDER-MIP-EQUIV-01`: the returned A800 comparison exposed a
+  real image-model mismatch (`109/768` RGB elements, max absolute error
+  `0.6104467`), rather than insufficient tolerance. The production reference
+  and CUDA adapter now share `RasterizationContract`, matching the inspected
+  TRELLIS mip kernel's EWA covariance filter, determinant opacity
+  compensation, integer pixel centers, 16x16 tile extent, near cull, alpha
+  cap/pruning, and transmittance termination.
+- Production path: analytical atlas covariance -> packed
+  `[xx,xy,xz,yy,yz,zz]` -> TRELLIS `cov3D_precomp`. Quaternion/scale
+  reconstruction was removed from CUDA rendering. OpenCV intrinsics now map
+  exactly through TRELLIS `ndc2Pix`, including off-axis principal points.
+  Color retains the requested background; alpha/depth/normal use a separate
+  zero-background rasterizer. Alpha and depth share one auxiliary pass, reducing
+  total passes from four to three without changing the compositing measure.
+- The renderer boundary now rejects nonfinite or non-OpenCV intrinsics,
+  nonpositive focal lengths, non-SO(3) world-to-camera rotations, mixed camera
+  devices/dtypes, malformed backgrounds, and attempts to override constants
+  compiled into the TRELLIS CUDA kernel.
+- Requirement `PRECISION-A800-01`: the formerly descriptive YAML precision
+  section is executable. `NativePrecisionPolicy` confines BF16/FP16 to the VGGT
+  aggregator, requires FP32 geometry/OT/manifold/analytical solve/render state,
+  reserves FP64 for diagnostics, selects `highest` FP32 matmul, and disables
+  CUDA/cuDNN TF32. Training, overfit, inference, evaluation, ablation, teacher
+  refinement, and external-model preflight apply the policy. The VGGT adapter
+  receives its configured backbone dtype explicitly.
+- Detached nonlinear feasibility acceptance and metric topology-boundary
+  certification now recompute areas, orientation, separation, covariance
+  eigenvalues, constraint gradients, and evidence-metric dual norms in FP64.
+  The trainable CBF/JVP/QP path remains FP32, preserving its gradient and A800
+  throughput while making the final marginal accept/reject decision stricter.
+- Checkpoint format 6 records the precision boundary. Exact resume, phase
+  initialization, distillation teachers, inference, evaluation, ablations, and
+  teacher refinement reject incompatible precision provenance; documented
+  format-5 defaults remain loadable only under the same native default.
+- Requirement `ENV-PIN-CONSISTENCY-01`: `requirements.txt` already pins
+  `ipykernel==7.3.0` and compatible `jupyter_client==8.9.1`. The server's
+  installed 7.4.9 client is an exact-environment violation. The validator now
+  records and prints exact synchronization/verification commands for either a
+  pin mismatch or `pip check` failure; no dependency constraint was loosened.

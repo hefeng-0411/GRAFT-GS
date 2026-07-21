@@ -199,6 +199,37 @@ class ServerManifestHandoffTest(unittest.TestCase):
         self.assertFalse(audit["valid"])
         self.assertIn("manifest object ID catalog digest differs", audit["errors"])
 
+    def test_upstream_checkout_contract_requires_package_and_entrypoint(self) -> None:
+        checkout = Path(self.temporary.name) / "vggt_checkout"
+        package = checkout / "vggt"
+        package.mkdir(parents=True)
+        (package / "__init__.py").write_text("VERSION = 1\n", encoding="utf8")
+        (checkout / "demo_gradio.py").write_text("print('vggt')\n", encoding="utf8")
+        contract = VALIDATOR._upstream_repository_contract(
+            checkout,
+            "IGNORED_EXPLICIT_ARGUMENT",
+            Path("/unreachable/default"),
+            "vggt",
+            "demo_gradio.py",
+        )
+        self.assertTrue(contract["valid"], contract["errors"])
+        self.assertEqual(contract["root"], str(checkout.resolve()))
+        self.assertEqual(len(str(contract["package_init_sha256"])), 64)
+        self.assertEqual(len(str(contract["entrypoint_sha256"])), 64)
+
+        (checkout / "demo_gradio.py").unlink()
+        missing = VALIDATOR._upstream_repository_contract(
+            checkout,
+            "IGNORED_EXPLICIT_ARGUMENT",
+            checkout,
+            "vggt",
+            "demo_gradio.py",
+        )
+        self.assertFalse(missing["valid"])
+        self.assertTrue(
+            any("entrypoint is unavailable" in error for error in missing["errors"])
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

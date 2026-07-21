@@ -11,8 +11,10 @@ import torch
 
 from graft_gs.engine import (
     load_graft_checkpoint,
+    load_precision_policy,
     load_server_config,
     load_trellis_prior_config,
+    validate_precision_policy,
     validate_trellis_prior_policy,
 )
 from graft_gs.integration import (
@@ -58,8 +60,14 @@ def main() -> None:
         raise ValueError("multiview inference requires at least two images")
     paths = paths[: args.maximum_views]
     device = torch.device("cuda")
-    adapter = VGGTAdapter.from_pretrained(args.vggt_checkpoint)
     model_config, _, _, _ = load_server_config(args.config)
+    precision_policy = load_precision_policy(args.config)
+    precision_policy.apply()
+    adapter = VGGTAdapter.from_pretrained(
+        args.vggt_checkpoint,
+        feature_dim=model_config.feature_dim,
+        backbone_dtype=precision_policy.backbone_dtype,
+    )
     prior_config = load_trellis_prior_config(args.config)
     use_prior = bool(prior_config["enabled_after_phase_a"])
     if use_prior:
@@ -86,6 +94,7 @@ def main() -> None:
             map_location="cpu",
             strict=True,
         )
+        validate_precision_policy(checkpoint_payload, precision_policy)
         validate_trellis_prior_policy(
             checkpoint_payload,
             enabled=prior is not None,

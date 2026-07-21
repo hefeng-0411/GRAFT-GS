@@ -103,7 +103,7 @@ class RealMultiviewTest(unittest.TestCase):
             trainer.batches_consumed_in_epoch = 13
             trainer.save_checkpoint(checkpoint)
             payload = torch.load(checkpoint, map_location="cpu", weights_only=False)
-            self.assertEqual(payload["format_version"], 5)
+            self.assertEqual(payload["format_version"], 6)
             self.assertEqual(payload["checkpoint_world_size"], trainer.context.world_size)
             self.assertEqual(len(payload["rank_rng_states"]), trainer.context.world_size)
             expected_random = torch.rand(8)

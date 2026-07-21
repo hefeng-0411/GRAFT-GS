@@ -9,6 +9,7 @@ import yaml
 
 from ..integration.pipeline import GraftGSConfig
 from .losses import LossWeights
+from .precision import NativePrecisionPolicy
 
 
 def load_server_config(
@@ -100,6 +101,36 @@ def load_trellis_prior_config(path: str | Path) -> dict[str, object]:
     return config
 
 
+def load_precision_policy(path: str | Path) -> NativePrecisionPolicy:
+    """Load and validate the process-wide native precision boundary."""
+
+    data = yaml.safe_load(Path(path).read_text(encoding="utf8"))
+    value = data.get("precision", {}) if isinstance(data, dict) else {}
+    if not isinstance(value, dict):
+        raise ValueError("configuration section 'precision' must be a mapping")
+    allowed = {
+        "backbone",
+        "geometric_state",
+        "analytical_solve",
+        "diagnostics",
+        "float32_matmul_precision",
+        "allow_tf32",
+    }
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError(f"unknown precision policy keys: {unknown}")
+    return NativePrecisionPolicy(
+        backbone=str(value.get("backbone", "bfloat16")),
+        geometric_state=str(value.get("geometric_state", "float32")),
+        analytical_solve=str(value.get("analytical_solve", "float32")),
+        diagnostics=str(value.get("diagnostics", "float64")),
+        float32_matmul_precision=str(
+            value.get("float32_matmul_precision", "highest")
+        ),
+        allow_tf32=bool(value.get("allow_tf32", False)),
+    )
+
+
 def load_loss_weights(path: str | Path) -> LossWeights:
     """Load explicit objective weights and reject dead configuration keys."""
 
@@ -117,4 +148,9 @@ def load_loss_weights(path: str | Path) -> LossWeights:
     return replace(LossWeights(), **converted)
 
 
-__all__ = ["load_loss_weights", "load_server_config", "load_trellis_prior_config"]
+__all__ = [
+    "load_loss_weights",
+    "load_precision_policy",
+    "load_server_config",
+    "load_trellis_prior_config",
+]

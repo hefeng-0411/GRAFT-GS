@@ -10,10 +10,16 @@ checkpoints, data, or a compiled server dependency.
   preflight in the enterprise A800 environment. The user reports that both
   released checkpoints exist in the server's default caches; their GRAFT-GS
   adapter results and provenance JSON have not yet been returned to this local
-  workspace. A trained GRAFT checkpoint still requires staged training.
-- CUDA/reference raster equivalence requires the server-built
-  `diff_gaussian_rasterization` extension.
-- Six-rank DDP equivalence, rank-local RNG resume, peak memory, and throughput
+  workspace. The validator now also requires and fingerprints the declared
+  `/mnt/sda2/hef/Base/vggt` and `/mnt/sda2/hef/Base/TRELLIS` checkouts, but
+  their actual server hashes have not been observed locally. A trained GRAFT
+  checkpoint still requires staged training.
+- CUDA/reference raster equivalence has now executed once and failed under the
+  pre-repair renderer (RGB max absolute error `0.6104467`, 14.2% elements out
+  of tolerance). The TRELLIS mip semantics, pixel centers, covariance path,
+  and auxiliary backgrounds were repaired; the exact off-axis/nonblack test
+  must be rerun on the A800 before equivalence is claimed.
+- Scheduler-visible multi-rank DDP equivalence, rank-local RNG resume, peak memory, and throughput
   measurements require a multi-A800 `torchrun` execution.
 - One-object overfitting and real multiview inference require the remote full
   train/test corpus and trained GRAFT-GS phase checkpoints. The local single
@@ -39,7 +45,8 @@ checkpoints, data, or a compiled server dependency.
 - Predictor-and-corrector feasibility backtracking and QP primal-margin checks.
 - Curvature-quadrature Gaussian allocation and PBR GLB reload.
 - Phase B/C execution-stage isolation.
-- Format-5 exact DDP checkpoint and Phase-F Fisher-state continuation.
+- Format-6 exact DDP checkpoint, native-precision provenance, and Phase-F
+  Fisher-state continuation.
 - Hilbert-space multiview gradient purification and manual post-purification
   DDP averaging.
 - Bounded quantization-scale inner maximization and dimensionless positive
@@ -77,25 +84,25 @@ checkpoints, data, or a compiled server dependency.
   gradient, certificate-dtype, prior-reliability, remote-manifest, and strict
   environment repairs. The corrected suite must be rerun with
   `/mnt/sda1/miniforge3/envs/CRAFT/bin/python scripts/validate_server.py` and
-  the declared `/mnt/sda2/hef/Base/dataset`
+  the declared `/mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97`
   root. No corrected numerical result is claimed yet.
 - The manifest handoff now locally passes stale-schema, wrong-root,
   record-count, modality-intersection, discovered-ID-digest, missing-summary,
   compatible-reuse, and many-object ordering tests. What remains external is executing the full
   rebuild against the large mounted remote corpus and retaining its digest and
   measured build duration.
-- The reference command intentionally does not execute six-rank DDP or a real
+- The reference command intentionally does not execute visible-rank DDP or a real
   image/checkpoint inference corpus. Those retain their dedicated commands in
   `docs/A800_VALIDATION_PROTOCOL.md`; all dataset, CUDA renderer, and
   nvdiffrast skips in the reference suite are now hard orchestration failures.
 - The accelerator probe contract is locally tested with synthetic metadata,
   but its CUDA 11.8, BF16, A800 identity, compute capability, and memory record
   remains pending until `validate_server.py` is rerun on the enterprise host.
-- The six-rank validator now rejects world-size/device aliasing and aggregates
+- The visible-rank validator now rejects world-size/device aliasing and aggregates
   pass/fail across ranks, but NCCL initialization, distinct A800 assignment,
   global-evidence gradients, prior broadcast, and rank-local RNG replay remain
   genuinely external until its structured JSON/log is produced on the server.
 - Phase launches are now pinned to the exact CRAFT interpreter and audit its
   requirements first. Executing the Bash launcher, NCCL initialization, staged
   backward passes, checkpoint boundaries, runtime, and peak memory remains an
-  external six-A800 task.
+  external scheduler-visible A800 task.

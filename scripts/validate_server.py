@@ -17,8 +17,10 @@ from validate_environment import audit_environment
 
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_SERVER_DATASET = Path(
-    "/mnt/sda2/hef/Base/dataset"
+    "/mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97"
 )
+DEFAULT_SERVER_VGGT_ROOT = Path("/mnt/sda2/hef/Base/vggt")
+DEFAULT_SERVER_TRELLIS_ROOT = Path("/mnt/sda2/hef/Base/TRELLIS")
 EXPECTED_MESHFLEET_SCHEMA = "meshfleet-trellis-object-v2"
 EXPECTED_DISCOVERY_REQUIRED_MODALITIES = ("renders", "latents", "mesh_normalized")
 ALLOWED_REFERENCE_SKIP_REASONS = (
@@ -116,6 +118,48 @@ def _dataset_root(argument: Path | None) -> Path | None:
     return DEFAULT_SERVER_DATASET if DEFAULT_SERVER_DATASET.is_dir() else None
 
 
+def _upstream_repository_contract(
+    argument: Path | None,
+    environment_name: str,
+    default: Path,
+    package: str,
+    entrypoint: str,
+) -> dict[str, object]:
+    """Resolve and fingerprint one declared upstream source checkout."""
+
+    configured = argument
+    if configured is None:
+        environment = os.environ.get(environment_name)
+        configured = Path(environment) if environment else default
+    root = configured.expanduser().resolve()
+    package_init = root / package / "__init__.py"
+    entrypoint_path = root / entrypoint
+    errors: list[str] = []
+    if not root.is_dir():
+        errors.append(f"upstream repository root is unavailable: {root}")
+    if not package_init.is_file():
+        errors.append(f"upstream package is unavailable: {package_init}")
+    if not entrypoint_path.is_file():
+        errors.append(f"verified upstream entrypoint is unavailable: {entrypoint_path}")
+    return {
+        "valid": not errors,
+        "root": str(root),
+        "package": package,
+        "entrypoint": str(entrypoint_path),
+        "package_init_sha256": (
+            hashlib.sha256(package_init.read_bytes()).hexdigest()
+            if package_init.is_file()
+            else None
+        ),
+        "entrypoint_sha256": (
+            hashlib.sha256(entrypoint_path.read_bytes()).hexdigest()
+            if entrypoint_path.is_file()
+            else None
+        ),
+        "errors": errors,
+    }
+
+
 def _skip_reasons(stderr: str) -> list[str]:
     return re.findall(r"\.\.\. skipped ['\"](.+?)['\"]", stderr)
 
@@ -123,6 +167,21 @@ def _skip_reasons(stderr: str) -> list[str]:
 def _write_record(path: Path, record: dict[str, object]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf8")
+
+
+def _environment_remediation(requirements: Path) -> dict[str, str]:
+    python = str(Path(sys.executable).resolve())
+    requirements = str(requirements.resolve())
+    return {
+        "synchronize_exact_pins": (
+            f"{python} -m pip install --no-deps --upgrade -r {requirements}"
+        ),
+        "verify_exact_pins": (
+            f"{python} {str((ROOT / 'scripts' / 'validate_environment.py').resolve())} "
+            f"--requirements {requirements}"
+        ),
+        "verify_dependency_metadata": f"{python} -m pip check",
+    }
 
 
 def _load_object_id_catalog(path: Path) -> tuple[str, ...]:
@@ -295,6 +354,8 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=Path("outputs/validation.json"))
     parser.add_argument("--requirements", type=Path, default=ROOT / "requirements.txt")
     parser.add_argument("--dataset-root", type=Path)
+    parser.add_argument("--vggt-root", type=Path)
+    parser.add_argument("--trellis-root", type=Path)
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--object-id-file", type=Path)
     parser.add_argument(
@@ -318,10 +379,7 @@ def main() -> None:
     if not isinstance(environment_record, dict) or not environment_record["valid"]:
         record["returncode"] = 2
         record["seconds"] = time.perf_counter() - overall_start
-        record["remediation"] = (
-            f"{sys.executable} -m pip install --no-deps --upgrade -r "
-            f"{Path(args.requirements).resolve()}"
-        )
+        record["remediation"] = _environment_remediation(args.requirements)
         _write_record(output_path, record)
         print(json.dumps(record, indent=2, sort_keys=True))
         raise SystemExit(2)
@@ -331,10 +389,47 @@ def main() -> None:
     if pip_check["returncode"] != 0:
         record["returncode"] = 2
         record["seconds"] = time.perf_counter() - overall_start
+        record["remediation"] = _environment_remediation(args.requirements)
         _write_record(output_path, record)
         sys.stdout.write(str(pip_check["stdout"]))
         sys.stderr.write(str(pip_check["stderr"]))
+        sys.stderr.write(
+            "\nExact environment remediation:\n"
+            + json.dumps(record["remediation"], indent=2, sort_keys=True)
+            + "\n"
+        )
         raise SystemExit(2)
+
+    upstream_repositories = {
+        "vggt": _upstream_repository_contract(
+            args.vggt_root,
+            "GRAFT_GS_VGGT_ROOT",
+            DEFAULT_SERVER_VGGT_ROOT,
+            "vggt",
+            "demo_gradio.py",
+        ),
+        "trellis": _upstream_repository_contract(
+            args.trellis_root,
+            "GRAFT_GS_TRELLIS_ROOT",
+            DEFAULT_SERVER_TRELLIS_ROOT,
+            "trellis",
+            "app.py",
+        ),
+    }
+    record["upstream_repositories"] = upstream_repositories
+    if not all(bool(value["valid"]) for value in upstream_repositories.values()):
+        record["returncode"] = 2
+        record["seconds"] = time.perf_counter() - overall_start
+        _write_record(output_path, record)
+        print(json.dumps(record, indent=2, sort_keys=True))
+        raise SystemExit(2)
+    runtime_environment = os.environ.copy()
+    runtime_environment["GRAFT_GS_VGGT_ROOT"] = str(
+        upstream_repositories["vggt"]["root"]
+    )
+    runtime_environment["GRAFT_GS_TRELLIS_ROOT"] = str(
+        upstream_repositories["trellis"]["root"]
+    )
 
     accelerator = _probe_accelerator()
     record["accelerator"] = accelerator
@@ -437,7 +532,7 @@ def main() -> None:
             "--output",
             str(component_output),
         ]
-        validation = _run(command)
+        validation = _run(command, runtime_environment)
         external_models[component] = validation
         if validation["returncode"] != 0:
             record["external_models"] = external_models
@@ -449,7 +544,7 @@ def main() -> None:
             raise SystemExit(int(validation["returncode"]))
     record["external_models"] = external_models
 
-    test_environment = os.environ.copy()
+    test_environment = runtime_environment.copy()
     test_environment["GRAFT_GS_MESHFLEET_ROOT"] = str(dataset_root)
     test_environment["GRAFT_GS_MESHFLEET_MANIFEST"] = str(manifest)
     test_command = [

@@ -1,4 +1,4 @@
-"""Six-rank A800 environment and same-object DDP reference validation."""
+"""Visible-rank A800 environment and same-object DDP reference validation."""
 
 from __future__ import annotations
 
@@ -40,12 +40,21 @@ def _local_device_record(rank: int, local_rank: int) -> dict[str, object]:
 
 def _distributed_contract_errors(
     world_size: int,
+    visible_device_count: int,
+    visible_device_mask: str | None,
     devices: list[dict[str, object]],
     environment_valid: bool,
 ) -> list[str]:
     errors: list[str] = []
-    if world_size != 6:
-        errors.append(f"six-A800 validation requires WORLD_SIZE=6, received {world_size}")
+    if visible_device_mask is None or not visible_device_mask.strip():
+        errors.append("CUDA_VISIBLE_DEVICES must explicitly identify the assigned GPU subset")
+    if world_size < 1:
+        errors.append(f"A800 validation requires a positive WORLD_SIZE, received {world_size}")
+    if visible_device_count != world_size:
+        errors.append(
+            "torchrun world size must equal the CUDA_VISIBLE_DEVICES-resolved "
+            f"device count; world_size={world_size}, visible={visible_device_count}"
+        )
     if not environment_valid:
         errors.append("one or more ranks do not match the exact requirements contract")
     if len(devices) != world_size:
@@ -79,7 +88,9 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
     if not torch.cuda.is_available():
-        raise RuntimeError("six-A800 validation requires CUDA")
+        raise RuntimeError("visible-rank A800 validation requires CUDA")
+    visible_device_count = torch.cuda.device_count()
+    visible_device_mask = os.environ.get("CUDA_VISIBLE_DEVICES")
     torch.cuda.set_device(local_rank)
     if not dist.is_initialized():
         dist.init_process_group(backend="nccl", init_method="env://")
@@ -103,12 +114,19 @@ def main() -> None:
     errors = _accelerator_contract_errors(accelerator_details)
     errors.extend(
         _distributed_contract_errors(
-            world_size, devices, bool(local_environment_valid.item())
+            world_size,
+            visible_device_count,
+            visible_device_mask,
+            devices,
+            bool(local_environment_valid.item()),
         )
     )
     preflight = {
         "valid": not errors,
         "world_size": world_size,
+        "visible_device_count": visible_device_count,
+        "cuda_visible_devices": visible_device_mask,
+        "multi_rank": world_size > 1,
         "environment": environment,
         "torch_version": torch.__version__,
         "torch_cuda": torch.version.cuda,

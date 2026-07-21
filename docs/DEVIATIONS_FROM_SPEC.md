@@ -120,7 +120,7 @@
     environment variable, then the released model-hub identifier. This is an
     execution-boundary clarification rather than a mathematical change.
 26. **Source-only TRELLIS sampling in same-object DDP.** The structured prior
-    is frozen and sampled under `no_grad`; sampling it independently on six
+    is frozen and sampled under `no_grad`; sampling it independently on every visible
     ranks cannot add a gradient. Same-object mode therefore gathers every view,
     samples only on the designated source rank, and broadcasts the typed
     probability/mass/variance measure before atlas construction. Object-level
@@ -166,3 +166,18 @@
     a configurable required-modality intersection, records optional absence,
     and retains rejected candidates separately. An optional ID file can narrow
     the result but is never the default source of truth.
+31. **TRELLIS mip-EWA is the canonical rendering measure.** The specification
+    requires a differentiable Gaussian renderer but does not fix pixel-center,
+    antialiasing, or tail-pruning conventions. The implementation adopts the
+    actual TRELLIS mip-splatting equations for both reference and optimized
+    paths, passes analytical SPD covariance directly, and rejects a generic
+    graphdeco ABI rather than silently using different low-pass semantics.
+    The determinant peak factor preserves integrated screen-space Gaussian
+    measure under the mip filter; discrete tile/pruning behavior remains an
+    explicit approximation boundary.
+32. **TF32 is rejected for the native reference.** Although A800 TF32 would
+    improve throughput while leaving tensor dtypes labeled FP32, its shortened
+    product mantissa is not accepted for sparse transport, SPD, topology, or
+    barrier decisions. The executable YAML policy disables TF32 and is stored
+    in format-6 checkpoints. This is stricter than the Markdown's broad mixed-
+    precision allowance and intentionally prioritizes reconstruction fidelity.

@@ -281,6 +281,25 @@ class TopologyAndManifoldTest(unittest.TestCase):
             certificate.to_dict()["topology_boundary_margin"],
             float(topology_margin),
         )
+        state32 = ManifoldState(
+            position.float(),
+            rotation_0.float(),
+            covariance_0.float(),
+            torch.zeros(4, 1, dtype=torch.float32),
+            torch.zeros(4, 48, dtype=torch.float32),
+            torch.zeros(4, 128, dtype=torch.float32),
+            torch.eye(3, dtype=torch.float32).expand(4, -1, -1).clone(),
+            complex_,
+        )
+        projector32 = BarrierProjector(
+            state32,
+            BarrierConfig(minimum_separation=0.1),
+        )
+        self.assertTrue(projector32.report(state32).feasible)
+        self.assertEqual(
+            projector32.topology_boundary_margin(state32).dtype,
+            torch.float64,
+        )
         tangent = ManifoldTangent(
             position=-0.1 * position,
             rotation_body=torch.zeros(4, 3, dtype=dtype),

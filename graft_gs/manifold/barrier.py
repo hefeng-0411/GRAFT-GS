@@ -149,6 +149,18 @@ class BarrierProjector:
         face_position = reference.position[self.faces]
         cross = torch.linalg.cross(face_position[:, 1] - face_position[:, 0], face_position[:, 2] - face_position[:, 0])
         self.reference_face_normal = F.normalize(cross, dim=-1)
+        diagnostic_face_position = reference.position.detach().to(dtype=torch.float64)[
+            self.faces
+        ]
+        diagnostic_cross = torch.linalg.cross(
+            diagnostic_face_position[:, 1] - diagnostic_face_position[:, 0],
+            diagnostic_face_position[:, 2] - diagnostic_face_position[:, 0],
+            dim=-1,
+        )
+        self.reference_face_normal_diagnostics = F.normalize(
+            diagnostic_cross,
+            dim=-1,
+        )
         adjacent = {tuple(sorted(edge)) for edge in reference.complex.edges.tolist()}
         search_radius = config.minimum_separation + 2.0 * config.maximum_position_speed
         position_cpu = reference.position.detach().to(device="cpu", dtype=torch.float64).numpy()
@@ -204,13 +216,19 @@ class BarrierProjector:
             latent=tangent.latent,
         )
 
-    def _face_quantities(self, position: Tensor) -> Tuple[Tensor, Tensor]:
+    def _face_quantities(
+        self,
+        position: Tensor,
+        reference_normal: Tensor | None = None,
+    ) -> Tuple[Tensor, Tensor]:
         vertices = position[self.faces]
         cross = torch.linalg.cross(vertices[:, 1] - vertices[:, 0], vertices[:, 2] - vertices[:, 0])
         double_area = torch.linalg.vector_norm(cross, dim=-1)
         normal = cross / double_area[:, None].clamp_min(torch.finfo(position.dtype).eps)
         area_margin = 0.5 * double_area - self.config.minimum_face_area
-        orientation_margin = torch.sum(normal * self.reference_face_normal, dim=-1) - self.config.minimum_orientation_cosine
+        if reference_normal is None:
+            reference_normal = self.reference_face_normal
+        orientation_margin = torch.sum(normal * reference_normal, dim=-1) - self.config.minimum_orientation_cosine
         return area_margin, orientation_margin
 
     def _separation_margin(self, position: Tensor) -> Tensor:
@@ -226,8 +244,11 @@ class BarrierProjector:
         right = position[self.faces[self.nonlocal_face_pairs[:, 1]]]
         return triangle_distance_squared(left, right) - self.config.minimum_separation**2
 
-    def position_constraints(self, position: Tensor) -> Tensor:
-        area, orientation = self._face_quantities(position)
+    def position_constraints(self, position: Tensor, diagnostics: bool = False) -> Tensor:
+        area, orientation = self._face_quantities(
+            position,
+            self.reference_face_normal_diagnostics if diagnostics else None,
+        )
         separation = self._separation_margin(position)
         triangle_separation = self._triangle_separation_margin(position)
         return torch.cat((area, orientation, separation, triangle_separation))
@@ -250,11 +271,13 @@ class BarrierProjector:
         if epsilon <= 0:
             raise ValueError("topology-margin epsilon must be positive")
         with torch.enable_grad():
-            position = state.position.detach().clone().requires_grad_(True)
-            constraint = self.position_constraints(position)
+            position = state.position.detach().to(dtype=torch.float64).requires_grad_(True)
+            constraint = self.position_constraints(position, diagnostics=True)
             if constraint.numel() == 0:
-                return state.position.new_tensor(torch.inf)
-            metric_inverse = torch.linalg.inv(state.evidence_metric.detach())
+                return position.new_tensor(torch.inf)
+            metric_inverse = torch.linalg.inv(
+                state.evidence_metric.detach().to(dtype=torch.float64)
+            )
             margins: List[Tensor] = []
             for index in range(constraint.numel()):
                 gradient = torch.autograd.grad(
@@ -277,10 +300,19 @@ class BarrierProjector:
             return torch.stack(margins).amin()
 
     def report(self, state: ManifoldState, accepted_step: float = 0.0) -> FeasibilityReport:
-        area, orientation = self._face_quantities(state.position)
-        separation = self._separation_margin(state.position)
-        triangle_separation = self._triangle_separation_margin(state.position)
-        eigenvalues = torch.linalg.eigvalsh(0.5 * (state.covariance + state.covariance.transpose(-1, -2)))
+        # Acceptance/certification is detached and deliberately recomputed in
+        # FP64. The differentiable CBF projection remains in the state dtype.
+        position = state.position.detach().to(dtype=torch.float64)
+        covariance = state.covariance.detach().to(dtype=torch.float64)
+        area, orientation = self._face_quantities(
+            position,
+            self.reference_face_normal_diagnostics,
+        )
+        separation = self._separation_margin(position)
+        triangle_separation = self._triangle_separation_margin(position)
+        eigenvalues = torch.linalg.eigvalsh(
+            0.5 * (covariance + covariance.transpose(-1, -2))
+        )
         covariance_min = eigenvalues[:, 0] - self.config.minimum_covariance_eigenvalue
         covariance_max = self.config.maximum_covariance_eigenvalue - eigenvalues[:, -1]
         area_min = float(area.min().detach().cpu()) if area.numel() else float("inf")

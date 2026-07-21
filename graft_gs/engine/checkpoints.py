@@ -10,6 +10,7 @@ import torch
 
 from ..integration.pipeline import GraftGS
 from ..optimization.quantization import QuantizationConfig, apply_equivariant_qat
+from .precision import NativePrecisionPolicy
 
 
 @dataclass(frozen=True)
@@ -111,9 +112,53 @@ def validate_trellis_prior_policy(
             raise ValueError(f"checkpoint TRELLIS hidden-prior policy differs at {name}")
 
 
+def validate_precision_policy(
+    payload: Mapping[str, Any],
+    policy: NativePrecisionPolicy,
+) -> None:
+    """Reject inference or phase transfer under a different numeric model."""
+
+    expected = {
+        "precision_backbone": policy.backbone,
+        "precision_geometric_state": policy.geometric_state,
+        "precision_analytical_solve": policy.analytical_solve,
+        "precision_diagnostics": policy.diagnostics,
+        "precision_float32_matmul": policy.float32_matmul_precision,
+        "precision_allow_tf32": policy.allow_tf32,
+    }
+    default_policy = NativePrecisionPolicy()
+    legacy_defaults = {
+        "precision_backbone": default_policy.backbone,
+        "precision_geometric_state": default_policy.geometric_state,
+        "precision_analytical_solve": default_policy.analytical_solve,
+        "precision_diagnostics": default_policy.diagnostics,
+        "precision_float32_matmul": default_policy.float32_matmul_precision,
+        "precision_allow_tf32": default_policy.allow_tf32,
+    }
+    trainer = payload.get("trainer_config")
+    format_version = int(payload.get("format_version", 0))
+    if not isinstance(trainer, Mapping):
+        if format_version >= 6 or expected != legacy_defaults:
+            raise ValueError("checkpoint lacks native precision provenance")
+        return
+    for name, value in expected.items():
+        if name not in trainer:
+            if format_version < 6 and value == legacy_defaults[name]:
+                continue
+            raise ValueError(f"checkpoint lacks native precision field {name}")
+        if trainer.get(name) != value:
+            raise ValueError(f"checkpoint native precision policy differs at {name}")
+    if format_version >= 6:
+        runtime = payload.get("precision_runtime")
+        expected_runtime = policy.apply()
+        if not isinstance(runtime, Mapping) or dict(runtime) != expected_runtime:
+            raise ValueError("checkpoint runtime precision record differs from the active process")
+
+
 __all__ = [
     "CheckpointLoadReport",
     "load_graft_checkpoint",
     "prepare_model_for_checkpoint",
+    "validate_precision_policy",
     "validate_trellis_prior_policy",
 ]

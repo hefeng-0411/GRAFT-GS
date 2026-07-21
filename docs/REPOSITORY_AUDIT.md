@@ -63,9 +63,12 @@ integration.  Upstream directories remain unmodified.
   and TRELLIS run in separate subprocesses and record upstream module/checkpoint
   provenance, tensor/support contracts, runtime, and peak CUDA allocation.
 - Every production entry point uses `CLI -> environment -> official hub ID`
-  checkpoint resolution. Installed packages are preferred; explicit checkouts
-  use `GRAFT_GS_VGGT_ROOT` or `GRAFT_GS_TRELLIS_ROOT`. No Windows path appears
-  in executable source or configuration.
+  checkpoint resolution. Explicit checkout environment values are preferred,
+  followed by the physically present declared server roots
+  `/mnt/sda2/hef/Base/vggt` and `/mnt/sda2/hef/Base/TRELLIS`, then installed
+  packages. Module-origin validation prevents resolving a same-named package
+  outside the selected checkout. No Windows path appears in executable source
+  or configuration.
 - `scripts/infer_multiview.py` runs the GRAFT-GS vertical slice and exports both
   formats from the selected atlas.
 - Both inference paths optionally emit a computed metric topology-margin
@@ -80,7 +83,7 @@ integration.  Upstream directories remain unmodified.
 - Local Windows/WSL is treated as an editor only. Since the hardware update,
   validation is restricted to parsing/bytecode compilation. Checkpoint
   downloads, forward/backward execution, profiling, and extension builds are
-  intentionally deferred to the 6x A800 server.
+  intentionally deferred to the scheduler-visible subset of the 6x A800 server.
 
 ## 2026-07-16 production-path audit
 
@@ -100,7 +103,7 @@ integration.  Upstream directories remain unmodified.
 - PLY and GLB remain one-state outputs. GLB adds only a deterministic PBR
   material; it does not call TRELLIS decoding, marching cubes, or a second mesh
   representation.
-- Checkpoint format 5 makes exact resume objective-, world-size-, and Phase-F
+- Checkpoint format 6 makes exact resume objective-, world-size-, precision-, and Phase-F
   Fisher-state-aware and stores rank-local RNG streams rather than cloning
   rank zero onto all ranks.
 - The exhaustive requirement mapping and honest status classification are in

@@ -19,8 +19,10 @@ from graft_gs.engine import (
     TeacherBundleConfig,
     TopologyFixedTeacherBundleRefiner,
     load_graft_checkpoint,
+    load_precision_policy,
     load_server_config,
     load_trellis_prior_config,
+    validate_precision_policy,
     validate_trellis_prior_policy,
 )
 from graft_gs.engine.losses import multiview_reprojection_cycle_loss
@@ -66,6 +68,8 @@ def main() -> None:
     args.vggt_checkpoint = resolve_vggt_checkpoint(args.vggt_checkpoint)
 
     model_config, _, _, dataset_config = load_server_config(args.config)
+    precision_policy = load_precision_policy(args.config)
+    precision_policy.apply()
     configured_id_file = dataset_config.get("object_id_file")
     object_id_file = args.object_id_file or (
         Path(str(configured_id_file)) if configured_id_file is not None else None
@@ -122,7 +126,9 @@ def main() -> None:
     )
     model = GraftGS(
         VGGTAdapter.from_pretrained(
-            args.vggt_checkpoint, feature_dim=model_config.feature_dim
+            args.vggt_checkpoint,
+            feature_dim=model_config.feature_dim,
+            backbone_dtype=precision_policy.backbone_dtype,
         ),
         model_config,
         prior,
@@ -130,6 +136,7 @@ def main() -> None:
     payload, report = load_graft_checkpoint(
         model, args.graft_checkpoint, map_location="cpu", strict=True
     )
+    validate_precision_policy(payload, precision_policy)
     validate_trellis_prior_policy(
         payload,
         enabled=use_prior,

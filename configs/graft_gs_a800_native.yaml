@@ -3,9 +3,10 @@ precision:
   geometric_state: float32
   analytical_solve: float32
   diagnostics: float64
+  float32_matmul_precision: highest
+  allow_tf32: false
 distributed:
   backend: nccl
-  world_size: 6
   synchronize_object_atlas: false
 dataset:
   input_view_set: renders

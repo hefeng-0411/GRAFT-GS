@@ -70,6 +70,10 @@ class ExactEnvironmentContractTest(unittest.TestCase):
         self.assertEqual(len(required), 444)
         self.assertEqual(required["torch"]["version"], "2.4.0+cu118")
         self.assertEqual(required["torchvision"]["version"], "0.19.0+cu118")
+        # ipykernel 7.3 declares jupyter-client>=8.9.0.  Pinning the legacy
+        # 7.4.9 client makes an otherwise exact environment fail ``pip check``.
+        self.assertEqual(required["ipykernel"]["version"], "7.3.0")
+        self.assertEqual(required["jupyter-client"]["version"], "8.9.1")
 
     def test_checkpoint_resolution_is_cli_then_environment_then_official_default(self) -> None:
         names = (

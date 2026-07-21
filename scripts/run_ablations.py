@@ -12,8 +12,10 @@ import torch
 
 from graft_gs.engine import (
     load_graft_checkpoint,
+    load_precision_policy,
     load_server_config,
     load_trellis_prior_config,
+    validate_precision_policy,
     validate_trellis_prior_policy,
 )
 from graft_gs.integration import (
@@ -46,6 +48,8 @@ def main() -> None:
     device = torch.device("cuda")
     images = load_and_preprocess_images([str(path) for path in paths])[None].to(device)
     base, _, _, _ = load_server_config(args.config)
+    precision_policy = load_precision_policy(args.config)
+    precision_policy.apply()
     prior_config = load_trellis_prior_config(args.config)
     use_prior = bool(prior_config["enabled_after_phase_a"])
     if use_prior:
@@ -64,7 +68,9 @@ def main() -> None:
         else None
     )
     adapter = VGGTAdapter.from_pretrained(
-        args.vggt_checkpoint, feature_dim=base.feature_dim
+        args.vggt_checkpoint,
+        feature_dim=base.feature_dim,
+        backbone_dtype=precision_policy.backbone_dtype,
     )
     variants = {
         "reference": (base, prior),
@@ -117,6 +123,7 @@ def main() -> None:
             # preserving the trained parameter contract.
             validate_model_config=name == "reference",
         )
+        validate_precision_policy(checkpoint_payload, precision_policy)
         validate_trellis_prior_policy(
             checkpoint_payload,
             enabled=variant_prior is not None,
