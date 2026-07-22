@@ -583,3 +583,30 @@ The full conditional validity domain is maintained in
   global autograd-gathered evidence measure, synchronize the atlas/stratum, and
   run the frozen TRELLIS sampler only on the source rank. Ordinary corpus
   object-level DDP is unchanged.
+- Requirement `DDP-ATLAS-TRANSPORT-01`: the subsequent A800 run passed TRELLIS
+  sampling and exposed Torch-2.4 NCCL rejection of atlas `levels:int16`.
+  `AtlasDDPSynchronizer` now preflights complete atlas config/shape/dtype/device
+  metadata, transports every discrete field through an independent contiguous
+  int64 buffer with an exact checked round trip, and applies the same codec to
+  Boolean split masks. This also protects int8 child slots, noncontiguous int64
+  connectivity, and Morton identities beyond floating-point exactness.
+- Requirement `DDP-ATLAS-GAUGE-02`: the next A800 smoke run passed the int64
+  transport boundary and exposed a raw `chart_frames` mismatch of exactly one.
+  This is a PCA chart-gauge ambiguity: eigenvector signs and bases inside a
+  nearly repeated eigenspace are not unique. Same-object DDP now defines one
+  source-owned nonlinear atlas and uses autograd-aware floating broadcasts.
+  Backward reduces every rank's downstream atlas derivative to the source; the
+  preceding differentiable evidence all-gather then routes exact derivatives
+  to each rank's local VGGT evidence. The invalid local straight-through frame
+  derivative was removed.
+- Gauge-coordinate fields (`chart_frames`, local curvature, overlap rotations
+  and translations) are source-authoritative and are not compared in raw
+  coordinates. Gauge-independent state retains collective finite and mixed
+  absolute/relative replica checks, all discrete state retains exact int64
+  transport, and the synchronized source atlas is structurally revalidated.
+- Requirement `ATLAS-PCA-EIGENGAP-01`: PCA frame differentiation is restricted
+  to the simple-spectrum stratum measured by an explicit relative eigengap.
+  Repeated or near-repeated eigenvectors retain their valid SO(3) forward gauge
+  but receive a finite zero derivative for that mathematically unidentifiable
+  gauge. The threshold is typed in `AtlasConfig`, loaded from the server YAML,
+  and does not reduce FP32 geometric-state precision.

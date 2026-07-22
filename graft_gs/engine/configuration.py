@@ -48,6 +48,15 @@ def load_server_config(
             base.atlas,
             base_level=int(model.get("base_level", base.atlas.base_level)),
             max_level=int(model.get("max_level", base.atlas.max_level)),
+            frame_epsilon=float(
+                model.get("frame_epsilon", base.atlas.frame_epsilon)
+            ),
+            frame_relative_eigengap=float(
+                model.get(
+                    "frame_relative_eigengap",
+                    base.atlas.frame_relative_eigengap,
+                )
+            ),
         ),
         mapping=replace(
             base.mapping,

@@ -13,7 +13,13 @@ import unittest
 
 import torch
 
-from graft_gs.geometry.atlas import AtlasConfig, PersistentOctreeAtlas, morton_decode, morton_encode
+from graft_gs.geometry.atlas import (
+    AtlasConfig,
+    PersistentOctreeAtlas,
+    _right_handed_pca_frames,
+    morton_decode,
+    morton_encode,
+)
 from graft_gs.mapping.manifold_mapping import (
     EvidenceParticles,
     ImplicitSinkhornConfig,
@@ -62,6 +68,38 @@ def _surface_evidence(dtype: torch.dtype = torch.float64) -> EvidenceParticles:
 
 
 class PersistentAtlasTest(unittest.TestCase):
+    def test_pca_frame_repeated_spectrum_has_finite_zero_gauge_gradient(self) -> None:
+        covariance = torch.zeros(2, 3, 3, dtype=torch.float64, requires_grad=True)
+        frame = _right_handed_pca_frames(covariance, 1.0e-10, 1.0e-4)
+        eye = torch.eye(3, dtype=frame.dtype).expand_as(frame)
+        torch.testing.assert_close(frame.transpose(-1, -2) @ frame, eye)
+        torch.testing.assert_close(
+            torch.linalg.det(frame), torch.ones(2, dtype=frame.dtype)
+        )
+        probe = torch.arange(18, dtype=frame.dtype).reshape_as(frame)
+        gradient = torch.autograd.grad((frame * probe).sum(), covariance)[0]
+        self.assertTrue(torch.all(torch.isfinite(gradient)))
+        torch.testing.assert_close(gradient, torch.zeros_like(gradient))
+
+    def test_pca_frame_distinct_spectrum_retains_finite_gradient(self) -> None:
+        covariance = torch.tensor(
+            [
+                [0.20, 0.01, -0.02],
+                [0.01, 0.63, 0.03],
+                [-0.02, 0.03, 1.17],
+            ],
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        frame = _right_handed_pca_frames(covariance, 1.0e-10, 1.0e-4)
+        probe = torch.tensor(
+            [[0.3, -0.7, 0.2], [0.4, 0.1, -0.2], [-0.5, 0.6, 0.8]],
+            dtype=frame.dtype,
+        )
+        gradient = torch.autograd.grad((frame * probe).sum(), covariance)[0]
+        self.assertTrue(torch.all(torch.isfinite(gradient)))
+        self.assertGreater(float(gradient.abs().sum()), 0.0)
+
     def test_sparse_reprojection_variance_retains_camera_gradient(self) -> None:
         dtype = torch.float64
         position = torch.tensor([[0.0, 0.0, 2.0], [0.0, 0.0, 2.0]], dtype=dtype)

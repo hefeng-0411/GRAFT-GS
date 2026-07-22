@@ -224,6 +224,36 @@ def _restore_rng_state(state: Mapping[str, object], rank: int) -> None:
     random.setstate(state["python"])
 
 
+def _broadcast_discrete_exact(value: Tensor, source_rank: int) -> Tensor:
+    """Broadcast discrete state through NCCL's portable int64 domain.
+
+    PyTorch 2.4's NCCL process group rejects ``torch.int16`` (``Short``), and
+    backend support for bool/int8 metadata is not a stable serialization
+    contract. Octree levels, child slots, activity masks, Morton identities,
+    counts, and connectivity are all exactly representable as int64. A checked
+    round trip restores the original storage dtype after communication.
+    """
+
+    if value.dtype.is_floating_point or value.dtype.is_complex:
+        raise TypeError("exact discrete broadcast requires a non-floating tensor")
+    if value.numel() == 0:
+        # Atlas metadata equality proves every rank has the same empty field;
+        # avoid relying on backend-specific zero-count collective behavior.
+        return value.clone()
+    # ``to(dtype)`` may alias an already-int64 input. The independent buffer is
+    # essential: otherwise source broadcast would overwrite the rank-local
+    # value before the exact mismatch check. Contiguity also covers transposed
+    # connectivity such as ``edge_index``.
+    transport = value.to(dtype=torch.int64, copy=True).contiguous()
+    dist.broadcast(transport, src=source_rank)
+    restored = transport.to(dtype=value.dtype)
+    if not torch.equal(restored.to(dtype=torch.int64), transport):
+        raise OverflowError(
+            f"distributed discrete value cannot round-trip through {value.dtype}"
+        )
+    return restored
+
+
 class AtlasDDPSynchronizer:
     """Synchronize discrete Morton state and continuous transport statistics.
 
@@ -483,15 +513,20 @@ class AtlasDDPSynchronizer:
         )
 
     def synchronize_atlas(self, atlas: PersistentOctreeAtlas) -> PersistentOctreeAtlas:
-        """Broadcast one atlas without detaching its continuous autograd graph."""
+        """Select one source-exact nonlinear atlas and preserve global gradients.
+
+        Same-object ranks first construct the same global evidence measure with
+        an autograd-aware all-gather.  Atlas chart fitting contains discrete cell
+        assignment and gauge-valued PCA eigenvectors, so independently computed
+        floating chart coordinates need not be bitwise equal even when their
+        geometry is equivalent.  The source rank therefore owns this nonlinear
+        realization.  ``dist_nn.broadcast`` reduces all downstream rank losses
+        to that source in backward; the preceding differentiable all-gather then
+        routes atlas derivatives to every rank's local evidence graph.
+        """
 
         if not self.context.distributed:
             return atlas
-        shape = (atlas.num_nodes, int(atlas.edge_index.shape[1]))
-        gathered: list[object] = [None for _ in range(self.context.world_size)]
-        dist.all_gather_object(gathered, shape)
-        if any(value != shape for value in gathered):
-            raise RuntimeError(f"DDP atlas shape mismatch before broadcast: {gathered}")
         names = (
             "root_min",
             "root_max",
@@ -516,30 +551,116 @@ class AtlasDDPSynchronizer:
             "overlap_rotation",
             "overlap_translation",
         )
+        signature = {
+            "config": asdict(atlas.config),
+            "fields": tuple(
+                (
+                    name,
+                    tuple(getattr(atlas, name).shape),
+                    str(getattr(atlas, name).dtype),
+                    getattr(atlas, name).device.type,
+                )
+                for name in names
+            ),
+        }
+        gathered: list[object] = [None for _ in range(self.context.world_size)]
+        dist.all_gather_object(gathered, signature)
+        if any(value != signature for value in gathered):
+            raise RuntimeError(
+                f"DDP atlas metadata mismatch before typed collectives: {gathered}"
+            )
+        device_mismatch = torch.tensor(
+            int(
+                any(
+                    getattr(atlas, name).device != self.context.device
+                    for name in names
+                )
+            ),
+            dtype=torch.int64,
+            device=self.context.device,
+        )
+        dist.all_reduce(device_mismatch, op=dist.ReduceOp.MAX)
+        if int(device_mismatch.item()):
+            raise RuntimeError(
+                "DDP atlas fields are not resident on their rank-local context device"
+            )
+        # These fields contain local chart-gauge coordinates. Raw elementwise
+        # equality is neither gauge invariant nor expected from independent
+        # eigensolver calls. Their authoritative source realization is still
+        # checked for finiteness and for all atlas structural invariants below.
+        gauge_coordinate_fields = {
+            "chart_frames",
+            "curvature",
+            "overlap_rotation",
+            "overlap_translation",
+        }
         for name in names:
             value = getattr(atlas, name)
             if value.dtype.is_floating_point:
                 if self.maps_global_evidence:
-                    reference = value.detach().clone()
-                    dist.broadcast(reference, src=self.source_rank)
-                    local_error = torch.max(torch.abs(value.detach() - reference)) if value.numel() else value.new_zeros(())
-                    dist.all_reduce(local_error, op=dist.ReduceOp.MAX)
-                    tolerance = 2.0e-5 if value.dtype in {torch.float16, torch.bfloat16, torch.float32} else 1.0e-10
-                    if float(local_error) > tolerance:
+                    # This is the exact derivative of one common atlas, unlike
+                    # a straight-through identity through a potentially
+                    # different rank-local PCA gauge.
+                    # Empty overlap tensors carry no state or derivative and
+                    # need no backend collective. Metadata equality guarantees
+                    # that every rank takes this branch together.
+                    synchronized = (
+                        dist_nn.broadcast(value.contiguous(), src=self.source_rank)
+                        if value.numel()
+                        else value
+                    )
+                    reference = synchronized.detach()
+                    invalid = torch.tensor(
+                        int(
+                            not bool(torch.all(torch.isfinite(value.detach())))
+                            or not bool(torch.all(torch.isfinite(reference)))
+                        ),
+                        dtype=torch.int64,
+                        device=value.device,
+                    )
+                    dist.all_reduce(invalid, op=dist.ReduceOp.MAX)
+                    if int(invalid.item()):
                         raise RuntimeError(
-                            f"global-evidence DDP produced inconsistent floating atlas field {name}: "
-                            f"maximum error {float(local_error):.3e}"
+                            f"global-evidence DDP produced non-finite atlas field {name}"
                         )
-                    # Retain the rank-local autograd graph after equality was
-                    # verified; broadcasting it would concentrate all chart
-                    # construction gradients on the source rank.
-                    synchronized = value
+                    if name not in gauge_coordinate_fields:
+                        if value.dtype in {torch.float16, torch.bfloat16}:
+                            absolute_tolerance, relative_tolerance = 2.0e-3, 5.0e-3
+                        elif value.dtype == torch.float32:
+                            absolute_tolerance, relative_tolerance = 2.0e-5, 5.0e-5
+                        else:
+                            absolute_tolerance, relative_tolerance = 1.0e-10, 5.0e-10
+                        difference = torch.abs(value.detach() - reference)
+                        scale = torch.maximum(value.detach().abs(), reference.abs())
+                        outside = difference > (
+                            absolute_tolerance + relative_tolerance * scale
+                        )
+                        mismatch = torch.tensor(
+                            int(bool(torch.any(outside))),
+                            dtype=torch.int64,
+                            device=value.device,
+                        )
+                        dist.all_reduce(mismatch, op=dist.ReduceOp.MAX)
+                        if int(mismatch.item()):
+                            local_error = (
+                                difference.max()
+                                if difference.numel()
+                                else value.new_zeros(())
+                            )
+                            dist.all_reduce(local_error, op=dist.ReduceOp.MAX)
+                            raise RuntimeError(
+                                "global-evidence DDP produced inconsistent "
+                                f"gauge-invariant atlas field {name}: maximum "
+                                f"absolute error {float(local_error):.3e}"
+                            )
                 else:
-                    synchronized = dist_nn.broadcast(value, src=self.source_rank)
+                    synchronized = (
+                        dist_nn.broadcast(value.contiguous(), src=self.source_rank)
+                        if value.numel()
+                        else value
+                    )
             else:
-                synchronized = value.clone()
-                reference = value.clone()
-                dist.broadcast(reference, src=self.source_rank)
+                reference = _broadcast_discrete_exact(value, self.source_rank)
                 mismatch = torch.tensor(
                     int(not torch.equal(value, reference)),
                     dtype=torch.int64,
@@ -550,6 +671,11 @@ class AtlasDDPSynchronizer:
                     raise RuntimeError(f"global-evidence DDP produced inconsistent discrete atlas field {name}")
                 synchronized = reference
             setattr(atlas, name, synchronized)
+        validation = atlas.validate()
+        if not validation.valid:
+            raise RuntimeError(
+                f"synchronized DDP atlas violates structural invariants: {validation}"
+            )
         return atlas
 
     def synchronize_split_mask(self, split_mask: Tensor) -> Tensor:
@@ -559,8 +685,7 @@ class AtlasDDPSynchronizer:
         dist.broadcast(size, src=self.source_rank)
         if split_mask.numel() != int(size.item()):
             split_mask = torch.empty(int(size.item()), dtype=torch.bool, device=self.context.device)
-        dist.broadcast(split_mask, src=self.source_rank)
-        return split_mask
+        return _broadcast_discrete_exact(split_mask, self.source_rank)
 
     def reduce_mapping_statistics(self, mapping: MappingResult, atlas: PersistentOctreeAtlas) -> MappingResult:
         """Legacy sharded approximation; rejected when complete evidence was gathered."""

@@ -219,6 +219,20 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("prior_measure,\n                            dtype=root_bounds[0].dtype", pipeline)
         self.assertIn("if context.rank == 0\n            else None", distributed_test)
         self.assertIn("synchronize_object_atlas=True", overfit)
+        self.assertIn("value.to(dtype=torch.int64, copy=True).contiguous()", trainer)
+        self.assertIn("synchronized = dist_nn.broadcast", trainer)
+        self.assertIn("gauge_coordinate_fields", trainer)
+        self.assertNotIn("reference + (value - value.detach())", trainer)
+        self.assertIn("DDP atlas metadata mismatch before typed collectives", trainer)
+        validator = source("scripts/validate_ddp_server.py")
+        self.assertIn(
+            "test_pca_frame_repeated_spectrum_has_finite_zero_gauge_gradient",
+            validator,
+        )
+        self.assertIn(
+            "test_pca_frame_distinct_spectrum_retains_finite_gradient",
+            validator,
+        )
 
     def test_remote_entry_points_resolve_checkpoint_environment_at_runtime(self) -> None:
         scripts = (
@@ -292,10 +306,16 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
 
     def test_pytorch_24_reference_failures_have_production_repairs(self) -> None:
         atlas = source("graft_gs/geometry/atlas.py")
+        configuration = source("graft_gs/engine/configuration.py")
+        server_config = source("configs/graft_gs_a800_native.yaml")
         losses = source("graft_gs/engine/losses.py")
         quantization = source("graft_gs/optimization/quantization.py")
         self.assertNotIn("torch.full_like(unique_codes, config.chart_radius_scale * side", atlas)
         self.assertIn("torch.ones_like(unique_codes, dtype=positions.dtype) * side", atlas)
+        self.assertIn("relative_eigengap * spectral_scale", atlas)
+        self.assertIn("diagnostic_vectors + 0.0 * flat.sum", atlas)
+        self.assertIn('"frame_relative_eigengap"', configuration)
+        self.assertIn("frame_relative_eigengap: 1.0e-4", server_config)
         self.assertIn("torch.sqrt(world_squared + norm_epsilon.square())", losses)
         self.assertIn("torch.sqrt(pixel_squared + norm_epsilon.square())", losses)
         margin_position = quantization.index("margin = projector.topology_boundary_margin(state)")

@@ -144,8 +144,21 @@ def main() -> None:
         dist.destroy_process_group()
         raise SystemExit(2)
 
-    suite = unittest.defaultTestLoader.discover(
-        str(ROOT / "tests"), pattern="test_distributed_evidence.py"
+    loader = unittest.defaultTestLoader
+    suite = unittest.TestSuite(
+        (
+            loader.discover(
+                str(ROOT / "tests"), pattern="test_distributed_evidence.py"
+            ),
+            loader.loadTestsFromNames(
+                (
+                    "tests.test_atlas_mapping.PersistentAtlasTest."
+                    "test_pca_frame_repeated_spectrum_has_finite_zero_gauge_gradient",
+                    "tests.test_atlas_mapping.PersistentAtlasTest."
+                    "test_pca_frame_distinct_spectrum_retains_finite_gradient",
+                )
+            ),
+        )
     )
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     success = torch.tensor(

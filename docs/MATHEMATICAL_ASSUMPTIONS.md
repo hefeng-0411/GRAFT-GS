@@ -24,6 +24,13 @@
   `no_grad`; source-only sampling followed by exact tensor broadcast is
   mathematically equivalent to redundant identical-rank sampling conditional
   on equal gathered images, checkpoint, sampler parameters, and RNG seed.
+- Same-object atlas synchronization treats discrete topology as an exact
+  source-authoritative integer state. Because Torch 2.4 NCCL lacks `int16`, its
+  portable wire representation is int64 with a checked round trip. Continuous
+  atlas values use the source rank in the forward pass but the identity
+  derivative of each rank's local global-evidence construction; this is valid
+  only after metadata equality, finite-state checks, and the configured
+  cross-rank numerical tolerance pass.
 
 ## Cameras and evidence
 
@@ -264,3 +271,16 @@
   permitted only within the configured VGGT aggregator; its camera, depth, and
   point heads and all GRAFT-GS geometric state execute with autocast disabled
   or explicit FP32 tensors.
+- A covariance PCA frame is a gauge-valued state. Its ordinary eigenvector
+  derivative is assumed only on the simple-spectrum stratum where both
+  adjacent gaps exceed `frame_epsilon + frame_relative_eigengap * spectral_scale`.
+  At a repeated or near-repeated spectrum the forward SO(3) frame remains a
+  valid source-selected gauge, while its unidentifiable gauge derivative is
+  exactly zero; center, covariance, mass and fixed-frame curvature derivatives
+  remain active.
+- Same-object DDP assumes every rank participates in both the autograd-aware
+  global evidence all-gather and source atlas broadcast in identical order.
+  Under that collective graph, broadcast backward sums downstream atlas
+  derivatives at the source and all-gather backward reduce-scatters evidence
+  derivatives to their owning ranks. Raw frame/curvature coordinates need not
+  agree before source gauge selection.

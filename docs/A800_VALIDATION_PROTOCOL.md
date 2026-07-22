@@ -216,6 +216,21 @@ validates the single-rank fallback but does not constitute multi-rank DDP
 evidence; retain a `multi_rank=true` report when collective equivalence is the
 claim under test.
 
+The suite also executes a real persistent-atlas collective. Torch 2.4 NCCL
+cannot broadcast `torch.int16` directly, so every discrete field must travel
+through an independent contiguous int64 buffer and restore its exact original
+dtype/value; the test includes noncontiguous and greater-than-2^53 identities.
+Every continuous field must be bitwise source-identical in the forward pass.
+The source-owned autograd broadcast must reduce all downstream rank losses and
+the global evidence all-gather must return finite nonzero gradients to every
+rank's local evidence, including when non-source ranks deliberately choose an
+equivalent pi-rotated tangent gauge. Gauge-independent fields retain explicit
+replica checks; raw PCA frame/curvature coordinates are not equality-tested.
+Any `Short` collective, metadata mismatch, nonfinite field, or zero local
+evidence gradient fails this gate. The CPU portion also requires a finite zero
+gauge derivative at a repeated spectrum and finite nonzero frame derivatives
+for a separated spectrum.
+
 ## Offline teacher bundle refinement
 
 ```bash

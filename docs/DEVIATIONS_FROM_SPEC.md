@@ -188,3 +188,21 @@
     inconsistent outputs. It does not hard-code the released checkpoint's 64
     and does not infer a grid from the largest occupied coordinate, which would
     contract shapes whose sampled support does not touch the boundary.
+34. **Discrete DDP state has an explicit NCCL wire dtype.** Persistent atlas
+    storage retains compact int16 levels, int8 child slots, Boolean activity,
+    and int64 identities, but Torch 2.4 NCCL does not accept `Short`. Collective
+    transport therefore uses an independent contiguous int64 representation
+    with exact restoration.
+35. **Same-object DDP selects one nonlinear chart gauge.** PCA frames are not
+    unique tensors: eigenvector signs and repeated-eigenspace bases are gauge
+    choices. Continuous atlas state therefore uses an autograd-aware source
+    broadcast instead of a local straight-through surrogate. All rank losses
+    reduce through the source atlas and the differentiable global-evidence
+    gather returns their derivative to each evidence shard. Raw equality is
+    required only for gauge-independent atlas fields.
+36. **PCA derivatives are eigengap-stratified.** The Markdown treats chart
+    frames as smooth SO(3) state, but an eigenframe is not differentiable at a
+    repeated covariance spectrum. The implementation differentiates it only
+    when both adjacent relative eigengaps are resolved; the unidentifiable
+    gauge has a finite zero derivative otherwise. This is a conditional
+    derivative guarantee, not a claim of smoothness across spectral strata.

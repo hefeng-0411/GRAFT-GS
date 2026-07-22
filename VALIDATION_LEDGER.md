@@ -306,3 +306,29 @@ pending; no post-repair model-forward or convergence result is claimed.
 The overfit entry point is now statically guarded to activate same-object view
 sharding/source-only prior sampling; its NCCL collectives and global-evidence
 gradients remain part of the same pending server rerun.
+
+Same-object atlas transport cycle (2026-07-22): the post-decoded-grid A800 run
+showed exactly eight 12-step sampling bars for the configured eight-draw prior,
+consistent with source-rank-only sampling, then both ranks failed on the first
+`levels:int16` atlas broadcast because Torch 2.4 ProcessGroupNCCL does not
+support `Short`. This is recorded as a new transport failure, not a recurrence
+of the TRELLIS grid defect.
+
+The repair has locally passed whole-tree `compileall` and 26/26 scientific
+static guards. New unskipped mock tests exercise int16/int8/
+bool-to-int64 transport, noncontiguous and greater-than-2^53 int64 identity,
+alias isolation, exact dtype restoration, split masks, and metadata mismatch
+before typed collectives.
+
+The next real two-rank A800 smoke run advanced beyond that transport and failed
+at the former raw replica guard with `chart_frames: maximum error 1.000e+00`.
+This is now classified as PCA gauge non-uniqueness rather than inconsistent
+geometry. The DDP suite has been upgraded to inject an exact pi tangent-gauge
+rotation, require bitwise source-forward equality, and backpropagate through
+source broadcast plus global evidence all-gather to finite nonzero local point
+gradients on every rank. CPU tests additionally cover finite zero gauge
+gradients at a repeated covariance spectrum and finite nonzero derivatives at
+a separated spectrum. Whole-tree compilation and 26/26 production-path static
+guards pass after this repair. PyTorch numerical execution and the corrected
+ProcessGroupNCCL/overfit rerun remain server-pending; no successful training
+step is claimed yet.

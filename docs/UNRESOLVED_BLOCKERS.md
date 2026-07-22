@@ -115,3 +115,11 @@ checkpoints, data, or a compiled server dependency.
   implemented. The focused CRAFT adapter tests, checkpoint-backed TRELLIS
   preflight, and one-object DDP overfit must be rerun on the server before the
   repair is called A800 validated.
+- The first post-grid overfit advanced through source-only TRELLIS sampling but
+  failed because Torch 2.4 NCCL rejects `int16` atlas levels. The next run
+  passed that boundary and exposed raw PCA-frame gauge disagreement. Exact
+  int64 discrete transport, source-owned autograd floating synchronization,
+  and eigengap-stratified PCA derivatives are now implemented with mock,
+  numerical and torchrun regression paths. The corrected
+  `validate_ddp_server.py` suite and overfit must execute before same-object
+  atlas synchronization or its backward path is called A800 validated.

@@ -38,6 +38,7 @@ class AtlasConfig:
     min_points_per_chart: int = 6
     curvature_ridge: float = 1.0e-8
     frame_epsilon: float = 1.0e-10
+    frame_relative_eigengap: float = 1.0e-4
     chart_radius_scale: float = 0.72
     overlap_scale: float = 1.05
     tau_geo: float = 0.08
@@ -56,6 +57,10 @@ class AtlasConfig:
             raise ValueError("root_padding must be non-negative")
         if self.min_points_per_chart < 1:
             raise ValueError("min_points_per_chart must be positive")
+        if self.frame_epsilon <= 0.0:
+            raise ValueError("frame_epsilon must be positive")
+        if not 0.0 < self.frame_relative_eigengap < 1.0:
+            raise ValueError("frame_relative_eigengap must lie in (0,1)")
 
 
 @dataclass(frozen=True)
@@ -111,11 +116,56 @@ def _scatter_sum(values: Tensor, index: Tensor, size: int) -> Tensor:
     return out
 
 
-def _right_handed_pca_frames(covariance: Tensor, eps: float) -> Tensor:
-    """Return stable SO(3) frames with the smallest-variance axis as normal."""
+def _right_handed_pca_frames(
+    covariance: Tensor,
+    eps: float,
+    relative_eigengap: float,
+) -> Tensor:
+    """Return SO(3) PCA frames without undefined repeated-eigenvalue gradients.
 
+    Eigenvectors are a gauge choice: signs are arbitrary and rotations inside a
+    repeated eigenspace are not identifiable.  Differentiating ``eigh`` through
+    such a spectrum introduces inverse eigengaps and can produce Inf/NaN even
+    when the forward frame is valid.  We therefore differentiate the frame only
+    where both adjacent relative eigengaps are resolved.  Ambiguous frames use
+    the same equivariant PCA forward value but have a mathematically appropriate
+    zero derivative for the unidentifiable gauge.  Centers, covariance and the
+    curvature fit retain their direct geometric derivatives.
+    """
+
+    if covariance.shape[-2:] != (3, 3):
+        raise ValueError("PCA covariance must have shape [...,3,3]")
+    if not covariance.dtype.is_floating_point:
+        raise TypeError("PCA covariance must be floating point")
+    if eps <= 0.0 or not 0.0 < relative_eigengap < 1.0:
+        raise ValueError("invalid PCA eigengap policy")
+
+    leading_shape = covariance.shape[:-2]
+    symmetric = 0.5 * (covariance + covariance.transpose(-1, -2))
+    flat = symmetric.reshape(-1, 3, 3)
     eye = torch.eye(3, dtype=covariance.dtype, device=covariance.device)
-    evals, evecs = torch.linalg.eigh(covariance + eps * eye)
+    regularized = flat + eps * eye
+
+    # The detached spectrum selects a differentiability stratum.  This is a
+    # discrete numerical-admissibility decision, not a learned soft gate.
+    with torch.no_grad():
+        diagnostic_values, diagnostic_vectors = torch.linalg.eigh(regularized)
+        spectral_scale = diagnostic_values.abs().amax(dim=-1).clamp_min(eps)
+        gap_floor = eps + relative_eigengap * spectral_scale
+        stable = (
+            (diagnostic_values[:, 1] - diagnostic_values[:, 0] > gap_floor)
+            & (diagnostic_values[:, 2] - diagnostic_values[:, 1] > gap_floor)
+        )
+
+    # Retain an explicit zero-gradient connection for an entirely ambiguous
+    # batch so downstream backward never fails merely because every frame lies
+    # on a repeated-eigenvalue stratum.
+    evecs = diagnostic_vectors + 0.0 * flat.sum(dim=(-2, -1))[:, None, None]
+    stable_index = torch.nonzero(stable, as_tuple=False).flatten()
+    if stable_index.numel():
+        _, stable_vectors = torch.linalg.eigh(regularized[stable_index])
+        evecs = evecs.index_copy(0, stable_index, stable_vectors)
+
     normal = evecs[..., :, 0]
     tangent_1 = evecs[..., :, 2]
     tangent_2 = torch.linalg.cross(normal, tangent_1, dim=-1)
@@ -131,7 +181,7 @@ def _right_handed_pca_frames(covariance: Tensor, eps: float) -> Tensor:
     frame[..., :, 1] = torch.where(
         (det < 0)[..., None], -frame[..., :, 1], frame[..., :, 1]
     )
-    return frame
+    return frame.reshape(*leading_shape, 3, 3)
 
 
 class PersistentOctreeAtlas(nn.Module):
@@ -402,7 +452,11 @@ class PersistentOctreeAtlas(nn.Module):
                 inverse,
                 unique_codes.numel(),
             ) / fit_wsum[:, None, None]
-            frames = _right_handed_pca_frames(cov, config.frame_epsilon)
+            frames = _right_handed_pca_frames(
+                cov,
+                config.frame_epsilon,
+                config.frame_relative_eigengap,
+            )
             fit_count = count + prior_count * (~has_observation).to(prior_count)
             curv = atlas._fit_curvature_grouped(
                 initializer_positions, fit_mass, inverse, means, frames, fit_count
@@ -734,7 +788,11 @@ class PersistentOctreeAtlas(nn.Module):
             active.numel(),
         )
         cov = cov / fit_wsum.clamp_min(self.config.frame_epsilon)[:, None, None]
-        frames = _right_handed_pca_frames(cov, self.config.frame_epsilon)
+        frames = _right_handed_pca_frames(
+            cov,
+            self.config.frame_epsilon,
+            self.config.frame_relative_eigengap,
+        )
         frames = torch.where(has_fit_points[:, None, None], frames, self.chart_frames[active])
         cov = torch.where(has_fit_points[:, None, None], cov, self.chart_covariance[active])
         fit_count = count + prior_count * (~has_points).to(prior_count)
