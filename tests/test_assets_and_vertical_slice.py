@@ -32,6 +32,7 @@ from graft_gs.mapping.manifold_mapping import (
 from graft_gs.readout.assets import (
     AnalyticalReadoutConfig,
     AnalyticalSurfaceReadout,
+    _stratified_metric_eigh,
     write_gaussian_ply,
     write_mesh_glb,
 )
@@ -93,6 +94,43 @@ def _fixture() -> tuple[PersistentOctreeAtlas, object, TopologySelection]:
 
 
 class AnalyticalAssetTest(unittest.TestCase):
+    def test_isotropic_chart_metric_has_finite_basis_free_backward(self) -> None:
+        metric = torch.eye(2, dtype=torch.float64).repeat(3, 1, 1)
+        metric.requires_grad_(True)
+        eigenvalue, eigenvector = _stratified_metric_eigh(
+            metric, 1.0e-10, 1.0e-4
+        )
+        reconstructed = (
+            eigenvector
+            @ torch.diag_embed(eigenvalue)
+            @ eigenvector.transpose(-1, -2)
+        )
+        torch.testing.assert_close(reconstructed, metric)
+        probe = torch.arange(12, dtype=metric.dtype).reshape(3, 2, 2)
+        loss = eigenvalue.sum() + 0.01 * (eigenvector * probe).sum()
+        gradient = torch.autograd.grad(loss, metric)[0]
+        self.assertTrue(torch.all(torch.isfinite(gradient)))
+        torch.testing.assert_close(
+            gradient, torch.eye(2, dtype=gradient.dtype).expand_as(gradient)
+        )
+
+    def test_flat_chart_analytical_readout_backward_is_finite(self) -> None:
+        atlas, mapping, selection = _fixture()
+        state = GraftGS._state_from_mapping(atlas, mapping, selection)
+        curvature = torch.zeros_like(atlas.curvature, requires_grad=True)
+        atlas.curvature = curvature
+        gaussians, _ = AnalyticalSurfaceReadout().double()(atlas, state, mapping)
+        objective = (
+            gaussians.covariance.square().sum()
+            + gaussians.scales.square().sum()
+            + 1.0e-3 * gaussians.rotation.square().sum()
+        )
+        objective.backward()
+        self.assertIsNotNone(curvature.grad)
+        self.assertTrue(torch.all(torch.isfinite(curvature.grad)))
+        self.assertIsNotNone(mapping.evidence.positions.grad)
+        self.assertTrue(torch.all(torch.isfinite(mapping.evidence.positions.grad)))
+
     def test_camera_batch_rejects_non_opencv_or_non_so3_frames(self) -> None:
         extrinsic = torch.eye(4, dtype=torch.float64)[:3][None]
         intrinsic = torch.tensor(

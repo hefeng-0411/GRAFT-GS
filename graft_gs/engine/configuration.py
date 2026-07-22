@@ -65,6 +65,18 @@ def load_server_config(
                 transport.get("retention_shrinkage", base.mapping.retention_shrinkage)
             ),
         ),
+        readout=replace(
+            base.readout,
+            metric_epsilon=float(
+                model.get("readout_metric_epsilon", base.readout.metric_epsilon)
+            ),
+            metric_relative_eigengap=float(
+                model.get(
+                    "readout_metric_relative_eigengap",
+                    base.readout.metric_relative_eigengap,
+                )
+            ),
+        ),
         attention=replace(
             base.attention,
             heads=int(model.get("attention_heads", base.attention.heads)),

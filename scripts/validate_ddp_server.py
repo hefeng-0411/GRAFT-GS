@@ -156,6 +156,14 @@ def main() -> None:
                     "test_pca_frame_repeated_spectrum_has_finite_zero_gauge_gradient",
                     "tests.test_atlas_mapping.PersistentAtlasTest."
                     "test_pca_frame_distinct_spectrum_retains_finite_gradient",
+                    "tests.test_assets_and_vertical_slice.AnalyticalAssetTest."
+                    "test_isotropic_chart_metric_has_finite_basis_free_backward",
+                    "tests.test_assets_and_vertical_slice.AnalyticalAssetTest."
+                    "test_flat_chart_analytical_readout_backward_is_finite",
+                    "tests.test_geometry_invariants.TopologyAndManifoldTest."
+                    "test_spd_spectral_box_is_bounded_and_repeated_spectrum_safe",
+                    "tests.test_atlas_mapping.PersistentAtlasTest."
+                    "test_atlas_rejects_nonfinite_mass_with_specific_diagnostic",
                 )
             ),
         )

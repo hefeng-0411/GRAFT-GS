@@ -220,7 +220,10 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("if context.rank == 0\n            else None", distributed_test)
         self.assertIn("synchronize_object_atlas=True", overfit)
         self.assertIn("value.to(dtype=torch.int64, copy=True).contiguous()", trainer)
-        self.assertIn("synchronized = dist_nn.broadcast", trainer)
+        self.assertIn(
+            "dist_nn.broadcast(value.contiguous(), src=self.source_rank)",
+            trainer,
+        )
         self.assertIn("gauge_coordinate_fields", trainer)
         self.assertNotIn("reference + (value - value.detach())", trainer)
         self.assertIn("DDP atlas metadata mismatch before typed collectives", trainer)
@@ -231,6 +234,22 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         )
         self.assertIn(
             "test_pca_frame_distinct_spectrum_retains_finite_gradient",
+            validator,
+        )
+        self.assertIn(
+            "test_isotropic_chart_metric_has_finite_basis_free_backward",
+            validator,
+        )
+        self.assertIn(
+            "test_flat_chart_analytical_readout_backward_is_finite",
+            validator,
+        )
+        self.assertIn(
+            "test_spd_spectral_box_is_bounded_and_repeated_spectrum_safe",
+            validator,
+        )
+        self.assertIn(
+            "test_atlas_rejects_nonfinite_mass_with_specific_diagnostic",
             validator,
         )
 
@@ -310,12 +329,21 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         server_config = source("configs/graft_gs_a800_native.yaml")
         losses = source("graft_gs/engine/losses.py")
         quantization = source("graft_gs/optimization/quantization.py")
+        readout = source("graft_gs/readout/assets.py")
+        pipeline = source("graft_gs/integration/pipeline.py")
+        trainer = source("graft_gs/engine/trainer.py")
         self.assertNotIn("torch.full_like(unique_codes, config.chart_radius_scale * side", atlas)
         self.assertIn("torch.ones_like(unique_codes, dtype=positions.dtype) * side", atlas)
         self.assertIn("relative_eigengap * spectral_scale", atlas)
         self.assertIn("diagnostic_vectors + 0.0 * flat.sum", atlas)
         self.assertIn('"frame_relative_eigengap"', configuration)
         self.assertIn("frame_relative_eigengap: 1.0e-4", server_config)
+        self.assertIn("_stratified_metric_eigh", readout)
+        self.assertIn("tangent_factor.square()", readout)
+        self.assertNotIn("torch.linalg.eigh(first_form)", readout)
+        self.assertIn("spectral_box_spd(covariance_raw", pipeline)
+        self.assertIn("error_if_nonfinite=True", trainer)
+        self.assertIn("post-step optimizer state", trainer)
         self.assertIn("torch.sqrt(world_squared + norm_epsilon.square())", losses)
         self.assertIn("torch.sqrt(pixel_squared + norm_epsilon.square())", losses)
         margin_position = quantization.index("margin = projector.topology_boundary_margin(state)")

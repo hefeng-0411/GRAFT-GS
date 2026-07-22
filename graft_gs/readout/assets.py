@@ -34,6 +34,8 @@ class AnalyticalReadoutConfig:
     observation_bandwidth_factor: float = 0.75
     uncertainty_normal_weight: float = 0.25
     opacity_epsilon: float = 1.0e-8
+    metric_epsilon: float = 1.0e-10
+    metric_relative_eigengap: float = 1.0e-4
     opacity_tile_size: int = 16
     maximum_tile_opacity: float = 0.995
 
@@ -53,8 +55,11 @@ class AnalyticalReadoutConfig:
             self.maximum_normal_scale,
             self.color_ridge,
             self.opacity_epsilon,
+            self.metric_epsilon,
         ) <= 0:
             raise ValueError("analytical readout scales and regularizers must be positive")
+        if not 0.0 < self.metric_relative_eigengap < 1.0:
+            raise ValueError("metric_relative_eigengap must lie in (0,1)")
 
 
 @dataclass
@@ -146,6 +151,49 @@ def _chart_evaluate(center: Tensor, rotation: Tensor, curvature: Tensor, xi: Ten
     return means, jacobian
 
 
+def _stratified_metric_eigh(
+    metric: Tensor,
+    epsilon: float,
+    relative_eigengap: float,
+) -> tuple[Tensor, Tensor]:
+    """Eigendecompose 2D metrics with a finite isotropic-stratum derivative.
+
+    Principal tangent directions are gauge-valued when both metric eigenvalues
+    coincide.  Separated spectra use the exact differentiable eigensystem.  At
+    an unresolved gap, the exact forward eigenvalues/vectors are retained, the
+    vector gauge has zero derivative, and both eigenvalues receive the common
+    trace derivative.  This preserves isotropic scale learning without the
+    undefined ``1 / (lambda_1-lambda_0)`` eigenvector term.
+    """
+
+    if metric.shape[-2:] != (2, 2):
+        raise ValueError("chart metric must have shape [...,2,2]")
+    if epsilon <= 0.0 or not 0.0 < relative_eigengap < 1.0:
+        raise ValueError("invalid chart-metric eigengap policy")
+    leading_shape = metric.shape[:-2]
+    symmetric = 0.5 * (metric + metric.transpose(-1, -2))
+    flat = symmetric.reshape(-1, 2, 2)
+    with torch.no_grad():
+        diagnostic_value, diagnostic_vector = torch.linalg.eigh(flat)
+        scale = diagnostic_value.abs().amax(dim=-1).clamp_min(epsilon)
+        stable = (
+            diagnostic_value[:, 1] - diagnostic_value[:, 0]
+            > epsilon + relative_eigengap * scale
+        )
+    mean = 0.5 * flat.diagonal(dim1=-2, dim2=-1).sum(-1)
+    value = diagnostic_value + (mean - mean.detach())[:, None]
+    vector = diagnostic_vector + 0.0 * flat.sum(dim=(-2, -1))[:, None, None]
+    stable_index = torch.nonzero(stable, as_tuple=False).flatten()
+    if stable_index.numel():
+        stable_value, stable_vector = torch.linalg.eigh(flat[stable_index])
+        value = value.index_copy(0, stable_index, stable_value)
+        vector = vector.index_copy(0, stable_index, stable_vector)
+    return (
+        value.reshape(*leading_shape, 2),
+        vector.reshape(*leading_shape, 2, 2),
+    )
+
+
 class AnalyticalSurfaceReadout(nn.Module):
     """Construct every Gaussian and mesh attribute from one selected atlas."""
 
@@ -197,7 +245,12 @@ class AnalyticalSurfaceReadout(nn.Module):
             xi = _disk_samples(count, radius)
             means, jacobian = _chart_evaluate(state.position[local_chart], state.rotation[local_chart], curvature, xi)
             first_form = jacobian.transpose(-1, -2) @ jacobian
-            eigenvalue, eigenvector = torch.linalg.eigh(first_form)
+            eigenvalue, eigenvector = _stratified_metric_eigh(
+                first_form,
+                cfg.metric_epsilon,
+                cfg.metric_relative_eigengap,
+            )
+            eigenvalue = eigenvalue.clamp_min(cfg.metric_epsilon)
             tangent = jacobian @ eigenvector @ torch.diag_embed(eigenvalue.rsqrt())
             tangent_1, tangent_2 = tangent[..., 0], tangent[..., 1]
             normal = F.normalize(torch.linalg.cross(tangent_1, tangent_2, dim=-1), dim=-1)
@@ -205,7 +258,12 @@ class AnalyticalSurfaceReadout(nn.Module):
             delta_q = torch.sqrt(domain_area / count)
             scale_1 = cfg.tangent_scale_factor * delta_q * torch.sqrt(eigenvalue[:, 0])
             scale_2 = cfg.tangent_scale_factor * delta_q * torch.sqrt(eigenvalue[:, 1])
-            kappa = torch.linalg.matrix_norm(curvature, ord=2)
+            # Frobenius curvature is a smooth conservative upper bound on the
+            # spectral curvature. The spectral norm has a set-valued gradient
+            # at a flat (zero) chart, exactly where initialization begins.
+            kappa = torch.sqrt(
+                curvature.square().sum() + cfg.metric_epsilon**2
+            )
             normal_scale = cfg.normal_scale_factor * torch.minimum(scale_1, scale_2) / (
                 1.0 + kappa * torch.minimum(scale_1, scale_2)
             )
@@ -231,7 +289,19 @@ class AnalyticalSurfaceReadout(nn.Module):
             )
             normal_scale = normal_scale.clamp(cfg.minimum_scale, cfg.maximum_normal_scale)
             scales = torch.stack((scale_1.clamp_min(cfg.minimum_scale), scale_2.clamp_min(cfg.minimum_scale), normal_scale), dim=-1)
-            covariance = rotation @ torch.diag_embed(scales.square()) @ rotation.transpose(-1, -2)
+            # The tangent covariance is basis-free: the principal-axis formula
+            # T diag((a sqrt(lambda))^2) T^T simplifies exactly to a^2 J J^T.
+            # Constructing it this way keeps the renderer gradient smooth at an
+            # isotropic tangent metric while rotation/scales retain the same
+            # exact forward covariance for PLY serialization.
+            tangent_factor = cfg.tangent_scale_factor * delta_q
+            tangent_covariance = tangent_factor.square() * (
+                jacobian @ jacobian.transpose(-1, -2)
+            )
+            covariance = tangent_covariance + normal_scale.square()[:, None, None] * (
+                normal[:, :, None] * normal[:, None, :]
+            )
+            covariance = 0.5 * (covariance + covariance.transpose(-1, -2))
             area = torch.sqrt(torch.linalg.det(first_form)).clamp_min(cfg.opacity_epsilon) * domain_area / count
             base_alpha = torch.sigmoid(state.opacity_logit[local_chart, 0])
             base_optical_depth = -torch.log1p(-base_alpha.clamp_max(1.0 - cfg.opacity_epsilon))

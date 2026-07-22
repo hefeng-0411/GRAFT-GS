@@ -284,3 +284,20 @@
   derivatives at the source and all-gather backward reduce-scatters evidence
   derivatives to their owning ranks. Raw frame/curvature coordinates need not
   agree before source gauge selection.
+- A chart principal frame is differentiable only when the 2D first-form
+  eigengap exceeds `metric_epsilon + metric_relative_eigengap * scale`. At an
+  unresolved spectrum, tangent directions are gauge-valued: their derivative
+  is defined to be zero while the repeated eigenvalue retains the common trace
+  derivative. Gaussian covariance is evaluated in the basis-free form
+  `a^2 J J^T + sigma_n^2 n n^T`, so this gauge convention cannot change the
+  rendered Gaussian measure.
+- The SPD shift-and-contract box is a conditional differentiable projection.
+  It is the identity strictly inside the eigenvalue interval, continuously
+  shifts an under-floor spectrum, and contracts an over-ceiling spectrum.
+  At exact min/max multiplicity its directional derivative is a selected
+  subgradient; finiteness is guaranteed, but classical differentiability at
+  the spectral active-set boundary is not claimed.
+- High-precision training assumes every optimized tensor remains finite before
+  and after Adam. Gradient clipping is not a recovery operator for NaN/Inf.
+  The collective finite gate deliberately aborts all ranks before mutation;
+  it never clamps, replaces, or silently skips a non-finite scientific state.

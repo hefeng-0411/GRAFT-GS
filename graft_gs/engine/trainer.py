@@ -894,6 +894,43 @@ class GraftGSTrainer:
         if torch.cuda.is_available():
             torch.cuda.manual_seed_all(seed)
 
+    def _assert_finite_tensors(
+        self,
+        stage: str,
+        tensors: Mapping[str, Tensor],
+    ) -> None:
+        """Collectively reject non-finite loss, gradient, or optimizer state.
+
+        Gradient clipping cannot repair NaN/Inf: its scale factor becomes
+        non-finite and corrupts every parameter in the following optimizer
+        step.  This guard is collective so no rank exits while peers remain in
+        a later NCCL operation.
+        """
+
+        bad = []
+        for name, value in tensors.items():
+            inspected = value.coalesce().values() if value.is_sparse else value
+            if not bool(torch.all(torch.isfinite(inspected.detach()))):
+                bad.append(name)
+        failure = torch.tensor(
+            [int(bool(bad))], dtype=torch.int64, device=self.context.device
+        )
+        if self.context.distributed:
+            dist.all_reduce(failure, op=dist.ReduceOp.MAX)
+        if not int(failure.item()):
+            return
+        if self.context.distributed:
+            gathered: list[object] = [None for _ in range(self.context.world_size)]
+            dist.all_gather_object(
+                gathered,
+                {"rank": self.context.rank, "nonfinite": bad[:64], "count": len(bad)},
+            )
+        else:
+            gathered = [{"rank": 0, "nonfinite": bad[:64], "count": len(bad)}]
+        raise FloatingPointError(
+            f"non-finite training tensors before {stage}: {gathered}"
+        )
+
     def train_step(self, batch: Mapping[str, object], microstep: int = 0) -> dict[str, float]:
         self.model.train()
         images = torch.as_tensor(batch["images"], device=self.context.device, dtype=torch.float32)
@@ -1001,6 +1038,10 @@ class GraftGSTrainer:
                 )
                 terms["distill"] = distill
                 total = total + distill
+            self._assert_finite_tensors(
+                "backward",
+                {"total": total, **terms},
+            )
             scale_adversary_metrics: dict[str, float] = {}
             if scale_adversaries:
                 adversarial_tensors = [
@@ -1035,6 +1076,10 @@ class GraftGSTrainer:
                     else 0.0,
                     "hardening/relative_margin": self.config.topology_hardening_relative_margin,
                 }
+            self._assert_finite_tensors(
+                "final backward",
+                {"total": total, **terms},
+            )
             purification_metrics: dict[str, float] = {}
             if self.gradient_purifier is not None:
                 purification_metrics = self._backward_with_gradient_purification(
@@ -1057,13 +1102,36 @@ class GraftGSTrainer:
                     if self.context.distributed
                     else None
                 )
+            named_gradient = {
+                name: parameter.grad
+                for name, parameter in self.module.named_parameters()
+                if parameter.requires_grad and parameter.grad is not None
+            }
+            self._assert_finite_tensors("gradient clipping", named_gradient)
+            named_parameter = {
+                name: parameter
+                for name, parameter in self.module.named_parameters()
+                if parameter.requires_grad
+            }
+            self._assert_finite_tensors("optimizer step", named_parameter)
             gradient_norm = float(
                 torch.nn.utils.clip_grad_norm_(
                     [parameter for parameter in self.module.parameters() if parameter.requires_grad and parameter.grad is not None],
                     self.config.maximum_gradient_norm,
+                    error_if_nonfinite=True,
                 )
             )
             self.optimizer.step()
+            self._assert_finite_tensors("post-step parameter state", named_parameter)
+            optimizer_tensor = {
+                f"parameter_{parameter_index}.{state_name}": state_value
+                for parameter_index, parameter in enumerate(self.trainable_parameters)
+                for state_name, state_value in self.optimizer.state.get(parameter, {}).items()
+                if isinstance(state_value, Tensor)
+            }
+            self._assert_finite_tensors(
+                "post-step optimizer state", optimizer_tensor
+            )
             self.optimizer.zero_grad(set_to_none=True)
             self.global_step += 1
         elapsed = time.perf_counter() - start

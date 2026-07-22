@@ -365,8 +365,16 @@ class PersistentOctreeAtlas(nn.Module):
         config = config or AtlasConfig()
         mass = torch.ones(positions.shape[0], dtype=positions.dtype, device=positions.device) if mass is None else mass
         mass = mass.reshape(-1).to(dtype=positions.dtype, device=positions.device)
-        if mass.shape[0] != positions.shape[0] or torch.any(mass < 0) or not bool(torch.any(mass > 0)):
-            raise ValueError("mass must be non-negative and match positions")
+        if mass.shape[0] != positions.shape[0]:
+            raise ValueError(
+                f"mass length {mass.shape[0]} does not match {positions.shape[0]} positions"
+            )
+        if not bool(torch.all(torch.isfinite(mass))):
+            raise ValueError("atlas evidence mass contains non-finite values")
+        if bool(torch.any(mass < 0)):
+            raise ValueError("atlas evidence mass must be non-negative")
+        if not bool(torch.any(mass > 0)):
+            raise ValueError("atlas evidence measure must contain positive mass")
 
         if (prior_positions is None) != (prior_mass is None):
             raise ValueError("prior_positions and prior_mass must be provided together")

@@ -14,6 +14,7 @@ import torch.distributed as dist
 from graft_gs.engine.trainer import (
     AtlasDDPSynchronizer,
     DistributedContext,
+    GraftGSTrainer,
     _broadcast_discrete_exact,
     _capture_rng_state,
     _restore_rng_state,
@@ -24,6 +25,25 @@ from graft_gs.integration.trellis_prior import TrellisPriorMeasure
 
 
 class AtlasSynchronizationTransportTest(unittest.TestCase):
+    def test_nonfinite_gradient_guard_fails_before_optimizer_step(self) -> None:
+        trainer = object.__new__(GraftGSTrainer)
+        trainer.context = DistributedContext(
+            rank=0,
+            local_rank=0,
+            world_size=1,
+            device=torch.device("cpu"),
+        )
+        trainer._assert_finite_tensors(
+            "unit finite state", {"finite": torch.tensor([1.0, -2.0])}
+        )
+        with self.assertRaisesRegex(
+            FloatingPointError, "bad_parameter"
+        ):
+            trainer._assert_finite_tensors(
+                "optimizer step",
+                {"bad_parameter": torch.tensor([float("nan")])},
+            )
+
     def test_int64_transport_preserves_values_beyond_float_exactness(self) -> None:
         storage = torch.tensor(
             [

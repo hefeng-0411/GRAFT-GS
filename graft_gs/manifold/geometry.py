@@ -85,6 +85,40 @@ def symmetric_exp(matrix: Tensor) -> Tensor:
     return (vectors * torch.exp(values)[..., None, :]) @ vectors.transpose(-1, -2)
 
 
+def spectral_box_spd(matrix: Tensor, lower: float, upper: float) -> Tensor:
+    """Project symmetric matrices into an SPD eigenvalue box without eigenvectors.
+
+    A direct ``eigh`` reconstruction differentiates eigenvectors even though a
+    spectral clamp depends only on eigenvalues; repeated eigenvalues can then
+    inject undefined inverse-gap terms.  This shift-and-contract construction
+    uses ``eigvalsh`` only.  It is the identity inside ``[lower, upper]``, shifts
+    the minimum eigenvalue to ``lower`` when necessary, and contracts the
+    remaining spectrum about ``lower`` only when the maximum exceeds ``upper``.
+    """
+
+    if matrix.shape[-2:] != (3, 3):
+        raise ValueError("SPD spectral boxing requires [...,3,3] matrices")
+    if not 0.0 < lower < upper:
+        raise ValueError("SPD spectral bounds must satisfy 0 < lower < upper")
+    symmetric = 0.5 * (matrix + matrix.transpose(-1, -2))
+    eigenvalue = torch.linalg.eigvalsh(symmetric)
+    shift = torch.relu(eigenvalue[..., 0].new_tensor(lower) - eigenvalue[..., 0])
+    eye = torch.eye(3, dtype=matrix.dtype, device=matrix.device)
+    shifted = symmetric + shift[..., None, None] * eye
+    shifted_maximum = eigenvalue[..., -1] + shift
+    denominator = (shifted_maximum - lower).clamp_min(
+        torch.finfo(matrix.dtype).eps
+    )
+    contraction = torch.minimum(
+        torch.ones_like(denominator),
+        denominator.new_tensor(upper - lower) / denominator,
+    )
+    lower_identity = matrix.new_tensor(lower) * eye
+    return lower_identity + contraction[..., None, None] * (
+        shifted - lower_identity
+    )
+
+
 def spd_geodesic(start: Tensor, end: Tensor, time: Tensor | float) -> Tensor:
     start_sqrt = spd_power(start, 0.5)
     start_inverse_sqrt = spd_power(start, -0.5)

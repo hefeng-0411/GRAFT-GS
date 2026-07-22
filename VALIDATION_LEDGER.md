@@ -332,3 +332,34 @@ a separated spectrum. Whole-tree compilation and 26/26 production-path static
 guards pass after this repair. PyTorch numerical execution and the corrected
 ProcessGroupNCCL/overfit rerun remain server-pending; no successful training
 step is claimed yet.
+
+Phase-B non-finite-state repair cycle (2026-07-22): the next supplied A800
+smoke is genuine forward progress. Both ranks completed source-only TRELLIS
+sampling, synchronized the persistent atlas, executed backward and an optimizer
+step, and gathered a checkpoint. The second forward failed while rebuilding
+the atlas because particle mass was non-finite; the former error text combined
+shape, sign, and NaN and therefore did not identify the numerical domain.
+
+The repaired path adds four numerical failure cases: an isotropic 2x2 chart
+metric must reconstruct exactly and backpropagate a finite trace derivative; a
+flat analytical chart must backpropagate finite evidence and curvature
+gradients; a repeated-spectrum 3x3 covariance must remain inside the SPD box
+with finite gradient; and NaN particle mass must be rejected by a specific
+diagnostic. The distributed suite already executes the new collective
+pre-optimizer finite guard and now loads all four tests on every rank.
+
+Locally executed after repair: whole-tree `compileall` passed, followed by
+31/31 PyTorch-independent exact-environment and scientific production-path
+tests. The bundled local runtime has no PyTorch, so the attempted five-test
+numerical command failed at import with `ModuleNotFoundError: torch`; it is
+recorded as unavailable, not as a model failure or pass. The targeted
+float64/gradient tests, corrected DDP gate, and a two-step checkpoint-backed
+smoke remain A800-pending. No post-repair loss decrease is claimed.
+
+The broader 57-test dataset/environment/static rerun was attempted after the
+same change. It reached 39 passes and one expected no-PyTorch skip, while 17
+fixture-writing cases failed uniformly with local `OSError: [Errno 28] No
+space left on device` under the Windows temporary directory. These are not
+recorded as code failures or passes. No cache or artifact cleanup was performed.
+The non-writing 31-test gate was then rerun with
+`PYTHONDONTWRITEBYTECODE=1` and passed 31/31.

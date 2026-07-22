@@ -610,3 +610,37 @@ The full conditional validity domain is maintained in
   but receive a finite zero derivative for that mathematically unidentifiable
   gauge. The threshold is typed in `AtlasConfig`, loaded from the server YAML,
   and does not reduce FP32 geometric-state precision.
+
+## 2026-07-22 Phase-B finite-gradient containment and readout repair
+
+- Requirement `READOUT-SPECTRAL-STRATA-01`: the returned two-rank smoke passed
+  decoded-grid, int64 NCCL transport, source-gauge synchronization, the first
+  complete forward/backward/update, and its format-6 checkpoint. Its second
+  forward then found non-finite particle mass. Since calibrated mass is a
+  product of non-negative finite-domain factors, this is evidence that the
+  first update corrupted a calibrator parameter; the old compound atlas error
+  hid whether the cause was shape, sign, or NaN.
+- Phase B executes analytical readout. Flat initialization gives repeated
+  eigenvalues in the 2D first fundamental form, where an ordinary eigenvector
+  derivative contains an undefined inverse eigengap. Readout now uses an
+  eigengap-stratified chart-metric decomposition: exact differentiable
+  eigenpairs on the simple-spectrum stratum, exact forward gauge with zero
+  gauge derivative at an unresolved spectrum, and the common trace derivative
+  for isotropic scale. The configured relative threshold is explicit.
+- Gaussian covariance no longer reconstructs a tangent covariance through
+  principal eigenvectors. The algebraically identical expression
+  `a^2 J J^T + sigma_n^2 n n^T` is basis-free, SPD, and has no eigenvector
+  derivative. Zero-curvature thickness uses a smoothed Frobenius bound instead
+  of the nondifferentiable spectral norm. Initial state covariance boxing uses
+  an eigenvector-free shift-and-contract spectral map.
+- Requirement `TRAIN-FINITE-01`: loss terms, gradients, trainable parameters,
+  post-update parameters, and every tensor-valued optimizer state are checked
+  collectively. Any rank with NaN/Inf causes all ranks to raise before the
+  next collective. Gradient clipping has `error_if_nonfinite=True`, so a NaN
+  norm can no longer rescale every gradient and poison Adam state. Evidence,
+  calibrator, and atlas constructors now name non-finite fields explicitly and
+  never reinterpret them as absent or zero mass.
+- Production files: `readout/assets.py`, `manifold/geometry.py`,
+  `integration/pipeline.py`, `mapping/manifold_mapping.py`,
+  `geometry/atlas.py`, `engine/trainer.py`, `engine/configuration.py`, and the
+  A800 YAML. Numerical regressions are wired into `validate_ddp_server.py`.

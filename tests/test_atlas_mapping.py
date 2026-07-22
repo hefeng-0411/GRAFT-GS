@@ -68,6 +68,15 @@ def _surface_evidence(dtype: torch.dtype = torch.float64) -> EvidenceParticles:
 
 
 class PersistentAtlasTest(unittest.TestCase):
+    def test_atlas_rejects_nonfinite_mass_with_specific_diagnostic(self) -> None:
+        positions = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.1, 0.0, 0.0]], dtype=torch.float64
+        )
+        with self.assertRaisesRegex(ValueError, "mass contains non-finite"):
+            PersistentOctreeAtlas.from_evidence(
+                positions, torch.tensor([1.0, float("nan")], dtype=torch.float64)
+            )
+
     def test_pca_frame_repeated_spectrum_has_finite_zero_gauge_gradient(self) -> None:
         covariance = torch.zeros(2, 3, 3, dtype=torch.float64, requires_grad=True)
         frame = _right_handed_pca_frames(covariance, 1.0e-10, 1.0e-4)

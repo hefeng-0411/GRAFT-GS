@@ -231,6 +231,25 @@ evidence gradient fails this gate. The CPU portion also requires a finite zero
 gauge derivative at a repeated spectrum and finite nonzero frame derivatives
 for a separated spectrum.
 
+Before repeating checkpoint-backed overfit, run the focused spectral and
+finite-state regressions with the exact pinned interpreter:
+
+```bash
+$GRAFT_GS_PYTHON -m unittest -v \
+  tests.test_assets_and_vertical_slice.AnalyticalAssetTest.test_isotropic_chart_metric_has_finite_basis_free_backward \
+  tests.test_assets_and_vertical_slice.AnalyticalAssetTest.test_flat_chart_analytical_readout_backward_is_finite \
+  tests.test_geometry_invariants.TopologyAndManifoldTest.test_spd_spectral_box_is_bounded_and_repeated_spectrum_safe \
+  tests.test_distributed_evidence.AtlasSynchronizationTransportTest.test_nonfinite_gradient_guard_fails_before_optimizer_step \
+  tests.test_atlas_mapping.PersistentAtlasTest.test_atlas_rejects_nonfinite_mass_with_specific_diagnostic \
+  2>&1 | tee outputs/validation/phase_b_finite_gradient.log
+```
+
+All five must pass. The same numerical cases are included in
+`validate_ddp_server.py` on every visible rank. A non-finite failure is not
+recoverable by increasing clipping or loosening a tolerance; retain the named
+rank/tensor diagnostic and restart from the last checkpoint created before the
+failed optimizer update.
+
 ## Offline teacher bundle refinement
 
 ```bash
@@ -262,6 +281,28 @@ $GRAFT_GS_PYTHON -m torch.distributed.run --standalone \
   --steps 1000 --output outputs/overfit_fixture \
   2>&1 | tee outputs/overfit_fixture/run.log
 ```
+
+For the bounded two-step recovery smoke, keep artifacts and the tee in the
+same directory (the `--output` argument is required; assigning `SMOKE_DIR`
+alone does not change the script default):
+
+```bash
+SMOKE_DIR="outputs/overfit_smoke/${GRAFT_GS_OBJECT_ID}_finite_gradient_fix"
+mkdir -p "$SMOKE_DIR"
+$GRAFT_GS_PYTHON -m torch.distributed.run --standalone --nnodes=1 \
+  --nproc-per-node="$GRAFT_GS_NPROC_PER_NODE" \
+  scripts/overfit_meshfleet_object.py \
+  "$GRAFT_GS_MESHFLEET_ROOT" "$GRAFT_GS_MESHFLEET_MANIFEST" \
+  --split train --object-id "$GRAFT_GS_OBJECT_ID" \
+  --config configs/graft_gs_a800_native.yaml \
+  --vggt-checkpoint "$VGGT_CHECKPOINT" \
+  --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
+  --steps 2 --minimum-relative-improvement -1 --output "$SMOKE_DIR" \
+  2>&1 | tee "$SMOKE_DIR/run.log"
+```
+
+Delete nothing and do not reuse `step-00000001.pt` from the pre-repair failed
+smoke: its optimizer step was not protected by the finite-state gate.
 
 Required artifacts: periodic and final checkpoints, `metrics.jsonl`, decreasing
 overfit objective, input-view renders, deterministic PLY/GLB, reload metrics,

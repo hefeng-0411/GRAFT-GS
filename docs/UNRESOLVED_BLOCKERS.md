@@ -123,3 +123,11 @@ checkpoints, data, or a compiled server dependency.
   numerical and torchrun regression paths. The corrected
   `validate_ddp_server.py` suite and overfit must execute before same-object
   atlas synchronization or its backward path is called A800 validated.
+- The subsequent smoke passed both prior failures and completed one optimizer
+  update, then the second forward rejected non-finite evidence mass. The
+  Phase-B repeated-spectrum readout and optimizer-containment repairs are
+  implemented. What remains external is running the focused float64 gradient
+  tests under the pinned Torch 2.4 environment, then rerunning two steps. A
+  successful gate must show two finite steps; a failure must now name the
+  first non-finite loss/gradient/parameter rather than reaching a corrupted
+  second-forward atlas. Do not resume a checkpoint produced by the failed run.

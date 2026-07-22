@@ -37,6 +37,8 @@ model:
   # gauge and receive a finite zero gauge derivative instead of 1/eigengap.
   frame_epsilon: 1.0e-10
   frame_relative_eigengap: 1.0e-4
+  readout_metric_epsilon: 1.0e-10
+  readout_metric_relative_eigengap: 1.0e-4
   encoder_layers: 4
   attention_heads: 4
   flow_layers: 8

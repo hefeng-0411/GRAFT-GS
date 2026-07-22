@@ -92,10 +92,35 @@ class EvidenceParticles:
             raise ValueError("camera focal lengths must be positive")
         if self.colors is not None and tuple(self.colors.shape) != (m, 3):
             raise ValueError("colors must have shape [M, 3]")
+        finite_fields = {
+            "positions": self.positions,
+            "rays": self.rays,
+            "features": self.features,
+            "covariance": self.covariance,
+            "confidence": self.confidence,
+            "mass": self.mass,
+            "pixel_uv": self.pixel_uv,
+            "extrinsics_world_to_camera": self.extrinsics_world_to_camera,
+            "intrinsics": self.intrinsics,
+            "depth_variance": self.depth_variance,
+        }
+        if self.colors is not None:
+            finite_fields["colors"] = self.colors
+        nonfinite = [
+            name
+            for name, value in finite_fields.items()
+            if not bool(torch.all(torch.isfinite(value)))
+        ]
+        if nonfinite:
+            raise ValueError(
+                f"evidence particle fields contain non-finite values: {nonfinite}"
+            )
         if torch.any(self.confidence < 0) or torch.any(self.confidence > 1):
             raise ValueError("confidence must lie in [0, 1]")
         if torch.any(self.mass < 0):
             raise ValueError("particle mass must be non-negative")
+        if not bool(torch.any(self.mass > 0)):
+            raise ValueError("evidence measure must contain positive particle mass")
         ray_error = (torch.linalg.vector_norm(self.rays, dim=-1) - 1.0).abs().max()
         if float(ray_error) > 1.0e-4:
             raise ValueError("rays must be unit vectors")
@@ -590,17 +615,44 @@ class ConfidenceCovarianceCalibrator(nn.Module):
         world_rays: Tensor,
         reprojection_residual: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor]:
+        parameters = {
+            "log_temperature": self.log_temperature,
+            "confidence_bias": self.confidence_bias,
+            "log_tangent_scale": self.log_tangent_scale,
+            "log_normal_scale": self.log_normal_scale,
+            "log_sigma_floor": self.log_sigma_floor,
+        }
+        nonfinite = [
+            name
+            for name, value in parameters.items()
+            if not bool(torch.all(torch.isfinite(value)))
+        ]
+        if nonfinite:
+            raise FloatingPointError(
+                f"confidence calibrator parameters are non-finite: {nonfinite}"
+            )
         eps = torch.finfo(depth.dtype).eps
+        temperature = torch.exp(
+            self.log_temperature.clamp(log(0.05), log(20.0))
+        )
+        tangent_scale = torch.exp(
+            self.log_tangent_scale.clamp(log(1.0e-4), log(10.0))
+        ).to(depth)
+        normal_scale = torch.exp(
+            self.log_normal_scale.clamp(log(1.0e-5), log(2.0))
+        ).to(depth)
+        sigma_floor = torch.exp(
+            self.log_sigma_floor.clamp(log(1.0e-8), log(1.0e-1))
+        ).to(depth)
         # VGGT heads use expp1 confidence, so log(confidence) is a better
         # unconstrained calibration coordinate than treating it as a probability.
-        logits = torch.exp(self.log_temperature) * torch.log(raw_confidence.clamp_min(eps)) + self.confidence_bias
+        logits = temperature * torch.log(raw_confidence.clamp_min(eps)) + self.confidence_bias
         if reprojection_residual is not None:
             logits = logits - reprojection_residual.square()
         confidence = torch.sigmoid(logits)
-        sigma_floor = torch.exp(self.log_sigma_floor).to(depth)
-        tangent_sigma = torch.exp(self.log_tangent_scale).to(depth) * depth * pixel_footprint / focal_mean
+        tangent_sigma = tangent_scale * depth * pixel_footprint / focal_mean
         tangent_sigma = tangent_sigma.clamp_min(sigma_floor)
-        normal_sigma = torch.exp(self.log_normal_scale).to(depth) * depth / torch.sqrt(confidence.clamp_min(eps))
+        normal_sigma = normal_scale * depth / torch.sqrt(confidence.clamp_min(eps))
         normal_sigma = normal_sigma.clamp_min(sigma_floor)
 
         helper = torch.zeros_like(world_rays)

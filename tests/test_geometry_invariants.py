@@ -30,6 +30,7 @@ from graft_gs.manifold.geometry import (
     ManifoldTangent,
     geodesic_interpolate,
     retract,
+    spectral_box_spd,
     so3_exp,
     so3_log,
     spd_geodesic,
@@ -193,6 +194,21 @@ class GaugeEquivarianceTest(unittest.TestCase):
 
 
 class TopologyAndManifoldTest(unittest.TestCase):
+    def test_spd_spectral_box_is_bounded_and_repeated_spectrum_safe(self) -> None:
+        matrix = torch.stack(
+            (
+                0.01 * torch.eye(3, dtype=torch.float64),
+                2.0 * torch.eye(3, dtype=torch.float64),
+                torch.diag(torch.tensor([1.0e-8, 0.02, 3.0], dtype=torch.float64)),
+            )
+        ).requires_grad_(True)
+        projected = spectral_box_spd(matrix, 1.0e-6, 0.25)
+        eigenvalue = torch.linalg.eigvalsh(projected)
+        self.assertTrue(bool(torch.all(eigenvalue >= 1.0e-6 - 1.0e-12)))
+        self.assertTrue(bool(torch.all(eigenvalue <= 0.25 + 1.0e-12)))
+        gradient = torch.autograd.grad(projected.square().sum(), matrix)[0]
+        self.assertTrue(torch.all(torch.isfinite(gradient)))
+
     def test_persistence_critical_proposal_thresholds(self) -> None:
         diagrams = {
             0: torch.tensor([[0.1, 0.9]], dtype=torch.float64),

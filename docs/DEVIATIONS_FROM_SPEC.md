@@ -206,3 +206,15 @@
     when both adjacent relative eigengaps are resolved; the unidentifiable
     gauge has a finite zero derivative otherwise. This is a conditional
     derivative guarantee, not a claim of smoothness across spectral strata.
+37. **Analytical tangent covariance is basis-free.** The specification writes
+    tangent scales in principal first-form coordinates. The implementation
+    still exports those exact scales and a valid representative rotation, but
+    computes the covariance as `a^2 J J^T + sigma_n^2 n n^T`. This is
+    algebraically equivalent and removes an unnecessary, undefined
+    eigenvector derivative at flat/isotropic charts.
+38. **Non-finite optimization state is a hard distributed error.** The
+    specification requests high precision but does not define recovery from a
+    NaN update. GRAFT-GS does not sanitize such values: it collectively checks
+    losses, gradients, parameters, and Adam state, then aborts before mutation
+    with rank/name provenance. This favors scientific diagnosability over a
+    silent skip or zero replacement.
