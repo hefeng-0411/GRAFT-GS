@@ -97,9 +97,12 @@ class BarrierConfig:
     dual_iterations: int = 96
     dual_tolerance: float = 1.0e-7
     dual_regularization: float = 1.0e-8
+    dual_check_interval: int = 8
     maximum_backtracks: int = 14
     backtrack_factor: float = 0.5
     maximum_position_speed: float = 5.0e-2
+    restoration_iterations: int = 12
+    restoration_relative_margin: float = 5.0e-2
 
     def __post_init__(self) -> None:
         if min(
@@ -110,6 +113,7 @@ class BarrierConfig:
             self.decay_rate,
             self.dual_regularization,
             self.maximum_position_speed,
+            self.restoration_relative_margin,
         ) <= 0:
             raise ValueError("barrier scales, margins, regularization, and speed bound must be positive")
         if not -1.0 < self.minimum_orientation_cosine < 1.0:
@@ -118,6 +122,14 @@ class BarrierConfig:
             raise ValueError("maximum covariance eigenvalue must exceed the minimum")
         if not 0.0 < self.backtrack_factor < 1.0:
             raise ValueError("backtrack_factor must lie in (0,1)")
+        if (
+            self.dual_iterations < 1
+            or self.dual_check_interval < 1
+            or self.maximum_backtracks < 0
+        ):
+            raise ValueError("barrier solver iterations must be positive and backtracks non-negative")
+        if self.restoration_iterations < 1:
+            raise ValueError("restoration_iterations must be positive")
 
 
 @dataclass
@@ -132,6 +144,8 @@ class FeasibilityReport:
     dual_residual: float = 0.0
     minimum_linearized_margin: float = float("inf")
     accepted_step: float = 0.0
+    restoration_iterations: int = 0
+    restoration_maximum_displacement: float = 0.0
 
 
 class BarrierProjector:
@@ -253,6 +267,231 @@ class BarrierProjector:
         triangle_separation = self._triangle_separation_margin(position)
         return torch.cat((area, orientation, separation, triangle_separation))
 
+    def _restoration_targets_and_scales(self, position: Tensor) -> Tuple[Tensor, Tensor]:
+        """Return dimensionally normalized strict-interior targets.
+
+        Topology proposal precedes the continuous topology-preserving flow, but
+        transported chart centers can lie just outside the selected stratum's
+        collision-free embedding set.  Restoration therefore solves for a
+        positive buffer in the native units of each constraint family.  Scaling
+        the inequalities changes neither their feasible set nor the primal
+        minimum-displacement problem; it only conditions the dual system.
+        """
+
+        face_count = int(self.faces.shape[0])
+        pair_count = int(self.nonlocal_pairs.shape[0])
+        face_pair_count = int(self.nonlocal_face_pairs.shape[0])
+        relative = self.config.restoration_relative_margin
+        area_scale = position.new_tensor(self.config.minimum_face_area)
+        orientation_scale = position.new_tensor(
+            1.0 - self.config.minimum_orientation_cosine
+        )
+        separation_scale = position.new_tensor(self.config.minimum_separation**2)
+        separation_target = position.new_tensor(
+            ((1.0 + relative) * self.config.minimum_separation) ** 2
+            - self.config.minimum_separation**2
+        )
+        target = torch.cat(
+            (
+                area_scale.expand(face_count) * relative,
+                orientation_scale.expand(face_count) * relative,
+                separation_target.expand(pair_count),
+                separation_target.expand(face_pair_count),
+            )
+        )
+        scale = torch.cat(
+            (
+                area_scale.expand(face_count),
+                orientation_scale.expand(face_count),
+                separation_scale.expand(pair_count),
+                separation_scale.expand(face_pair_count),
+            )
+        )
+        return target, scale
+
+    @staticmethod
+    def _replace_position(state: ManifoldState, position: Tensor) -> ManifoldState:
+        return ManifoldState(
+            position=position,
+            rotation=state.rotation,
+            covariance=state.covariance,
+            opacity_logit=state.opacity_logit,
+            appearance=state.appearance,
+            latent=state.latent,
+            evidence_metric=state.evidence_metric,
+            complex=state.complex,
+        )
+
+    def restore_feasible_embedding(
+        self,
+        state: ManifoldState,
+    ) -> Tuple[ManifoldState, FeasibilityReport]:
+        r"""Restore a proposed stratum by metric-minimal hard-constraint steps.
+
+        Each iteration solves the linearized convex problem
+
+        ``min_delta 1/2 sum_v delta_v^T G_v delta_v``
+
+        subject to ``h_j(p) + D h_j(p)[delta] >= target_j`` for the
+        currently active area, orientation, vertex-separation, and
+        triangle-separation constraints.  A deterministic merit line search
+        accepts only decreasing normalized violation, and the returned state
+        must pass the existing detached FP64 *strict* feasibility report.
+
+        This is an initialization operation performed after discrete topology
+        proposal and before topology-preserving flow.  It is conditionally
+        differentiable for fixed active sets/closest features; it is not an
+        isotopy claim from an infeasible input.  Total displacement is bounded
+        by ``maximum_position_speed``, preserving the fixed broad-phase search
+        certificate constructed around the transported input.
+        """
+
+        initial_report = self.report(state)
+        if initial_report.feasible:
+            return state, initial_report
+        if (
+            initial_report.minimum_covariance_margin <= 0.0
+            or initial_report.maximum_covariance_margin <= 0.0
+        ):
+            raise RuntimeError(
+                "embedding restoration cannot repair covariance spectral-box violations"
+            )
+
+        original_dtype = state.position.dtype
+        base_position = state.position.to(dtype=torch.float64)
+        position = base_position
+        metric = state.evidence_metric.to(dtype=torch.float64)
+        target, scale = self._restoration_targets_and_scales(position)
+        last_report = initial_report
+        completed_iterations = 0
+        last_dual_residual = float("inf")
+
+        for iteration in range(1, self.config.restoration_iterations + 1):
+            completed_iterations = iteration
+            constraint = self.position_constraints(position, diagnostics=True)
+            normalized = (constraint - target) / scale
+            active = normalized < 0.0
+            if not bool(torch.any(active)):
+                candidate_state = self._replace_position(
+                    state, position.to(dtype=original_dtype)
+                )
+                last_report = self.report(candidate_state)
+                if last_report.feasible:
+                    break
+
+            active = active.detach()
+            jacobian = torch.autograd.functional.jacobian(
+                lambda value: (
+                    (self.position_constraints(value, diagnostics=True) - target)
+                    / scale
+                )[active],
+                position,
+                create_graph=torch.is_grad_enabled(),
+                vectorize=True,
+            )
+            linear = normalized[active]
+            weighted = torch.linalg.solve(
+                metric.unsqueeze(0), jacobian.unsqueeze(-1)
+            ).squeeze(-1)
+            gram = torch.einsum("iva,jva->ij", jacobian, weighted)
+            gram = gram + self.config.dual_regularization * torch.eye(
+                gram.shape[0], dtype=gram.dtype, device=gram.device
+            )
+            if not bool(torch.all(torch.isfinite(gram))) or not bool(
+                torch.all(torch.isfinite(linear))
+            ):
+                raise RuntimeError("embedding-restoration QP contains non-finite coefficients")
+            spectral_bound = torch.linalg.matrix_norm(
+                gram, ord=float("inf")
+            ).clamp_min(self.config.dual_regularization)
+            dual_step = 1.0 / spectral_bound
+            dual = torch.zeros_like(linear)
+            for dual_iteration in range(self.config.dual_iterations):
+                candidate_dual = torch.relu(
+                    dual - dual_step * (gram @ dual + linear)
+                )
+                dual = candidate_dual
+                should_check = (
+                    (dual_iteration + 1) % self.config.dual_check_interval == 0
+                    or dual_iteration + 1 == self.config.dual_iterations
+                )
+                if should_check:
+                    fixed_dual = torch.relu(
+                        dual - dual_step * (gram @ dual + linear)
+                    )
+                    residual = torch.max(torch.abs(fixed_dual - dual))
+                    threshold = self.config.dual_tolerance * (
+                        1.0 + dual.abs().amax()
+                    )
+                    residual_value, threshold_value = torch.stack(
+                        (residual, threshold)
+                    ).detach().cpu().tolist()
+                    last_dual_residual = float(residual_value)
+                    if last_dual_residual <= float(threshold_value):
+                        break
+            correction = torch.einsum("jva,j->va", weighted, dual)
+            if not bool(torch.all(torch.isfinite(correction))):
+                raise RuntimeError("embedding-restoration QP produced a non-finite step")
+
+            current_merit = torch.relu(-normalized).amax()
+            accepted = False
+            step = 1.0
+            for _ in range(self.config.maximum_backtracks + 1):
+                candidate_position = position + step * correction
+                displacement = candidate_position - base_position
+                maximum_displacement = torch.linalg.vector_norm(
+                    displacement, dim=-1
+                ).amax()
+                displacement_scale = (
+                    position.new_tensor(self.config.maximum_position_speed)
+                    / maximum_displacement.clamp_min(torch.finfo(position.dtype).eps)
+                ).clamp_max(1.0)
+                candidate_position = base_position + displacement_scale * displacement
+                candidate_constraint = self.position_constraints(
+                    candidate_position, diagnostics=True
+                )
+                candidate_merit = torch.relu(
+                    (target - candidate_constraint) / scale
+                ).amax()
+                candidate_state = self._replace_position(
+                    state, candidate_position.to(dtype=original_dtype)
+                )
+                candidate_report = self.report(candidate_state)
+                if candidate_report.feasible or bool(
+                    candidate_merit < current_merit * (1.0 - 1.0e-6)
+                ):
+                    position = candidate_position
+                    last_report = candidate_report
+                    accepted = True
+                    break
+                step *= self.config.backtrack_factor
+            if not accepted:
+                raise RuntimeError(
+                    "embedding-restoration QP could not decrease normalized hard-constraint violation"
+                )
+            if last_report.feasible:
+                break
+
+        restored = self._replace_position(state, position.to(dtype=original_dtype))
+        final_report = self.report(restored)
+        final_report.restoration_iterations = completed_iterations
+        final_report.dual_residual = last_dual_residual
+        final_report.restoration_maximum_displacement = float(
+            torch.linalg.vector_norm(
+                restored.position.detach().to(dtype=torch.float64)
+                - state.position.detach().to(dtype=torch.float64),
+                dim=-1,
+            )
+            .amax()
+            .cpu()
+        )
+        if not final_report.feasible:
+            raise RuntimeError(
+                "embedding restoration exhausted its iterations without reaching the strict feasible set: "
+                f"{final_report}"
+            )
+        return restored, final_report
+
     def topology_boundary_margin(
         self,
         state: ManifoldState,
@@ -315,12 +554,27 @@ class BarrierProjector:
         )
         covariance_min = eigenvalues[:, 0] - self.config.minimum_covariance_eigenvalue
         covariance_max = self.config.maximum_covariance_eigenvalue - eigenvalues[:, -1]
-        area_min = float(area.min().detach().cpu()) if area.numel() else float("inf")
-        orientation_min = float(orientation.min().detach().cpu()) if orientation.numel() else float("inf")
+        infinity = position.new_tensor(torch.inf)
+        area_minimum = area.amin() if area.numel() else infinity
+        orientation_minimum = orientation.amin() if orientation.numel() else infinity
         all_separation = torch.cat((separation, triangle_separation))
-        separation_min = float(all_separation.min().detach().cpu()) if all_separation.numel() else float("inf")
-        covariance_minimum = float(covariance_min.min().detach().cpu())
-        covariance_maximum = float(covariance_max.min().detach().cpu())
+        separation_minimum = all_separation.amin() if all_separation.numel() else infinity
+        diagnostic_minima = torch.stack(
+            (
+                area_minimum,
+                orientation_minimum,
+                separation_minimum,
+                covariance_min.amin(),
+                covariance_max.amin(),
+            )
+        ).cpu().tolist()
+        (
+            area_min,
+            orientation_min,
+            separation_min,
+            covariance_minimum,
+            covariance_maximum,
+        ) = (float(value) for value in diagnostic_minima)
         feasible = min(area_min, orientation_min, separation_min, covariance_minimum, covariance_maximum) > 0.0
         return FeasibilityReport(
             feasible=feasible,
@@ -365,13 +619,26 @@ class BarrierProjector:
         step = 1.0 / spectral_bound
         dual = torch.zeros_like(linear)
         residual_value = float("inf")
-        for _ in range(self.config.dual_iterations):
+        for iteration in range(self.config.dual_iterations):
             candidate = torch.relu(dual - step * (gram @ dual + linear))
-            residual = torch.max(torch.abs(candidate - dual))
             dual = candidate
-            residual_value = float(residual.detach().cpu())
-            if residual_value < self.config.dual_tolerance:
-                break
+            should_check = (
+                (iteration + 1) % self.config.dual_check_interval == 0
+                or iteration + 1 == self.config.dual_iterations
+            )
+            if should_check:
+                fixed_dual = torch.relu(dual - step * (gram @ dual + linear))
+                residual = torch.max(torch.abs(fixed_dual - dual))
+                threshold = self.config.dual_tolerance * (1.0 + dual.abs().amax())
+                residual_value, threshold_value = (
+                    float(value)
+                    for value in torch.stack((residual, threshold))
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                if residual_value <= threshold_value:
+                    break
         correction = torch.einsum("jva,j->va", weighted, dual)
         safe_position = tangent.position + correction
         projected = ManifoldTangent(

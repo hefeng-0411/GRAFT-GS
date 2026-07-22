@@ -5,7 +5,6 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
-import os
 from pathlib import Path
 
 import torch
@@ -26,6 +25,7 @@ from graft_gs.engine import (
     GraftGSTrainer,
     TrainerConfig,
     TrainingPhase,
+    bind_local_cuda_device,
     load_graft_checkpoint,
     load_loss_weights,
     load_precision_policy,
@@ -59,11 +59,30 @@ def main() -> None:
     parser.add_argument("--perceptual-checkpoint", type=Path)
     parser.add_argument("--output", default="outputs/training")
     parser.add_argument("--same-object-view-shards", action="store_true")
+    parser.add_argument(
+        "--maximum-views",
+        type=int,
+        help=(
+            "maximum images loaded per object before optional same-object view "
+            "sharding (defaults to dataset.maximum_views)"
+        ),
+    )
+    parser.add_argument("--dataloader-workers", type=int)
+    parser.add_argument("--dataloader-prefetch-factor", type=int)
     parser.add_argument("--config", type=Path, default=Path("configs/graft_gs_a800_native.yaml"))
     args = parser.parse_args()
+    local_device = bind_local_cuda_device(require_cuda=True)
     args.vggt_checkpoint = resolve_vggt_checkpoint(args.vggt_checkpoint)
     phase = TrainingPhase(args.phase)
     model_config, training_config, distributed_config, dataset_config = load_server_config(args.config)
+    maximum_views = int(
+        args.maximum_views
+        if args.maximum_views is not None
+        else dataset_config.get("maximum_views", 24)
+    )
+    minimum_views = int(dataset_config.get("minimum_views", 2))
+    if maximum_views < minimum_views:
+        raise ValueError("--maximum-views must be at least dataset.minimum_views")
     precision_policy = load_precision_policy(args.config)
     precision_record = precision_policy.apply()
     loss_weights = load_loss_weights(args.config)
@@ -83,9 +102,6 @@ def main() -> None:
     use_prior = bool(prior_config["enabled_after_phase_a"]) and phase is not TrainingPhase.EVIDENCE_CALIBRATION
     if use_prior:
         args.trellis_checkpoint = resolve_trellis_checkpoint(args.trellis_checkpoint)
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    if torch.cuda.is_available():
-        torch.cuda.set_device(local_rank)
     prior = (
         TrellisPriorAdapter.from_pretrained(
             args.trellis_checkpoint,
@@ -94,7 +110,7 @@ def main() -> None:
             strength=float(prior_config["strength"]),
             minimum_probability=float(prior_config["minimum_probability"]),
             uncertainty_discount=float(prior_config["uncertainty_discount"]),
-            device=torch.device("cuda", local_rank),
+            device=local_device,
         )
         if use_prior
         else None
@@ -167,6 +183,9 @@ def main() -> None:
             learning_rate=float(training_config.get("learning_rate", 1.0e-4)),
             gradient_accumulation_steps=int(training_config.get("gradient_accumulation_steps", 1)),
             maximum_gradient_norm=float(training_config.get("maximum_gradient_norm", 1.0)),
+            find_unused_parameters=bool(
+                distributed_config.get("find_unused_parameters", False)
+            ),
             gradient_purification_enabled=bool(
                 training_config.get("gradient_purification_enabled", True)
             ),
@@ -223,6 +242,7 @@ def main() -> None:
             dataset_view_set=str(dataset_config.get("input_view_set", "renders"))
             if args.manifest is not None
             else None,
+            dataset_maximum_views=maximum_views,
             dataset_manifest_schema=MANIFEST_SCHEMA if args.manifest is not None else None,
             topology_supervision_mode=str(
                 dataset_config.get("topology_supervision_mode", "validated_or_repaired")
@@ -324,8 +344,8 @@ def main() -> None:
                 split=args.split,
                 input_view_set=str(dataset_config.get("input_view_set", "renders")),
                 image_size=(int(image_size[0]), int(image_size[1])),
-                minimum_views=int(dataset_config.get("minimum_views", 2)),
-                maximum_views=int(dataset_config.get("maximum_views", 12)),
+                minimum_views=minimum_views,
+                maximum_views=maximum_views,
                 view_selection=str(dataset_config.get("view_selection", "random")),
                 foreground_alpha_threshold=float(
                     dataset_config.get("foreground_alpha_threshold", 0.5)
@@ -407,13 +427,26 @@ def main() -> None:
             rank=trainer.context.rank,
             shuffle=True,
         )
+    dataloader_workers = int(
+        args.dataloader_workers
+        if args.dataloader_workers is not None
+        else training_config.get("dataloader_workers", 8)
+    )
+    prefetch_factor = int(
+        args.dataloader_prefetch_factor
+        if args.dataloader_prefetch_factor is not None
+        else training_config.get("dataloader_prefetch_factor", 4)
+    )
+    if dataloader_workers < 0 or prefetch_factor < 1:
+        raise ValueError("dataloader workers must be non-negative and prefetch positive")
     loader = DataLoader(
         dataset,
         batch_size=1,
         sampler=sampler,
         shuffle=sampler is None and not same_object,
-        num_workers=4,
+        num_workers=dataloader_workers,
         pin_memory=True,
+        prefetch_factor=prefetch_factor if dataloader_workers > 0 else None,
         # Workers are recreated after dataset.set_epoch so deterministic random
         # view subsets actually change between epochs.
         persistent_workers=False,

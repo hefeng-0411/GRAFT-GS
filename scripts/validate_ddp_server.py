@@ -164,6 +164,16 @@ def main() -> None:
                     "test_spd_spectral_box_is_bounded_and_repeated_spectrum_safe",
                     "tests.test_atlas_mapping.PersistentAtlasTest."
                     "test_atlas_rejects_nonfinite_mass_with_specific_diagnostic",
+                    "tests.test_geometry_invariants.TopologyAndManifoldTest."
+                    "test_metric_minimal_restoration_enters_strict_feasible_set",
+                    "tests.test_atlas_mapping.ImplicitSinkhornTest."
+                    "test_solver_rejects_invalid_measure_and_nonconvergence",
+                    "tests.test_atlas_mapping.ImplicitSinkhornTest."
+                    "test_adjoint_nonconvergence_is_not_silently_accepted",
+                    "tests.test_atlas_mapping.ImplicitSinkhornTest."
+                    "test_sparse_all_edges_matches_dense_fixed_point_and_has_gradients",
+                    "tests.test_atlas_mapping.ImplicitSinkhornTest."
+                    "test_implicit_backward_matches_finite_difference",
                 )
             ),
         )

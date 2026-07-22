@@ -636,11 +636,81 @@ The full conditional validity domain is maintained in
 - Requirement `TRAIN-FINITE-01`: loss terms, gradients, trainable parameters,
   post-update parameters, and every tensor-valued optimizer state are checked
   collectively. Any rank with NaN/Inf causes all ranks to raise before the
-  next collective. Gradient clipping has `error_if_nonfinite=True`, so a NaN
-  norm can no longer rescale every gradient and poison Adam state. Evidence,
+  next collective. Gradient clipping accumulates the norm in FP64 after the
+  collective finite-state gate, so finite FP32 gradients cannot overflow while
+  being squared and a NaN norm cannot poison every Adam state. Evidence,
   calibrator, and atlas constructors now name non-finite fields explicitly and
   never reinterpret them as absent or zero mass.
 - Production files: `readout/assets.py`, `manifold/geometry.py`,
   `integration/pipeline.py`, `mapping/manifold_mapping.py`,
   `geometry/atlas.py`, `engine/trainer.py`, `engine/configuration.py`, and the
   A800 YAML. Numerical regressions are wired into `validate_ddp_server.py`.
+
+## 2026-07-22 A800 rank ownership and useful concurrency
+
+- Requirement `DDP-DEVICE-OWNERSHIP-02`: `LOCAL_RANK` is bound before either
+  released checkpoint is instantiated and before NCCL process-group creation.
+  Trainer construction rejects any process-local PyTorch allocation or cache
+  reservation on a non-local visible CUDA device. This directly addresses the
+  supplied run in which one PID appeared on two A800s.
+- Requirement `TRAIN-VIEW-CONCURRENCY-01`: same-object overfit accepts an exact
+  `--views-per-rank` budget and derives the global loader budget from the
+  dynamic `WORLD_SIZE`. CPU tensors are deterministically sharded before
+  non-blocking device transfer, so additional memory is spent on useful local
+  VGGT evidence rather than replicated global images and cameras.
+- Production training exposes `--maximum-views`; the selected budget is stored
+  in exact-resume provenance. Object-level DDP remains one variable-topology
+  object per rank, with configurable pinned-memory workers/prefetch. The A800
+  YAML uses native BF16 only in the VGGT backbone and FP32 for geometric,
+  transport, manifold, barrier, readout, renderer, and optimizer state.
+- One-object output records per-rank peak allocated/reserved fractions, local
+  views and views/s. Final asset evaluation is rank-zero-only and has a separate
+  deterministic view cap, preventing a global same-object training budget from
+  being redundantly evaluated and serialized on every rank.
+- Changed production files: `graft_gs/engine/trainer.py`,
+  `graft_gs/engine/__init__.py`, `scripts/train_a800.py`,
+  `scripts/overfit_meshfleet_object.py`, and
+  `configs/graft_gs_a800_native.yaml`.
+
+## 2026-07-22 strict stratum restoration and implicit-solver certification
+
+- Requirement `TOPOLOGY-EMBED-RESTORE-01`: the supplied post-update A800 run
+  reached final evaluation but rejected its only topology candidate at
+  separation margin `-2.605944407442015e-09`. This corresponds to an actual
+  closest distance of about `8.60e-5`, below the configured `1.0e-4`; it is not
+  accepted as roundoff and the hard separation threshold is unchanged.
+- Topology selection now performs a pre-flow, FP64, evidence-metric
+  minimum-displacement QP over active area, orientation, vertex-separation,
+  and triangle-separation inequalities. Constraint families are normalized in
+  their native units, projected-dual steps use deterministic merit
+  backtracking, total displacement is bounded by the collision broad-phase
+  certificate, and a newly constructed projector independently recertifies
+  strict feasibility. Failure rejects that discrete candidate; it never turns
+  into a soft penalty or fabricated feasible report.
+- Requirement `UOT-CONVERGENCE-02`: sparse KL-UOT now validates finite
+  non-negative costs/measures, exact support index domains, common
+  FP32/FP64 dtype/device, positive transported row/column mass, and the actual
+  coupled fixed-point equations. Both forward and implicit-adjoint solves fail
+  closed on non-convergence or non-finite state. Relative stopping scales are
+  explicit, while device/host convergence synchronization is reduced from
+  every iteration to every eighth iteration.
+- Requirement `DDP-CHECKPOINT-COMMIT-01`: distributed checkpoint serialization
+  is a collective commit transaction. Rank zero atomically replaces the file,
+  then broadcasts success/failure before any peer can enter the next NCCL
+  forward. Save failures are reported on all ranks. This removes a potential
+  collective-order race around a slow rank-zero filesystem write.
+- Production files: `graft_gs/manifold/barrier.py`,
+  `graft_gs/integration/pipeline.py`,
+  `graft_gs/mapping/manifold_mapping.py`,
+  `graft_gs/engine/configuration.py`, `graft_gs/engine/trainer.py`, and
+  `configs/graft_gs_a800_native.yaml`. Numerical regressions are in
+  `tests/test_geometry_invariants.py`, `tests/test_atlas_mapping.py`, and
+  `tests/test_distributed_evidence.py`.
+- The one-object artifact now records the selected topology, UOT iterations,
+  residual/effective tolerance, minimum transported row/column mass, and both
+  initial and final feasibility reports. This makes restoration and subsequent
+  barrier preservation directly auditable from `overfit_metrics.json`.
+- Barrier dual residuals are checked in scale-relative batches of eight
+  iterations, and the five FP64 nonlinear certificate minima are transferred
+  to the host in one operation. Acceptance remains a strict positive-margin
+  predicate; the change removes synchronization stalls, not checks.

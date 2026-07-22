@@ -25,6 +25,18 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("edge_uncertainty=edge_uncertainty", pipeline)
         self.assertIn("mapping.plan * mapping.cost", pipeline)
 
+    def test_implicit_sinkhorn_requires_forward_and_adjoint_convergence(self) -> None:
+        mapping = source("graft_gs/mapping/manifold_mapping.py")
+        configuration = source("graft_gs/engine/configuration.py")
+        config = source("configs/graft_gs_a800_native.yaml")
+        self.assertIn("sparse unbalanced Sinkhorn did not converge", mapping)
+        self.assertIn("implicit Sinkhorn adjoint did not converge", mapping)
+        self.assertIn("equation_source = lambda_source", mapping)
+        self.assertIn("torch.linalg.solve_triangular", mapping)
+        self.assertNotIn("precision = torch.linalg.inv(covariance)", mapping)
+        self.assertIn("convergence_check_interval", configuration)
+        self.assertIn("convergence_check_interval: 8", config)
+
     def test_refined_chart_fit_is_not_decorated_no_grad(self) -> None:
         tree = ast.parse(source("graft_gs/geometry/atlas.py"))
         methods = {}
@@ -342,7 +354,9 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("tangent_factor.square()", readout)
         self.assertNotIn("torch.linalg.eigh(first_form)", readout)
         self.assertIn("spectral_box_spd(covariance_raw", pipeline)
-        self.assertIn("error_if_nonfinite=True", trainer)
+        self.assertIn("def _clip_grad_norm_high_precision", trainer)
+        self.assertIn("non-finite training tensors before", trainer)
+        self.assertNotIn("torch.nn.utils.clip_grad_norm_", trainer)
         self.assertIn("post-step optimizer state", trainer)
         self.assertIn("torch.sqrt(world_squared + norm_epsilon.square())", losses)
         self.assertIn("torch.sqrt(pixel_squared + norm_epsilon.square())", losses)
@@ -390,6 +404,8 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("torch.cuda.set_device(local_rank)", validator)
         self.assertIn("successful_on_every_rank", validator)
         self.assertIn("dist.all_reduce(success, op=dist.ReduceOp.MIN)", validator)
+        self.assertIn("test_metric_minimal_restoration_enters_strict_feasible_set", validator)
+        self.assertIn("test_adjoint_nonconvergence_is_not_silently_accepted", validator)
 
     def test_visible_gpu_training_launcher_cannot_bypass_pinned_interpreter(self) -> None:
         launcher = source("scripts/launch_a800_6gpu.sh")
@@ -399,6 +415,71 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn('--requirements "$ROOT/requirements.txt"', launcher)
         self.assertIn('"$PYTHON_BIN" -m torch.distributed.run', launcher)
         self.assertIn("torch.cuda.device_count()", launcher)
+
+    def test_a800_concurrency_uses_useful_views_and_early_rank_binding(self) -> None:
+        trainer = source("graft_gs/engine/trainer.py")
+        overfit = source("scripts/overfit_meshfleet_object.py")
+        training = source("scripts/train_a800.py")
+        launcher = source("scripts/launch_a800_6gpu.sh")
+        config = source("configs/graft_gs_a800_native.yaml")
+        self.assertIn("def bind_local_cuda_device", trainer)
+        self.assertIn("def assert_local_cuda_allocator_ownership", trainer)
+        self.assertIn("assert_local_cuda_allocator_ownership(self.context.device)", trainer)
+        self.assertLess(
+            overfit.index("device = bind_local_cuda_device(require_cuda=True)"),
+            overfit.index("TrellisPriorAdapter.from_pretrained"),
+        )
+        self.assertLess(
+            training.index("local_device = bind_local_cuda_device(require_cuda=True)"),
+            training.index("TrellisPriorAdapter.from_pretrained"),
+        )
+        self.assertIn('"--views-per-rank"', overfit)
+        self.assertIn("maximum_views = args.views_per_rank * world_size", overfit)
+        self.assertIn('"--evaluation-views"', overfit)
+        self.assertIn('"rank_performance": rank_performance', overfit)
+        self.assertIn('"initial_feasibility": scene.feasibility_reports[0].__dict__', overfit)
+        self.assertIn('"final_feasibility": scene.feasibility_reports[-1].__dict__', overfit)
+        self.assertIn('"fixed_point_residual": transport.fixed_point_residual', overfit)
+        self.assertIn("if trainer.context.rank != 0:", overfit)
+        self.assertIn('"--maximum-views"', training)
+        self.assertIn("dataset_maximum_views=maximum_views", training)
+        self.assertLess(
+            trainer.index("images, valid_mask, view_supervision = self._shard_object_views"),
+            trainer.index("images = images.to("),
+        )
+        self.assertNotIn('torch.as_tensor(batch["images"], device=', trainer)
+        self.assertGreaterEqual(
+            trainer.count("images, valid_mask, view_supervision = self._shard_object_views"),
+            2,
+        )
+        self.assertIn("non_blocking=True", trainer)
+        self.assertIn("peak_reserved_memory_bytes", trainer)
+        self.assertIn("local_views_per_second", trainer)
+        self.assertIn("def _clip_grad_norm_high_precision", trainer)
+        self.assertIn("dtype=torch.float64", trainer)
+        save_start = trainer.index("def save_checkpoint")
+        load_start = trainer.index("def load_checkpoint")
+        checkpoint_source = trainer[save_start:load_start]
+        self.assertLess(
+            checkpoint_source.index("torch.save(payload, temporary)"),
+            checkpoint_source.index("dist.broadcast(failed, src=0)"),
+        )
+        self.assertIn("distributed checkpoint commit failed", checkpoint_source)
+        barrier = source("graft_gs/manifold/barrier.py")
+        pipeline = source("graft_gs/integration/pipeline.py")
+        configuration = source("graft_gs/engine/configuration.py")
+        self.assertIn("def restore_feasible_embedding", barrier)
+        self.assertIn("metric-minimal hard-constraint steps", barrier)
+        self.assertIn("dual_check_interval", barrier)
+        self.assertIn("diagnostic_minima = torch.stack", barrier)
+        self.assertIn("projector.restore_feasible_embedding(state)", pipeline)
+        self.assertIn('barrier = data.get("barrier", {})', configuration)
+        self.assertIn("restoration_relative_margin", config)
+        self.assertIn("--dataloader-workers", training)
+        self.assertIn("dataloader_prefetch_factor", training)
+        self.assertIn("find_unused_parameters: false", config)
+        self.assertIn("dataloader_workers: 8", config)
+        self.assertIn("dataloader_prefetch_factor: 4", config)
         self.assertIn("CUDA_VISIBLE_DEVICES must name the scheduler-assigned idle GPU subset", launcher)
         self.assertIn('--nproc-per-node="$NPROC_PER_NODE"', launcher)
         self.assertNotIn("--nproc-per-node=6", launcher)

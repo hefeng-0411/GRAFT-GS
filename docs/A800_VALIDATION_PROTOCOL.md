@@ -84,6 +84,97 @@ if not ids: raise SystemExit("manifest contains no admitted train object")
 print(ids[0])')
 ```
 
+## Rank ownership and useful-concurrency sweep
+
+Use exactly one process for every device already exposed by the scheduler. Do
+not launch multiple ranks per A800 and do not rewrite the scheduler mask:
+
+```bash
+export GRAFT_GS_NPROC_PER_NODE=$($GRAFT_GS_PYTHON -c \
+  'import torch; print(torch.cuda.device_count())')
+test "$GRAFT_GS_NPROC_PER_NODE" -ge 1
+echo "CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES ranks=$GRAFT_GS_NPROC_PER_NODE"
+
+$GRAFT_GS_PYTHON -m unittest \
+  tests.test_distributed_evidence.AtlasSynchronizationTransportTest.test_local_rank_is_bound_before_checkpoint_allocation \
+  tests.test_distributed_evidence.AtlasSynchronizationTransportTest.test_local_rank_rejects_foreign_cuda_allocator_reservation \
+  tests.test_distributed_evidence.AtlasSynchronizationTransportTest.test_local_rank_accepts_exclusively_local_cuda_allocator_state \
+  -v
+```
+
+After confirming that no previous GRAFT-GS launch remains, sweep distinct views
+per rank. The global loader admits `views_per_rank * world_size` views, then
+shards the CPU sample before its non-blocking CUDA transfer:
+
+```bash
+for VIEWS_PER_RANK in 8 12 16; do
+  RUN_DIR="outputs/concurrency/${GRAFT_GS_OBJECT_ID}/vpr-${VIEWS_PER_RANK}"
+  mkdir -p "$RUN_DIR"
+  "$GRAFT_GS_PYTHON" -m torch.distributed.run \
+    --standalone --nnodes=1 \
+    --nproc-per-node="$GRAFT_GS_NPROC_PER_NODE" \
+    scripts/overfit_meshfleet_object.py \
+    "$GRAFT_GS_MESHFLEET_ROOT" "$GRAFT_GS_MESHFLEET_MANIFEST" \
+    --split train --object-id "$GRAFT_GS_OBJECT_ID" \
+    --config configs/graft_gs_a800_native.yaml \
+    --vggt-checkpoint "$VGGT_CHECKPOINT" \
+    --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
+    --views-per-rank "$VIEWS_PER_RANK" \
+    --evaluation-views 24 --steps 2 \
+    --minimum-relative-improvement -1 \
+    --output "$RUN_DIR" 2>&1 | tee "$RUN_DIR/run.log"
+done
+```
+
+In a second terminal, verify that each PID appears on one GPU only:
+
+```bash
+watch -n 2 'nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory \
+  --format=csv,noheader,nounits | sort -k2,2n'
+```
+
+Inspect measured per-rank records instead of using occupancy as a proxy:
+
+```bash
+$GRAFT_GS_PYTHON - <<'PY'
+import glob, json
+for path in sorted(glob.glob("outputs/concurrency/*/vpr-*/overfit_metrics.json")):
+    report = json.load(open(path))
+    print(path)
+    for row in report["rank_performance"]:
+        print(
+            " rank", row["rank"], "views", int(row["local_views"]),
+            "views/s", round(row["local_views_per_second"], 3),
+            "allocated", round(row["peak_allocated_fraction"], 3),
+            "reserved", round(row["peak_reserved_fraction"], 3),
+        )
+PY
+```
+
+Select the largest budget that increases aggregate useful views/s, keeps every
+finite-state guard passing, and retains headroom. Initially reject a two-step
+Phase-B setting above 0.85 peak reserved fraction; Phase-D/F refinement peaks
+can be larger. If 16 views/rank remains below 0.70 and improves views/s, repeat
+once with 24. Never reserve dummy memory merely to reach 80 GiB.
+
+For corpus training, use ordinary object-level DDP (omit
+`--same-object-view-shards`). Every visible GPU receives a different complete
+object, while `--maximum-views` controls its local geometric view budget:
+
+```bash
+bash scripts/launch_a800_6gpu.sh \
+  "$GRAFT_GS_MESHFLEET_ROOT" B 1000 \
+  --manifest "$GRAFT_GS_MESHFLEET_MANIFEST" --split train \
+  --maximum-views 24 --dataloader-workers 8 \
+  --dataloader-prefetch-factor 4 \
+  --vggt-checkpoint "$VGGT_CHECKPOINT" \
+  --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
+  --output outputs/training/phase-b
+```
+
+The view budget is checkpoint provenance; changing it requires a new run or
+phase initialization, not an exact in-epoch resume.
+
 ## High-precision reference suite
 
 The returned server environment had `jupyter_client==7.4.9`, while the exact
@@ -287,17 +378,18 @@ same directory (the `--output` argument is required; assigning `SMOKE_DIR`
 alone does not change the script default):
 
 ```bash
-SMOKE_DIR="outputs/overfit_smoke/${GRAFT_GS_OBJECT_ID}_finite_gradient_fix"
+SMOKE_DIR="outputs/overfit_smoke/${GRAFT_GS_TRAIN_OBJECT_ID}_strict_restore"
 mkdir -p "$SMOKE_DIR"
 $GRAFT_GS_PYTHON -m torch.distributed.run --standalone --nnodes=1 \
   --nproc-per-node="$GRAFT_GS_NPROC_PER_NODE" \
   scripts/overfit_meshfleet_object.py \
   "$GRAFT_GS_MESHFLEET_ROOT" "$GRAFT_GS_MESHFLEET_MANIFEST" \
-  --split train --object-id "$GRAFT_GS_OBJECT_ID" \
+  --split train --object-id "$GRAFT_GS_TRAIN_OBJECT_ID" \
   --config configs/graft_gs_a800_native.yaml \
   --vggt-checkpoint "$VGGT_CHECKPOINT" \
   --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
-  --steps 2 --minimum-relative-improvement -1 --output "$SMOKE_DIR" \
+  --steps 2 --views-per-rank 12 --evaluation-views 24 \
+  --minimum-relative-improvement -1 --output "$SMOKE_DIR" \
   2>&1 | tee "$SMOKE_DIR/run.log"
 ```
 
@@ -309,6 +401,27 @@ overfit objective, input-view renders, deterministic PLY/GLB, reload metrics,
 and no activation of inadmissible hard raw-mesh topology loss. Topology
 expectations are taken from each record's provenance-aware contract, never
 from the selected object's ID.
+
+Before that smoke, run the strict restoration, implicit-UOT, and high-precision
+gradient-norm gate against the deployed source:
+
+```bash
+mkdir -p outputs/validation
+"$GRAFT_GS_PYTHON" -m unittest \
+  tests.test_geometry_invariants.TopologyAndManifoldTest.test_metric_minimal_restoration_enters_strict_feasible_set \
+  tests.test_atlas_mapping.ImplicitSinkhornTest.test_solver_rejects_invalid_measure_and_nonconvergence \
+  tests.test_atlas_mapping.ImplicitSinkhornTest.test_adjoint_nonconvergence_is_not_silently_accepted \
+  tests.test_atlas_mapping.ImplicitSinkhornTest.test_sparse_all_edges_matches_dense_fixed_point_and_has_gradients \
+  tests.test_atlas_mapping.ImplicitSinkhornTest.test_implicit_backward_matches_finite_difference \
+  tests.test_distributed_evidence.AtlasSynchronizationTransportTest.test_high_precision_gradient_norm_does_not_overflow_before_clipping \
+  -v 2>&1 | tee outputs/validation/strict_numerics.log
+```
+
+Retain `strict_numerics.log`, `run.log`, `metrics.json`, the final checkpoint,
+rank performance records, and every final feasibility/restoration field. A
+`find_unused_parameters=True` warning, evaluation on a nonzero rank, an
+unconverged UOT diagnostic, or a non-positive recertified margin means the
+deployed source/config is stale or the run failed.
 
 ## Full staged training and exact phase boundaries
 

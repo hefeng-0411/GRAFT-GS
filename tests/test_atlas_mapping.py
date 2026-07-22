@@ -420,6 +420,40 @@ class PersistentAtlasTest(unittest.TestCase):
 
 
 class ImplicitSinkhornTest(unittest.TestCase):
+    def test_solver_rejects_invalid_measure_and_nonconvergence(self) -> None:
+        dtype = torch.float64
+        edge = torch.tensor([[0, 0, 1, 1], [0, 1, 0, 1]], dtype=torch.int64)
+        cost = torch.tensor([0.0, 2.0, 2.0, 0.0], dtype=dtype)
+        mass = torch.tensor([0.5, 0.5], dtype=dtype)
+        solver = ImplicitUnbalancedSinkhorn(
+            ImplicitSinkhornConfig(max_iterations=1, tolerance=1.0e-16)
+        )
+        with self.assertRaisesRegex(RuntimeError, "did not converge"):
+            solver(cost, mass, mass, edge)
+        with self.assertRaisesRegex(ValueError, "non-negative"):
+            ImplicitUnbalancedSinkhorn(ImplicitSinkhornConfig())(
+                cost, torch.tensor([0.5, -0.5], dtype=dtype), mass, edge
+            )
+
+    def test_adjoint_nonconvergence_is_not_silently_accepted(self) -> None:
+        dtype = torch.float64
+        edge = torch.tensor([[0, 0, 1, 1], [0, 1, 0, 1]], dtype=torch.int64)
+        cost = torch.tensor(
+            [0.1, 0.8, 0.7, 0.2], dtype=dtype, requires_grad=True
+        )
+        mass = torch.tensor([0.55, 0.45], dtype=dtype)
+        solver = ImplicitUnbalancedSinkhorn(
+            ImplicitSinkhornConfig(
+                max_iterations=1000,
+                tolerance=1.0e-12,
+                backward_max_iterations=1,
+                backward_tolerance=1.0e-16,
+            )
+        )
+        plan, _ = solver(cost, mass, mass, edge)
+        with self.assertRaisesRegex(RuntimeError, "adjoint did not converge"):
+            (plan * torch.tensor([0.2, 0.7, 1.1, -0.3], dtype=dtype)).sum().backward()
+
     def test_sparse_all_edges_matches_dense_fixed_point_and_has_gradients(self) -> None:
         dtype = torch.float64
         n, m = 4, 5

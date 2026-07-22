@@ -130,6 +130,15 @@ process different objects and only model gradients synchronize. Server defaults
 are read from `configs/graft_gs_a800_native.yaml` and can be replaced with
 `--config`.
 
+The launcher derives one process per GPU from the active
+`CUDA_VISIBLE_DEVICES`; it never assumes that all six A800s are idle. Use
+`--maximum-views N` for the ordinary object-level per-rank view budget. For the
+same-object overfit diagnostic, use `--views-per-rank N`; its global sample
+contains `N * WORLD_SIZE` views and is sharded before CUDA transfer. Do not add
+multiple ranks per GPU or dummy allocations to fill 80 GiB. The measured
+8/12/16-view sweep, allocator-ownership check, headroom criterion, and exact
+commands are in `docs/A800_VALIDATION_PROTOCOL.md`.
+
 Phases B--F use the configured fixed TRELLIS structure generator as a
 Beta-Bernoulli hidden-surface prior. Its checkpoint and sampling/uncertainty
 policy are stored in every training checkpoint. The audited DINOv2 and TRELLIS

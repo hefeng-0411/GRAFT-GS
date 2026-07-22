@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 import random
 import time
-from typing import Iterable, Mapping, Optional
+from typing import Iterable, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -86,6 +86,7 @@ class TrainerConfig:
     dataset_object_id_count: Optional[int] = None
     dataset_split: Optional[str] = None
     dataset_view_set: Optional[str] = None
+    dataset_maximum_views: Optional[int] = None
     dataset_manifest_schema: Optional[str] = None
     topology_supervision_mode: Optional[str] = None
     minimum_topology_confidence: Optional[float] = None
@@ -153,6 +154,8 @@ class TrainerConfig:
             raise ValueError("Phase E requires explicit teacher checkpoint provenance")
         if self.minimum_topology_confidence is not None and not 0.0 <= self.minimum_topology_confidence <= 1.0:
             raise ValueError("minimum_topology_confidence must lie in [0,1]")
+        if self.dataset_maximum_views is not None and self.dataset_maximum_views < 1:
+            raise ValueError("dataset_maximum_views must be positive when configured")
         if self.trellis_prior_checkpoint is not None:
             if self.trellis_prior_samples < 1 or self.trellis_prior_sampler_steps < 1:
                 raise ValueError("active TRELLIS prior requires positive samples and steps")
@@ -186,18 +189,114 @@ class DistributedContext:
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         rank = int(os.environ.get("RANK", "0"))
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+        device = bind_local_cuda_device()
         if world_size > 1 and not dist.is_initialized():
             dist.init_process_group(backend="nccl", init_method="env://")
-        if torch.cuda.is_available():
-            torch.cuda.set_device(local_rank)
-            device = torch.device("cuda", local_rank)
-        else:
-            device = torch.device("cpu")
         return cls(rank, local_rank, world_size, device)
 
     @property
     def distributed(self) -> bool:
         return self.world_size > 1
+
+
+def bind_local_cuda_device(*, require_cuda: bool = False) -> torch.device:
+    """Bind torchrun's local device before any checkpoint allocates CUDA state.
+
+    Loading a CUDA checkpoint before ``torch.cuda.set_device(LOCAL_RANK)`` can
+    leave one process owning allocations on both logical device zero and its
+    assigned rank.  That wastes memory, defeats process isolation, and can OOM
+    an otherwise lightly loaded A800.  This helper is intentionally safe to
+    call again when the trainer initializes the process group.
+    """
+
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    if not torch.cuda.is_available():
+        if require_cuda:
+            raise RuntimeError("the requested distributed path requires CUDA")
+        return torch.device("cpu")
+    device_count = torch.cuda.device_count()
+    if not 0 <= local_rank < device_count:
+        raise RuntimeError(
+            f"LOCAL_RANK={local_rank} is outside the {device_count} devices exposed "
+            "by CUDA_VISIBLE_DEVICES"
+        )
+    torch.cuda.set_device(local_rank)
+    return torch.device("cuda", local_rank)
+
+
+def assert_local_cuda_allocator_ownership(device: torch.device) -> None:
+    """Reject process-local allocator state on another visible CUDA device.
+
+    This inspects only allocations owned by the current Python process; memory
+    belonging to other jobs is intentionally outside its scope. A one-process-
+    per-GPU DDP rank has no legitimate reason to reserve storage on a sibling
+    device before wrapping its local model.
+    """
+
+    if device.type != "cuda":
+        return
+    local_index = device.index
+    if local_index is None:
+        local_index = torch.cuda.current_device()
+    foreign = {
+        index: {
+            "allocated": int(torch.cuda.memory_allocated(index)),
+            "reserved": int(torch.cuda.memory_reserved(index)),
+        }
+        for index in range(torch.cuda.device_count())
+        if index != local_index
+        and (
+            torch.cuda.memory_allocated(index) != 0
+            or torch.cuda.memory_reserved(index) != 0
+        )
+    }
+    if foreign:
+        raise RuntimeError(
+            "this DDP process owns CUDA allocator state on non-local devices; "
+            f"LOCAL_RANK={local_index}, foreign={foreign}. Bind LOCAL_RANK before "
+            "loading VGGT, TRELLIS, or any CUDA checkpoint."
+        )
+
+
+@torch.no_grad()
+def _clip_grad_norm_high_precision(
+    parameters: Sequence[nn.Parameter],
+    maximum_norm: float,
+) -> Tensor:
+    """Clip a mixed-precision gradient vector using an FP64 global norm.
+
+    PyTorch's foreach norm follows gradient dtypes. Squaring a finite FP32
+    gradient can overflow in FP32 before clipping, and BF16 reductions discard
+    small components. The A800 reference instead accumulates the Euclidean norm
+    in FP64, then applies one common coefficient in each gradient's dtype.
+    """
+
+    entries = [
+        (parameter, parameter.grad)
+        for parameter in parameters
+        if parameter.grad is not None
+    ]
+    if not entries:
+        return torch.zeros((), dtype=torch.float64)
+    device = entries[0][1].device
+    squared_norm = torch.zeros((), dtype=torch.float64, device=device)
+    for _, gradient in entries:
+        values = gradient.coalesce().values() if gradient.is_sparse else gradient
+        squared_norm.add_(values.detach().to(dtype=torch.float64).square().sum())
+    norm = torch.sqrt(squared_norm)
+    coefficient = torch.clamp(
+        norm.new_tensor(maximum_norm) / norm.clamp_min(torch.finfo(norm.dtype).tiny),
+        max=1.0,
+    )
+    for parameter, gradient in entries:
+        if gradient.is_sparse:
+            gradient = gradient.coalesce()
+            parameter.grad = gradient
+            values = gradient.values()
+        else:
+            values = gradient
+        values.mul_(coefficient.to(device=values.device, dtype=values.dtype))
+    return norm
 
 
 def _capture_rng_state(rank: int) -> dict[str, object]:
@@ -801,6 +900,7 @@ class GraftGSTrainer:
                 "VGGT adapter backbone dtype differs from the trainer precision policy"
             )
         self.context = DistributedContext.initialize()
+        assert_local_cuda_allocator_ownership(self.context.device)
         self._seed_everything(config.seed + self.context.rank)
         if config.phase in {
             TrainingPhase.END_TO_END,
@@ -907,18 +1007,27 @@ class GraftGSTrainer:
         a later NCCL operation.
         """
 
+        # Build one asynchronous device indicator first. Converting every
+        # parameter predicate to Python bool would serialize the CUDA stream
+        # hundreds of times per step and materially depress A800 utilization.
+        failure = torch.zeros((), dtype=torch.int64, device=self.context.device)
+        for name, value in tensors.items():
+            inspected = value.coalesce().values() if value.is_sparse else value
+            del name
+            indicator = torch.any(~torch.isfinite(inspected.detach())).to(
+                device=self.context.device,
+                dtype=torch.int64,
+            )
+            failure = torch.maximum(failure, indicator)
+        if self.context.distributed:
+            dist.all_reduce(failure, op=dist.ReduceOp.MAX)
+        if not int(failure.item()):
+            return
         bad = []
         for name, value in tensors.items():
             inspected = value.coalesce().values() if value.is_sparse else value
             if not bool(torch.all(torch.isfinite(inspected.detach()))):
                 bad.append(name)
-        failure = torch.tensor(
-            [int(bool(bad))], dtype=torch.int64, device=self.context.device
-        )
-        if self.context.distributed:
-            dist.all_reduce(failure, op=dist.ReduceOp.MAX)
-        if not int(failure.item()):
-            return
         if self.context.distributed:
             gathered: list[object] = [None for _ in range(self.context.world_size)]
             dist.all_gather_object(
@@ -933,16 +1042,38 @@ class GraftGSTrainer:
 
     def train_step(self, batch: Mapping[str, object], microstep: int = 0) -> dict[str, float]:
         self.model.train()
-        images = torch.as_tensor(batch["images"], device=self.context.device, dtype=torch.float32)
+        # In same-object DDP the collated CPU sample contains the union of all
+        # rank views. Select the deterministic local shard before transferring
+        # tensors, otherwise every process briefly materializes the entire
+        # global image/camera set on its assigned A800.
+        images = torch.as_tensor(batch["images"])
         valid_mask = batch.get("valid_mask")
         if valid_mask is not None:
-            valid_mask = torch.as_tensor(valid_mask, device=self.context.device)
+            valid_mask = torch.as_tensor(valid_mask)
         view_supervision = self._view_supervision(batch)
-        atlas_root_bounds = self._atlas_root_bounds(batch)
-        trellis_prior_seed = self._trellis_prior_seed(batch)
         images, valid_mask, view_supervision = self._shard_object_views(
             images, valid_mask, view_supervision
         )
+        images = images.to(
+            device=self.context.device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
+        if valid_mask is not None:
+            valid_mask = valid_mask.to(
+                device=self.context.device,
+                non_blocking=True,
+            )
+        view_supervision = {
+            name: value.to(
+                device=self.context.device,
+                dtype=torch.float32,
+                non_blocking=True,
+            )
+            for name, value in view_supervision.items()
+        }
+        atlas_root_bounds = self._atlas_root_bounds(batch)
+        trellis_prior_seed = self._trellis_prior_seed(batch)
         robustness = None
         if self.config.phase is TrainingPhase.TOPOLOGY_HARDENING:
             if images.shape[1] > 2:
@@ -1115,11 +1246,10 @@ class GraftGSTrainer:
             }
             self._assert_finite_tensors("optimizer step", named_parameter)
             gradient_norm = float(
-                torch.nn.utils.clip_grad_norm_(
-                    [parameter for parameter in self.module.parameters() if parameter.requires_grad and parameter.grad is not None],
+                _clip_grad_norm_high_precision(
+                    self.trainable_parameters,
                     self.config.maximum_gradient_norm,
-                    error_if_nonfinite=True,
-                )
+                ).cpu()
             )
             self.optimizer.step()
             self._assert_finite_tensors("post-step parameter state", named_parameter)
@@ -1135,7 +1265,16 @@ class GraftGSTrainer:
             self.optimizer.zero_grad(set_to_none=True)
             self.global_step += 1
         elapsed = time.perf_counter() - start
-        peak_memory = torch.cuda.max_memory_allocated(self.context.device) if self.context.device.type == "cuda" else 0
+        if self.context.device.type == "cuda":
+            peak_memory = torch.cuda.max_memory_allocated(self.context.device)
+            peak_reserved_memory = torch.cuda.max_memory_reserved(self.context.device)
+            device_memory = torch.cuda.get_device_properties(
+                self.context.device
+            ).total_memory
+        else:
+            peak_memory = 0
+            peak_reserved_memory = 0
+            device_memory = 0
         metrics = {name: float(value.detach().cpu()) for name, value in terms.items()}
         if output.scenes:
             metrics.update(
@@ -1168,7 +1307,25 @@ class GraftGSTrainer:
                     .cpu()
                 ),
             )
-        metrics.update(total=float(total.detach().cpu()), gradient_norm=gradient_norm, seconds=elapsed, peak_memory_bytes=float(peak_memory))
+        metrics.update(
+            total=float(total.detach().cpu()),
+            gradient_norm=gradient_norm,
+            seconds=elapsed,
+            peak_memory_bytes=float(peak_memory),
+            peak_reserved_memory_bytes=float(peak_reserved_memory),
+            device_memory_bytes=float(device_memory),
+            peak_allocated_fraction=(
+                float(peak_memory / device_memory) if device_memory else 0.0
+            ),
+            peak_reserved_fraction=(
+                float(peak_reserved_memory / device_memory) if device_memory else 0.0
+            ),
+            local_scenes=float(images.shape[0]),
+            local_views=float(images.shape[0] * images.shape[1]),
+            local_views_per_second=float(
+                images.shape[0] * images.shape[1] / max(elapsed, 1.0e-12)
+            ),
+        )
         metrics.update(purification_metrics)
         metrics.update(scale_adversary_metrics)
         if should_step and self.global_step % self.config.log_every == 0:
@@ -1355,16 +1512,34 @@ class GraftGSTrainer:
         totals: dict[str, float] = {}
         count = 0
         for batch in loader:
-            images = torch.as_tensor(batch["images"], device=self.context.device, dtype=torch.float32)
+            images = torch.as_tensor(batch["images"])
             valid_mask = batch.get("valid_mask")
             if valid_mask is not None:
-                valid_mask = torch.as_tensor(valid_mask, device=self.context.device)
+                valid_mask = torch.as_tensor(valid_mask)
             view_supervision = self._view_supervision(batch)
-            atlas_root_bounds = self._atlas_root_bounds(batch)
-            trellis_prior_seed = self._trellis_prior_seed(batch)
             images, valid_mask, view_supervision = self._shard_object_views(
                 images, valid_mask, view_supervision
             )
+            images = images.to(
+                device=self.context.device,
+                dtype=torch.float32,
+                non_blocking=True,
+            )
+            if valid_mask is not None:
+                valid_mask = valid_mask.to(
+                    device=self.context.device,
+                    non_blocking=True,
+                )
+            view_supervision = {
+                name: value.to(
+                    device=self.context.device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                )
+                for name, value in view_supervision.items()
+            }
+            atlas_root_bounds = self._atlas_root_bounds(batch)
+            trellis_prior_seed = self._trellis_prior_seed(batch)
             output = self.model(
                 images,
                 valid_mask=valid_mask,
@@ -1436,7 +1611,7 @@ class GraftGSTrainer:
 
     def _view_supervision(self, batch: Mapping[str, object]) -> dict[str, Tensor]:
         available = {
-            name: torch.as_tensor(batch[name], device=self.context.device, dtype=torch.float32)
+            name: torch.as_tensor(batch[name])
             for name in ("extrinsics_world_to_camera", "intrinsics", "alpha")
             if name in batch and batch[name] is not None
         }
@@ -1452,7 +1627,11 @@ class GraftGSTrainer:
         value = batch.get("atlas_root_bounds")
         if value is None:
             return None
-        bounds = torch.as_tensor(value, device=self.context.device, dtype=torch.float32)
+        bounds = torch.as_tensor(value).to(
+            device=self.context.device,
+            dtype=torch.float32,
+            non_blocking=True,
+        )
         if bounds.ndim == 2:
             bounds = bounds[None]
         if bounds.ndim != 3 or bounds.shape[-2:] != (2, 3):
@@ -1568,34 +1747,71 @@ class GraftGSTrainer:
             dist.all_gather_object(rank_rng_states, local_rng_state)
         else:
             rank_rng_states = [local_rng_state]
-        if self.context.rank != 0:
-            return
-        path = Path(path)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        temporary = path.with_suffix(path.suffix + ".tmp")
-        payload = {
-            "format_version": 6,
-            "global_step": self.global_step,
-            "epoch": self.epoch,
-            "microstep": self.microstep,
-            "batches_consumed_in_epoch": self.batches_consumed_in_epoch,
-            "phase": self.config.phase.value,
-            "model": self.module.state_dict(),
-            "optimizer": self.optimizer.state_dict(),
-            "checkpoint_world_size": self.context.world_size,
-            "rank_rng_states": rank_rng_states,
-            "trainer_config": asdict(self.config),
-            "precision_runtime": self.precision_record,
-            "loss_weights": asdict(self.loss.weights),
-            "model_config": asdict(self.module.config),
-            "gradient_purifier": (
-                self.gradient_purifier.state_dict()
-                if self.gradient_purifier is not None
-                else None
-            ),
-        }
-        torch.save(payload, temporary)
-        os.replace(temporary, path)
+        save_exception: Optional[BaseException] = None
+        save_error: Optional[str] = None
+        if self.context.rank == 0:
+            try:
+                path = Path(path)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                temporary = path.with_suffix(path.suffix + ".tmp")
+                payload = {
+                    "format_version": 6,
+                    "global_step": self.global_step,
+                    "epoch": self.epoch,
+                    "microstep": self.microstep,
+                    "batches_consumed_in_epoch": self.batches_consumed_in_epoch,
+                    "phase": self.config.phase.value,
+                    "model": self.module.state_dict(),
+                    "optimizer": self.optimizer.state_dict(),
+                    "checkpoint_world_size": self.context.world_size,
+                    "rank_rng_states": rank_rng_states,
+                    "trainer_config": asdict(self.config),
+                    "precision_runtime": self.precision_record,
+                    "loss_weights": asdict(self.loss.weights),
+                    "model_config": asdict(self.module.config),
+                    "gradient_purifier": (
+                        self.gradient_purifier.state_dict()
+                        if self.gradient_purifier is not None
+                        else None
+                    ),
+                }
+                torch.save(payload, temporary)
+                os.replace(temporary, path)
+            except BaseException as error:
+                save_exception = error
+                save_error = f"{type(error).__name__}: {error}"
+        if self.context.distributed:
+            # This broadcast is the checkpoint commit fence. No non-source
+            # rank may enter the next forward/NCCL collective until rank zero
+            # has atomically installed the file or reported its failure.
+            failed = torch.tensor(
+                [int(save_error is not None)],
+                dtype=torch.int64,
+                device=self.context.device,
+            )
+            dist.broadcast(failed, src=0)
+            if int(failed.item()):
+                reports: list[object] = [None for _ in range(self.context.world_size)]
+                dist.all_gather_object(
+                    reports,
+                    {"rank": self.context.rank, "checkpoint_error": save_error},
+                )
+                message = next(
+                    (
+                        str(report["checkpoint_error"])
+                        for report in reports
+                        if isinstance(report, Mapping)
+                        and report.get("checkpoint_error") is not None
+                    ),
+                    "unknown rank-zero checkpoint failure",
+                )
+                if save_exception is not None:
+                    raise RuntimeError(
+                        f"distributed checkpoint commit failed: {message}"
+                    ) from save_exception
+                raise RuntimeError(f"distributed checkpoint commit failed: {message}")
+        elif save_exception is not None:
+            raise save_exception
 
     def load_checkpoint(self, path: str | Path) -> None:
         payload = torch.load(path, map_location=self.context.device, weights_only=False)
@@ -1647,6 +1863,7 @@ class GraftGSTrainer:
             resume_policy_fields = (
                 "gradient_accumulation_steps",
                 "maximum_gradient_norm",
+                "find_unused_parameters",
                 "gradient_purification_enabled",
                 "gradient_purification_maximum_views",
                 "gradient_consensus_cosine",
@@ -1664,6 +1881,7 @@ class GraftGSTrainer:
                 "dataset_manifest_schema",
                 "dataset_object_id_catalog_sha256",
                 "dataset_object_id_count",
+                "dataset_maximum_views",
                 "topology_supervision_mode",
                 "minimum_topology_confidence",
                 "teacher_checkpoint",
@@ -1818,6 +2036,8 @@ class GraftGSTrainer:
 
 __all__ = [
     "AtlasDDPSynchronizer",
+    "assert_local_cuda_allocator_ownership",
+    "bind_local_cuda_device",
     "DistributedContext",
     "GraftGSTrainer",
     "TrainerConfig",

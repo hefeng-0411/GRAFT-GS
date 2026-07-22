@@ -131,3 +131,37 @@ checkpoints, data, or a compiled server dependency.
   successful gate must show two finite steps; a failure must now name the
   first non-finite loss/gradient/parameter rather than reaching a corrupted
   second-forward atlas. Do not resume a checkpoint produced by the failed run.
+
+## 2026-07-22 A800 concurrency measurement boundary
+
+- The supplied process table proves the old run had cross-device allocator
+  ownership. Early binding and a hard foreign-device allocator check are now
+  implemented, but one-PID-per-GPU must be confirmed on the server after all
+  old processes have exited. Any ownership exception is a correctness failure,
+  not a reason to disable the guard.
+- The locally selected default is 24 views per ordinary object-level rank. For
+  same-object overfit, 8, 12, and 16 views per rank must be profiled on the
+  actual visible subset. Choose the highest measured global useful views/s
+  that preserves finite steps and leaves at least phase/object-dependent
+  headroom; 100% reserved memory is not a completion criterion. Phase D/F and
+  highly refined objects can peak above the two-step Phase-B fixture.
+
+## 2026-07-22 strict topology/UOT rerun boundary
+
+- The supplied smoke is pre-repair evidence: it used an older entry point
+  (`find_unused_parameters=True`, all-rank final evaluation) and failed on a
+  real `8.60e-5 < 1.0e-4` embedding separation. The current source adds strict
+  restoration, rank-zero evaluation, FP64 gradient norm accumulation, and a
+  collective checkpoint commit fence. These changes must be deployed together;
+  no checkpoint from the failed run is a validated result.
+- The synthetic restoration/gradient test and sparse UOT forward/adjoint
+  failure tests require PyTorch and are not executable in the local drafting
+  runtime. Run the focused command in `A800_VALIDATION_PROTOCOL.md`, then rerun
+  the two-step checkpoint-backed smoke. A pass requires positive final area,
+  orientation, separation, and covariance margins on the recertifying
+  projector, two finite optimizer steps, a committed checkpoint, and clean
+  rank-zero-only asset evaluation.
+- If restoration reports constraint-qualification failure or exhausts the
+  configured displacement budget, this is an invalid proposed embedding, not
+  permission to reduce `minimum_separation`. Retain the complete candidate
+  failure string for topology-proposal diagnosis.

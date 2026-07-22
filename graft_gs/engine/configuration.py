@@ -24,12 +24,14 @@ def load_server_config(
     training = data.get("training", {})
     distributed = data.get("distributed", {})
     dataset = data.get("dataset", {})
+    barrier = data.get("barrier", {})
     for name, value in (
         ("model", model),
         ("transport", transport),
         ("training", training),
         ("distributed", distributed),
         ("dataset", dataset),
+        ("barrier", barrier),
     ):
         if not isinstance(value, dict):
             raise ValueError(f"configuration section {name!r} must be a mapping")
@@ -40,6 +42,31 @@ def load_server_config(
         tau_target=float(transport.get("tau_target", base.mapping.sinkhorn.tau_target)),
         max_iterations=int(transport.get("max_iterations", base.mapping.sinkhorn.max_iterations)),
         tolerance=float(transport.get("tolerance", base.mapping.sinkhorn.tolerance)),
+        backward_max_iterations=int(
+            transport.get(
+                "backward_max_iterations",
+                base.mapping.sinkhorn.backward_max_iterations,
+            )
+        ),
+        backward_tolerance=float(
+            transport.get(
+                "backward_tolerance", base.mapping.sinkhorn.backward_tolerance
+            )
+        ),
+        backward_damping=float(
+            transport.get(
+                "backward_damping", base.mapping.sinkhorn.backward_damping
+            )
+        ),
+        mass_floor=float(
+            transport.get("mass_floor", base.mapping.sinkhorn.mass_floor)
+        ),
+        convergence_check_interval=int(
+            transport.get(
+                "convergence_check_interval",
+                base.mapping.sinkhorn.convergence_check_interval,
+            )
+        ),
     )
     config = replace(
         base,
@@ -85,6 +112,73 @@ def load_server_config(
             base.flow,
             layers=int(model.get("flow_layers", base.flow.layers)),
             steps=int(model.get("flow_steps", base.flow.steps)),
+        ),
+        barrier=replace(
+            base.barrier,
+            minimum_face_area=float(
+                barrier.get("minimum_face_area", base.barrier.minimum_face_area)
+            ),
+            minimum_orientation_cosine=float(
+                barrier.get(
+                    "minimum_orientation_cosine",
+                    base.barrier.minimum_orientation_cosine,
+                )
+            ),
+            minimum_separation=float(
+                barrier.get("minimum_separation", base.barrier.minimum_separation)
+            ),
+            minimum_covariance_eigenvalue=float(
+                barrier.get(
+                    "minimum_covariance_eigenvalue",
+                    base.barrier.minimum_covariance_eigenvalue,
+                )
+            ),
+            maximum_covariance_eigenvalue=float(
+                barrier.get(
+                    "maximum_covariance_eigenvalue",
+                    base.barrier.maximum_covariance_eigenvalue,
+                )
+            ),
+            activation_margin=float(
+                barrier.get("activation_margin", base.barrier.activation_margin)
+            ),
+            decay_rate=float(barrier.get("decay_rate", base.barrier.decay_rate)),
+            dual_iterations=int(
+                barrier.get("dual_iterations", base.barrier.dual_iterations)
+            ),
+            dual_tolerance=float(
+                barrier.get("dual_tolerance", base.barrier.dual_tolerance)
+            ),
+            dual_regularization=float(
+                barrier.get("dual_regularization", base.barrier.dual_regularization)
+            ),
+            dual_check_interval=int(
+                barrier.get(
+                    "dual_check_interval", base.barrier.dual_check_interval
+                )
+            ),
+            maximum_backtracks=int(
+                barrier.get("maximum_backtracks", base.barrier.maximum_backtracks)
+            ),
+            backtrack_factor=float(
+                barrier.get("backtrack_factor", base.barrier.backtrack_factor)
+            ),
+            maximum_position_speed=float(
+                barrier.get(
+                    "maximum_position_speed", base.barrier.maximum_position_speed
+                )
+            ),
+            restoration_iterations=int(
+                barrier.get(
+                    "restoration_iterations", base.barrier.restoration_iterations
+                )
+            ),
+            restoration_relative_margin=float(
+                barrier.get(
+                    "restoration_relative_margin",
+                    base.barrier.restoration_relative_margin,
+                )
+            ),
         ),
         encoder_layers=int(model.get("encoder_layers", base.encoder_layers)),
         transport_feature_iterations=int(

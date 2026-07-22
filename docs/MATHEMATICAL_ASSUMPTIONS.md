@@ -301,3 +301,25 @@
   and after Adam. Gradient clipping is not a recovery operator for NaN/Inf.
   The collective finite gate deliberately aborts all ranks before mutation;
   it never clamps, replaces, or silently skips a non-finite scientific state.
+- Single-node DDP assumes `torchrun` assigns one process to each logical device
+  exposed by `CUDA_VISIBLE_DEVICES`, so local rank is a valid CUDA index. A rank
+  must own no allocator state on its siblings. More views per rank increase
+  distinct geometric evidence but do not monotonically improve examples per
+  second; the operational choice is therefore empirical and phase-specific.
+  Peak reservation should retain headroom for object-dependent octree and UOT
+  growth. Occupying all 80 GiB is neither a loss term nor a quality guarantee.
+- Pre-flow embedding restoration assumes the active hard constraints satisfy a
+  local constraint qualification: their normalized Jacobian must contain a
+  separating direction inside the configured cumulative displacement budget.
+  The active collision/closest-feature set is discrete, so differentiability
+  is conditional on that set remaining fixed. Exact degenerate intersections
+  may have a zero squared-distance gradient and are rejected if the sequential
+  QP cannot reduce violation; no feasibility guarantee is claimed in that
+  case. The fixed broad phase remains complete because every restored vertex
+  stays within `maximum_position_speed` of its transported input.
+- Sparse implicit UOT assumes positive finite relaxation scales and a support
+  covering every source and target node. Zero input mass is represented only
+  through the declared `mass_floor`; if exponentiation removes all transported
+  mass from a supported row or column, the solve aborts. Implicit gradients are
+  valid only after both the primal fixed-point and transposed fixed-point
+  equations meet their recorded scale-relative tolerances.

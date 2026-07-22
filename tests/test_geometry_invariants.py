@@ -435,6 +435,59 @@ class TopologyAndManifoldTest(unittest.TestCase):
             -10.0 * config.dual_tolerance,
         )
 
+    def test_metric_minimal_restoration_enters_strict_feasible_set(self) -> None:
+        dtype = torch.float64
+        separation = 8.6e-5
+        position = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [0.2, 0.0, 0.0],
+                [0.0, 0.2, 0.0],
+                [0.0, 0.0, separation],
+                [0.2, 0.0, separation],
+                [0.0, 0.2, separation],
+            ],
+            dtype=dtype,
+            requires_grad=True,
+        )
+        complex_ = SimplicialComplex(
+            torch.arange(6),
+            torch.tensor(
+                [[0, 1], [1, 2], [0, 2], [3, 4], [4, 5], [3, 5]],
+                dtype=torch.int64,
+            ),
+            torch.tensor([[0, 1, 2], [3, 5, 4]], dtype=torch.int64),
+        )
+        state = ManifoldState(
+            position=position,
+            rotation=torch.eye(3, dtype=dtype).expand(6, -1, -1).clone(),
+            covariance=0.1 * torch.eye(3, dtype=dtype).expand(6, -1, -1).clone(),
+            opacity_logit=torch.zeros(6, 1, dtype=dtype),
+            appearance=torch.zeros(6, 48, dtype=dtype),
+            latent=torch.zeros(6, 128, dtype=dtype),
+            evidence_metric=torch.eye(3, dtype=dtype).expand(6, -1, -1).clone(),
+            complex=complex_,
+        )
+        config = BarrierConfig(
+            minimum_separation=1.0e-4,
+            maximum_position_speed=1.0e-3,
+        )
+        projector = BarrierProjector(state, config)
+        initial = projector.report(state)
+        self.assertFalse(initial.feasible)
+        self.assertLess(initial.minimum_separation_margin, 0.0)
+        restored, report = projector.restore_feasible_embedding(state)
+        self.assertTrue(report.feasible)
+        self.assertGreater(report.minimum_separation_margin, 0.0)
+        self.assertGreater(report.restoration_iterations, 0)
+        self.assertLessEqual(
+            report.restoration_maximum_displacement,
+            config.maximum_position_speed + 1.0e-12,
+        )
+        restored.position.square().sum().backward()
+        self.assertIsNotNone(position.grad)
+        self.assertTrue(torch.all(torch.isfinite(position.grad)))
+
     def test_triangle_collision_distance_detects_face_crossing(self) -> None:
         dtype = torch.float64
         left = torch.tensor(

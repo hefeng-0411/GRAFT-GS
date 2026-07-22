@@ -218,3 +218,25 @@
     losses, gradients, parameters, and Adam state, then aborts before mutation
     with rank/name provenance. This favors scientific diagnosability over a
     silent skip or zero replacement.
+39. **A800 concurrency is evidence-bearing, not artificial occupancy.** The
+    specification targets six A800s but runtime availability is scheduler
+    dependent. The launcher uses one rank per dynamically visible GPU. It
+    increases memory/compute through independent object samples or additional
+    multiview evidence, never through multiple ranks per GPU or dummy buffers.
+    Same-object global views are CPU-sharded before transfer, and final export
+    uses a separate deterministic rank-zero view cap.
+40. **An infeasible transported topology receives hard pre-flow restoration.**
+    The specification requires topology selection before continuous refinement
+    and assumes the selected embedding is feasible, but a real run produced a
+    small genuine collision-margin violation. The implementation inserts a
+    metric-minimal sequential QP between discrete selection and flow, preserves
+    every configured hard threshold, bounds displacement, and accepts only an
+    independently recertified strict interior state. This is initialization of
+    a stratum, not a claim that an infeasible input was connected by a
+    topology-preserving isotopy.
+41. **Implicit transport convergence is an executable precondition.** The
+    Markdown describes an implicit sparse Sinkhorn solve but does not prescribe
+    failure semantics. Production now rejects unconverged primal or adjoint
+    equations, non-finite plans/gradients, invalid measure domains, and complete
+    supported-node mass underflow. It does not train on a last iterate while
+    labeling it converged.

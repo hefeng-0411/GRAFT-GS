@@ -511,9 +511,47 @@ class GraftGS(nn.Module):
             )
             projector = BarrierProjector(state, self.config.barrier)
             report = projector.report(state)
-            if report.feasible:
-                return topology, state, projector, report
-            failures.append(f"{topology.selected.identifier}: {report}")
+            if not report.feasible:
+                try:
+                    state, restoration_report = projector.restore_feasible_embedding(state)
+                    projector = BarrierProjector(state, self.config.barrier)
+                    report = projector.report(state)
+                    # The rebuilt projector defines the reference orientation
+                    # and broad phase used by flow. Retain the conservative
+                    # minimum from the restoration projector as evidence that
+                    # initialization also preserved the transported face
+                    # orientation rather than recertifying only against itself.
+                    for field_name in (
+                        "minimum_area_margin",
+                        "minimum_orientation_margin",
+                        "minimum_separation_margin",
+                        "minimum_covariance_margin",
+                        "maximum_covariance_margin",
+                    ):
+                        setattr(
+                            report,
+                            field_name,
+                            min(
+                                getattr(report, field_name),
+                                getattr(restoration_report, field_name),
+                            ),
+                        )
+                    report.feasible = report.feasible and restoration_report.feasible
+                    report.restoration_iterations = restoration_report.restoration_iterations
+                    report.restoration_maximum_displacement = (
+                        restoration_report.restoration_maximum_displacement
+                    )
+                except RuntimeError as error:
+                    failures.append(
+                        f"{topology.selected.identifier}: {report}; restoration={error}"
+                    )
+                    continue
+            if not report.feasible:
+                failures.append(
+                    f"{topology.selected.identifier}: restoration returned a non-feasible state: {report}"
+                )
+                continue
+            return topology, state, projector, report
         raise RuntimeError(
             "no proposed topology stratum has a strictly feasible transported embedding: "
             + "; ".join(failures)

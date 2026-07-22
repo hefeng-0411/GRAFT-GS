@@ -19,7 +19,7 @@ the implicit solve are expected to run in FP32 or FP64 on the target server.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from math import log, sqrt
+from math import isfinite, log, sqrt
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
@@ -155,12 +155,19 @@ class ImplicitSinkhornConfig:
     backward_tolerance: float = 1.0e-8
     backward_damping: float = 0.8
     mass_floor: float = 1.0e-12
+    convergence_check_interval: int = 8
 
     def __post_init__(self) -> None:
         if self.epsilon <= 0 or self.tau_source <= 0 or self.tau_target <= 0:
             raise ValueError("epsilon and both marginal relaxation parameters must be positive")
         if not 0 < self.backward_damping <= 1:
             raise ValueError("backward_damping must lie in (0, 1]")
+        if self.max_iterations < 1 or self.backward_max_iterations < 1:
+            raise ValueError("forward and backward Sinkhorn iterations must be positive")
+        if self.tolerance <= 0 or self.backward_tolerance <= 0 or self.mass_floor <= 0:
+            raise ValueError("Sinkhorn tolerances and mass floor must be positive")
+        if self.convergence_check_interval < 1:
+            raise ValueError("convergence_check_interval must be positive")
 
 
 @dataclass(frozen=True)
@@ -217,6 +224,8 @@ class SinkhornDiagnostics:
     source_transport_mass: Tensor
     target_transport_mass: Tensor
     objective: Tensor
+    converged: bool = True
+    effective_tolerance: float = 0.0
 
 
 @dataclass
@@ -390,7 +399,8 @@ def _sinkhorn_fixed_point(
     rho_target: float,
     max_iterations: int,
     tolerance: float,
-) -> Tuple[Tensor, Tensor, Tensor, int, float]:
+    convergence_check_interval: int,
+) -> Tuple[Tensor, Tensor, Tensor, int, float, float]:
     """Solve generalized Sinkhorn scaling on an arbitrary sparse support."""
 
     n, m = log_source_mass.numel(), log_target_mass.numel()
@@ -398,23 +408,48 @@ def _sinkhorn_fixed_point(
     log_u = torch.zeros_like(log_source_mass)
     log_v = torch.zeros_like(log_target_mass)
     residual = float("inf")
+    effective_tolerance = float("inf")
     iterations = max_iterations
     for iteration in range(max_iterations):
         row_lse = _segment_logsumexp(log_kernel + log_v[target], source, n)
         new_log_u = rho_source * (log_source_mass - row_lse)
         col_lse = _segment_logsumexp(log_kernel + new_log_u[source], target, m)
         new_log_v = rho_target * (log_target_mass - col_lse)
-        delta_u = torch.max(torch.abs(new_log_u - log_u))
-        delta_v = torch.max(torch.abs(new_log_v - log_v))
-        residual_tensor = torch.maximum(delta_u, delta_v)
+        should_check = (
+            (iteration + 1) % convergence_check_interval == 0
+            or iteration + 1 == max_iterations
+        )
+        if should_check:
+            # Certify the actual coupled fixed-point equations, not merely a
+            # small change between iterates (which damping could manufacture).
+            check_row_lse = _segment_logsumexp(
+                log_kernel + new_log_v[target], source, n
+            )
+            fixed_log_u = rho_source * (log_source_mass - check_row_lse)
+            check_col_lse = _segment_logsumexp(
+                log_kernel + new_log_u[source], target, m
+            )
+            fixed_log_v = rho_target * (log_target_mass - check_col_lse)
+            residual_tensor = torch.maximum(
+                (new_log_u - fixed_log_u).abs().amax(),
+                (new_log_v - fixed_log_v).abs().amax(),
+            )
+            potential_scale = torch.maximum(
+                new_log_u.abs().amax(), new_log_v.abs().amax()
+            )
+            threshold_tensor = tolerance * (1.0 + potential_scale)
         log_u, log_v = new_log_u, new_log_v
-        residual = float(residual_tensor.detach().cpu())
-        if residual < tolerance:
-            iterations = iteration + 1
-            break
+        if should_check:
+            residual = float(residual_tensor.detach().cpu())
+            effective_tolerance = float(threshold_tensor.detach().cpu())
+            if not isfinite(residual):
+                break
+            if residual <= effective_tolerance:
+                iterations = iteration + 1
+                break
     log_plan = log_kernel + log_u[source] + log_v[target]
     plan = torch.exp(log_plan)
-    return plan, log_u, log_v, iterations, residual
+    return plan, log_u, log_v, iterations, residual, effective_tolerance
 
 
 class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
@@ -436,8 +471,9 @@ class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
         backward_max_iterations: int,
         backward_tolerance: float,
         backward_damping: float,
+        convergence_check_interval: int,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        plan, log_u, log_v, iterations, residual = _sinkhorn_fixed_point(
+        plan, log_u, log_v, iterations, residual, effective_tolerance = _sinkhorn_fixed_point(
             cost,
             log_source_mass,
             log_target_mass,
@@ -448,9 +484,22 @@ class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
             rho_target,
             max_iterations,
             tolerance,
+            convergence_check_interval,
         )
+        if not bool(torch.all(torch.isfinite(plan))):
+            raise FloatingPointError("sparse unbalanced Sinkhorn produced a non-finite plan")
+        if residual > effective_tolerance:
+            raise RuntimeError(
+                "sparse unbalanced Sinkhorn did not converge: "
+                f"iterations={iterations}, residual={residual:.6e}, "
+                f"effective_tolerance={effective_tolerance:.6e}"
+            )
         row = _segment_sum(plan, source, log_source_mass.numel())
         col = _segment_sum(plan, target, log_target_mass.numel())
+        if bool(torch.any(row <= 0)) or bool(torch.any(col <= 0)):
+            raise FloatingPointError(
+                "sparse unbalanced Sinkhorn underflow removed all transported mass from a supported node"
+            )
         ctx.save_for_backward(plan, row, col, source, target)
         ctx.epsilon = epsilon
         ctx.rho_source = rho_source
@@ -458,7 +507,10 @@ class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
         ctx.backward_max_iterations = backward_max_iterations
         ctx.backward_tolerance = backward_tolerance
         ctx.backward_damping = backward_damping
-        status = cost.new_tensor((float(iterations), residual))
+        ctx.convergence_check_interval = convergence_check_interval
+        status = cost.new_tensor(
+            (float(iterations), residual, effective_tolerance)
+        )
         ctx.mark_non_differentiable(log_u, log_v, status)
         return plan, log_u, log_v, status
 
@@ -472,7 +524,7 @@ class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
     ) -> Tuple[Optional[Tensor], ...]:
         del grad_log_u, grad_log_v, grad_status
         if grad_plan is None:
-            return (None,) * 13
+            return (None,) * 14
         plan, row, col, source, target = ctx.saved_tensors
         tiny = torch.finfo(plan.dtype).tiny
         row_probability = plan / row[source].clamp_min(tiny)
@@ -487,7 +539,10 @@ class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
         lambda_source = torch.zeros_like(q_source)
         lambda_target = torch.zeros_like(q_target)
         damping = ctx.backward_damping
-        for _ in range(ctx.backward_max_iterations):
+        backward_iterations = ctx.backward_max_iterations
+        backward_residual = float("inf")
+        backward_threshold = float("inf")
+        for iteration in range(ctx.backward_max_iterations):
             candidate_source = q_source - ctx.rho_target * _segment_sum(
                 col_probability * lambda_target[target], source, row.numel()
             )
@@ -496,13 +551,36 @@ class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
                 row_probability * candidate_source[source], target, col.numel()
             )
             candidate_target = (1.0 - damping) * lambda_target + damping * candidate_target
-            residual = torch.maximum(
-                torch.max(torch.abs(candidate_source - lambda_source)),
-                torch.max(torch.abs(candidate_target - lambda_target)),
-            )
             lambda_source, lambda_target = candidate_source, candidate_target
-            if float(residual.detach().cpu()) < ctx.backward_tolerance:
-                break
+            should_check = (
+                (iteration + 1) % ctx.convergence_check_interval == 0
+                or iteration + 1 == ctx.backward_max_iterations
+            )
+            if should_check:
+                equation_source = lambda_source + ctx.rho_target * _segment_sum(
+                    col_probability * lambda_target[target], source, row.numel()
+                ) - q_source
+                equation_target = lambda_target + ctx.rho_source * _segment_sum(
+                    row_probability * lambda_source[source], target, col.numel()
+                ) - q_target
+                residual = torch.maximum(
+                    equation_source.abs().amax(), equation_target.abs().amax()
+                )
+                rhs_scale = torch.maximum(q_source.abs().amax(), q_target.abs().amax())
+                threshold = ctx.backward_tolerance * (1.0 + rhs_scale)
+                backward_residual = float(residual.detach().cpu())
+                backward_threshold = float(threshold.detach().cpu())
+                if not isfinite(backward_residual):
+                    break
+                if backward_residual <= backward_threshold:
+                    backward_iterations = iteration + 1
+                    break
+        if backward_residual > backward_threshold:
+            raise RuntimeError(
+                "implicit Sinkhorn adjoint did not converge: "
+                f"iterations={backward_iterations}, residual={backward_residual:.6e}, "
+                f"effective_tolerance={backward_threshold:.6e}"
+            )
 
         epsilon = ctx.epsilon
         grad_cost = -weighted_gradient / epsilon
@@ -518,10 +596,18 @@ class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
         grad_log_target = direct_target - ctx.rho_source * _segment_sum(
             row_probability * lambda_source[source], target, col.numel()
         )
+        gradients_finite = (
+            torch.all(torch.isfinite(grad_cost))
+            & torch.all(torch.isfinite(grad_log_source))
+            & torch.all(torch.isfinite(grad_log_target))
+        )
+        if not bool(gradients_finite):
+            raise FloatingPointError("implicit Sinkhorn adjoint produced non-finite gradients")
         return (
             grad_cost,
             grad_log_source,
             grad_log_target,
+            None,
             None,
             None,
             None,
@@ -549,11 +635,45 @@ class ImplicitUnbalancedSinkhorn(nn.Module):
         target_mass: Tensor,
         edge_index: Tensor,
     ) -> Tuple[Tensor, SinkhornDiagnostics]:
+        if edge_index.ndim != 2 or tuple(edge_index.shape[:1]) != (2,):
+            raise ValueError("edge_index must have shape [2,E]")
         source, target = edge_index
         if cost.ndim != 1 or cost.shape[0] != source.shape[0]:
             raise ValueError("cost must have one scalar per sparse edge")
         if source.numel() == 0:
             raise ValueError("Sinkhorn support cannot be empty")
+        if edge_index.dtype != torch.int64:
+            raise ValueError("Sinkhorn sparse indices must use int64")
+        if cost.dtype not in {torch.float32, torch.float64}:
+            raise ValueError("Sinkhorn reference solve requires float32 or float64 cost")
+        if source_mass.dtype != cost.dtype or target_mass.dtype != cost.dtype:
+            raise ValueError("Sinkhorn cost and marginal masses must share a floating dtype")
+        if (
+            source.device != cost.device
+            or target.device != cost.device
+            or source_mass.device != cost.device
+            or target_mass.device != cost.device
+        ):
+            raise ValueError("Sinkhorn costs, masses, and sparse support must share a device")
+        if source_mass.ndim != 1 or target_mass.ndim != 1:
+            raise ValueError("Sinkhorn marginal masses must be one-dimensional")
+        inputs_finite = (
+            torch.all(torch.isfinite(cost))
+            & torch.all(torch.isfinite(source_mass))
+            & torch.all(torch.isfinite(target_mass))
+        )
+        if not bool(inputs_finite):
+            raise ValueError("Sinkhorn cost and marginal masses must be finite")
+        if bool(torch.any(cost < 0)):
+            raise ValueError("GRAFT-GS transport costs must be non-negative")
+        if bool(torch.any(source_mass < 0)) or bool(torch.any(target_mass < 0)):
+            raise ValueError("Sinkhorn marginal masses must be non-negative")
+        if not bool(torch.any(source_mass > 0)) or not bool(torch.any(target_mass > 0)):
+            raise ValueError("each Sinkhorn marginal measure must contain positive mass")
+        if int(source.amin()) != 0 or int(source.amax()) != source_mass.numel() - 1:
+            raise ValueError("source support indices must cover exactly [0,N)")
+        if int(target.amin()) != 0 or int(target.amax()) != target_mass.numel() - 1:
+            raise ValueError("target support indices must cover exactly [0,M)")
         if torch.unique(source).numel() != source_mass.numel():
             raise ValueError("every source node must have at least one transport edge")
         if torch.unique(target).numel() != target_mass.numel():
@@ -577,6 +697,7 @@ class ImplicitUnbalancedSinkhorn(nn.Module):
             cfg.backward_max_iterations,
             cfg.backward_tolerance,
             cfg.backward_damping,
+            cfg.convergence_check_interval,
         )
         row = _segment_sum(plan, source, source_mass.numel())
         col = _segment_sum(plan, target, target_mass.numel())
@@ -591,6 +712,8 @@ class ImplicitUnbalancedSinkhorn(nn.Module):
             source_transport_mass=row,
             target_transport_mass=col,
             objective=objective,
+            converged=True,
+            effective_tolerance=float(status[2].item()),
         )
         return plan, diagnostics
 
@@ -895,9 +1018,17 @@ class TransportCost(nn.Module):
         source, target = graph.source, graph.target
         nodes = graph.atlas_node_index[source]
         delta = atlas.chart_centers[nodes] - evidence.positions[target]
-        covariance = 0.5 * (evidence.covariance[target] + evidence.covariance[target].transpose(-1, -2))
-        precision = torch.linalg.inv(covariance)
-        mahalanobis = torch.einsum("ei,eij,ej->e", delta, precision, delta)
+        covariance = 0.5 * (
+            evidence.covariance[target]
+            + evidence.covariance[target].transpose(-1, -2)
+        )
+        # Cholesky whitening evaluates delta^T Sigma^-1 delta without forming
+        # an explicit inverse and remains non-negative by construction.
+        covariance_factor = torch.linalg.cholesky(covariance)
+        whitened = torch.linalg.solve_triangular(
+            covariance_factor, delta.unsqueeze(-1), upper=False
+        ).squeeze(-1)
+        mahalanobis = whitened.square().sum(-1)
         ray = evidence.rays[target]
         axial = torch.sum(ray * delta, dim=-1)
         perpendicular = delta - axial[:, None] * ray
@@ -909,7 +1040,8 @@ class TransportCost(nn.Module):
                 raise ValueError("atlas_features must have one row per active source chart")
             image_feature = F.normalize(self.feature_projection(evidence.features[target]), dim=-1)
             chart_feature = F.normalize(atlas_features[source], dim=-1)
-            feature_distance = 1.0 - torch.sum(image_feature * chart_feature, dim=-1)
+            cosine = torch.sum(image_feature * chart_feature, dim=-1).clamp(-1.0, 1.0)
+            feature_distance = 1.0 - cosine
         if visibility_barrier is None:
             # The particle is an observed first surface along its camera ray.
             # A chart substantially *behind* it should not consume that target
@@ -925,6 +1057,10 @@ class TransportCost(nn.Module):
         else:
             if visibility_barrier.shape != mahalanobis.shape:
                 raise ValueError("visibility_barrier must have one value per transport edge")
+            if not bool(torch.all(torch.isfinite(visibility_barrier))) or bool(
+                torch.any(visibility_barrier < 0)
+            ):
+                raise ValueError("visibility_barrier must be finite and non-negative")
             visibility = visibility_barrier
         return (
             self._positive(self.raw_lambda_x) * mahalanobis
@@ -1000,8 +1136,11 @@ class GaugeCovariantChartWriter(nn.Module):
             conditional_centers - chart_center
         )
 
-        covariance = 0.5 * (evidence.covariance[target] + evidence.covariance[target].transpose(-1, -2))
-        precision = torch.linalg.inv(covariance)
+        covariance = 0.5 * (
+            evidence.covariance[target]
+            + evidence.covariance[target].transpose(-1, -2)
+        )
+        precision = torch.cholesky_inverse(torch.linalg.cholesky(covariance))
         conditional_metric = _segment_sum(
             plan[:, None, None] * precision, source, count
         ) / denominator[:, None, None]

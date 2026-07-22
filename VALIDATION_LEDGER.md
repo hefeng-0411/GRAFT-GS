@@ -363,3 +363,53 @@ space left on device` under the Windows temporary directory. These are not
 recorded as code failures or passes. No cache or artifact cleanup was performed.
 The non-writing 31-test gate was then rerun with
 `PYTHONDONTWRITEBYTECODE=1` and passed 31/31.
+
+A800 concurrency/ownership repair (2026-07-22): the supplied `nvidia-smi`
+table is retained as pre-repair evidence that PID 2518319 owned about 5.8 GiB
+on GPU 2 and 14.5 GiB on GPU 3. Root cause was checkpoint construction before
+rank-local CUDA binding in the one-object entry point. Early binding, a hard
+foreign-allocator guard, CPU-before-CUDA view sharding, configurable view
+budgets, and per-rank throughput/memory telemetry are implemented. Whole-tree
+in-memory source compilation passed for 65 Python files. The exact-environment
+plus scientific static gate passed 32/32. The two new mocked allocator-ownership tests and real
+one-PID-per-GPU behavior require the pinned Torch 2.4 A800 environment and are
+not claimed locally. Their targeted local invocation failed during test-module
+import with `ModuleNotFoundError: No module named 'torch'`; no test body ran and
+this is recorded as unavailable, not failed model behavior. The server must
+next run the 8/12/16 views-per-rank sweep,
+retain `rank_performance`, and select by measured views/s subject to finite
+loss/gradient state and memory headroom; no occupancy or speedup is fabricated.
+The final call-site trace found and repaired the validation loop's transitional
+CPU-camera/GPU-image mismatch; both training and validation now shard first and
+move all view-aligned tensors together. The 65-file compile and 32-test static
+gate were rerun after that repair and passed unchanged.
+
+Strict stratum/UOT numerical repair cycle (2026-07-22): the next supplied
+two-rank A800 smoke completed training/checkpoint work and failed only in the
+old all-rank final evaluation path because the selected transported embedding
+had separation margin `-2.605944407442015e-09` (`d ~= 8.60e-5` for configured
+`d_min=1.0e-4`). This is retained as a genuine pre-repair feasibility failure.
+The repair does not loosen `d_min`: it defines metric-minimal pre-flow
+restoration, displacement-bounded broad-phase completeness, and independent
+FP64 strict recertification. A synthetic two-sheet numerical test checks that
+the same `8.6e-5` defect becomes strictly feasible with finite gradient.
+
+The sparse implicit solver now has executable failure tests for forward
+non-convergence, adjoint non-convergence, negative measures, supported-node
+mass underflow, and non-finite gradients, in addition to dense agreement and
+gradcheck. Whole-tree in-memory compilation passed for 65 Python files. The
+exact-environment plus scientific production-path gate passed 33/33 after the
+change. The local runtime has no PyTorch, so none of the new numerical tests is
+claimed locally; the focused Torch 2.4 CPU/A800 command and corrected two-rank
+checkpoint-backed smoke remain server-ready and unexecuted.
+
+After adding overfit certificate telemetry, in-memory compilation again passed
+all 65 Python files and the same non-writing gate passed 33/33. The nine-test
+MeshFleet static suite was also attempted: seven read-only tests passed, while
+the two deterministic manifest writers could not start because the Windows
+temporary volume returned `OSError: [Errno 28] No space left on device`. This
+matches the previously recorded external local-storage condition; it is not
+counted as a manifest pass or a source regression, and no cache was deleted.
+After the barrier synchronization consolidation and stable Cholesky transport-
+cost solve, the 65-file in-memory compile and 33-test non-writing gate passed
+again. Numerical equivalence and throughput impact remain A800-pending.

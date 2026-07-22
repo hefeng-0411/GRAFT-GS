@@ -15,6 +15,9 @@ from graft_gs.engine.trainer import (
     AtlasDDPSynchronizer,
     DistributedContext,
     GraftGSTrainer,
+    assert_local_cuda_allocator_ownership,
+    bind_local_cuda_device,
+    _clip_grad_norm_high_precision,
     _broadcast_discrete_exact,
     _capture_rng_state,
     _restore_rng_state,
@@ -25,6 +28,68 @@ from graft_gs.integration.trellis_prior import TrellisPriorMeasure
 
 
 class AtlasSynchronizationTransportTest(unittest.TestCase):
+    def test_high_precision_gradient_norm_does_not_overflow_before_clipping(self) -> None:
+        parameter = torch.nn.Parameter(torch.zeros(2, dtype=torch.float32))
+        original = torch.tensor([3.0e20, 4.0e20], dtype=torch.float32)
+        parameter.grad = original.clone()
+        expected = torch.linalg.vector_norm(original.to(torch.float64))
+        observed = _clip_grad_norm_high_precision((parameter,), 1.0)
+        torch.testing.assert_close(observed, expected, atol=0.0, rtol=1.0e-12)
+        self.assertTrue(torch.isfinite(parameter.grad).all())
+        torch.testing.assert_close(
+            torch.linalg.vector_norm(parameter.grad.to(torch.float64)),
+            torch.tensor(1.0, dtype=torch.float64),
+            atol=1.0e-6,
+            rtol=1.0e-6,
+        )
+
+    def test_local_rank_is_bound_before_checkpoint_allocation(self) -> None:
+        with (
+            mock.patch("graft_gs.engine.trainer.torch.cuda.is_available", return_value=True),
+            mock.patch("graft_gs.engine.trainer.torch.cuda.device_count", return_value=4),
+            mock.patch("graft_gs.engine.trainer.torch.cuda.set_device") as set_device,
+            mock.patch.dict(os.environ, {"LOCAL_RANK": "2"}),
+        ):
+            device = bind_local_cuda_device(require_cuda=True)
+        self.assertEqual(device, torch.device("cuda", 2))
+        set_device.assert_called_once_with(2)
+
+    def test_invalid_local_rank_is_rejected_before_cuda_allocation(self) -> None:
+        with (
+            mock.patch("graft_gs.engine.trainer.torch.cuda.is_available", return_value=True),
+            mock.patch("graft_gs.engine.trainer.torch.cuda.device_count", return_value=2),
+            mock.patch("graft_gs.engine.trainer.torch.cuda.set_device") as set_device,
+            mock.patch.dict(os.environ, {"LOCAL_RANK": "3"}),
+            self.assertRaisesRegex(RuntimeError, "outside the 2 devices"),
+        ):
+            bind_local_cuda_device(require_cuda=True)
+        set_device.assert_not_called()
+
+    def test_local_rank_rejects_foreign_cuda_allocator_reservation(self) -> None:
+        allocated = {0: 0, 1: 1024, 2: 0}
+        reserved = {0: 0, 1: 4096, 2: 0}
+        with (
+            mock.patch("graft_gs.engine.trainer.torch.cuda.device_count", return_value=3),
+            mock.patch(
+                "graft_gs.engine.trainer.torch.cuda.memory_allocated",
+                side_effect=lambda index: allocated[index],
+            ),
+            mock.patch(
+                "graft_gs.engine.trainer.torch.cuda.memory_reserved",
+                side_effect=lambda index: reserved[index],
+            ),
+            self.assertRaisesRegex(RuntimeError, "non-local devices"),
+        ):
+            assert_local_cuda_allocator_ownership(torch.device("cuda", 2))
+
+    def test_local_rank_accepts_exclusively_local_cuda_allocator_state(self) -> None:
+        with (
+            mock.patch("graft_gs.engine.trainer.torch.cuda.device_count", return_value=3),
+            mock.patch("graft_gs.engine.trainer.torch.cuda.memory_allocated", return_value=0),
+            mock.patch("graft_gs.engine.trainer.torch.cuda.memory_reserved", return_value=0),
+        ):
+            assert_local_cuda_allocator_ownership(torch.device("cuda", 2))
+
     def test_nonfinite_gradient_guard_fails_before_optimizer_step(self) -> None:
         trainer = object.__new__(GraftGSTrainer)
         trainer.context = DistributedContext(

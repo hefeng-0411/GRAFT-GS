@@ -2,6 +2,8 @@
 
 from .trainer import (
     AtlasDDPSynchronizer,
+    assert_local_cuda_allocator_ownership,
+    bind_local_cuda_device,
     GraftGSTrainer,
     TrainerConfig,
     TrainingPhase,
@@ -31,6 +33,8 @@ from .teacher_refinement import (
 
 __all__ = [
     "AtlasDDPSynchronizer",
+    "assert_local_cuda_allocator_ownership",
+    "bind_local_cuda_device",
     "CheckpointLoadReport",
     "GraftGSTrainer",
     "SurfaceTargetConfig",

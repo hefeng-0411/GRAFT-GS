@@ -8,6 +8,10 @@ precision:
 distributed:
   backend: nccl
   synchronize_object_atlas: false
+  # Phase-specific trainability makes every selected parameter part of the
+  # graph. Avoid DDP's extra autograd traversal unless a future optional branch
+  # introduces a genuinely unused trainable parameter and its test proves it.
+  find_unused_parameters: false
 dataset:
   input_view_set: renders
   image_size: [518, 518]
@@ -52,9 +56,35 @@ transport:
   tau_target: 0.5
   max_iterations: 300
   tolerance: 1.0e-7
+  backward_max_iterations: 300
+  backward_tolerance: 1.0e-8
+  backward_damping: 0.8
+  mass_floor: 1.0e-12
+  # Avoid a device-to-host stream synchronization on every fixed-point step.
+  # Residual equations are still checked at termination and every 8 steps.
+  convergence_check_interval: 8
   # Conditional chart moments are shrunk toward the persistent chart when
   # retained/source UOT mass is below this dimensionless ratio.
   retention_shrinkage: 0.05
+barrier:
+  minimum_face_area: 1.0e-8
+  minimum_orientation_cosine: 0.1
+  minimum_separation: 1.0e-4
+  minimum_covariance_eigenvalue: 1.0e-8
+  maximum_covariance_eigenvalue: 1.0
+  activation_margin: 1.0e-3
+  decay_rate: 5.0
+  dual_iterations: 96
+  dual_tolerance: 1.0e-7
+  dual_regularization: 1.0e-8
+  dual_check_interval: 8
+  maximum_backtracks: 14
+  backtrack_factor: 0.5
+  maximum_position_speed: 5.0e-2
+  # Pre-flow topology selection may repair a transported embedding, but only
+  # with a metric-minimal hard-constraint QP and strict FP64 recertification.
+  restoration_iterations: 12
+  restoration_relative_margin: 5.0e-2
 trellis_prior:
   enabled_after_phase_a: true
   samples: 8
@@ -66,6 +96,9 @@ training:
   phases: [A, B, C, D, E, F]
   learning_rate: 1.0e-4
   gradient_accumulation_steps: 1
+  # Per-rank host-side concurrency. These do not alter the mathematical batch.
+  dataloader_workers: 8
+  dataloader_prefetch_factor: 4
   maximum_gradient_norm: 1.0
   # Phase F only: exact Gram-space view consensus, augmentation-artifact
   # rejection, and diagonal Fisher clipping. Global topology/barrier gradients
