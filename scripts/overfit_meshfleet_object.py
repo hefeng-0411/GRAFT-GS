@@ -248,6 +248,7 @@ def main() -> None:
     performance_fields = (
         "peak_memory_bytes",
         "peak_reserved_memory_bytes",
+        "device_memory_bytes",
         "peak_allocated_fraction",
         "peak_reserved_fraction",
         "local_views",

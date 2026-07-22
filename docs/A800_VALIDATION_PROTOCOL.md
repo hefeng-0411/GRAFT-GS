@@ -107,22 +107,25 @@ per rank. The global loader admits `views_per_rank * world_size` views, then
 shards the CPU sample before its non-blocking CUDA transfer:
 
 ```bash
-for VIEWS_PER_RANK in 8 12 16; do
-  RUN_DIR="outputs/concurrency/${GRAFT_GS_OBJECT_ID}/vpr-${VIEWS_PER_RANK}"
+set -o pipefail
+for VIEWS_PER_RANK in 16 24 32 48 64; do
+  RUN_DIR="outputs/concurrency/${GRAFT_GS_TRAIN_OBJECT_ID}/vpr-${VIEWS_PER_RANK}"
   mkdir -p "$RUN_DIR"
-  "$GRAFT_GS_PYTHON" -m torch.distributed.run \
+  if ! "$GRAFT_GS_PYTHON" -m torch.distributed.run \
     --standalone --nnodes=1 \
     --nproc-per-node="$GRAFT_GS_NPROC_PER_NODE" \
     scripts/overfit_meshfleet_object.py \
     "$GRAFT_GS_MESHFLEET_ROOT" "$GRAFT_GS_MESHFLEET_MANIFEST" \
-    --split train --object-id "$GRAFT_GS_OBJECT_ID" \
+    --split train --object-id "$GRAFT_GS_TRAIN_OBJECT_ID" \
     --config configs/graft_gs_a800_native.yaml \
     --vggt-checkpoint "$VGGT_CHECKPOINT" \
     --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
     --views-per-rank "$VIEWS_PER_RANK" \
-    --evaluation-views 24 --steps 2 \
+    --evaluation-views 24 --steps 3 \
     --minimum-relative-improvement -1 \
-    --output "$RUN_DIR" 2>&1 | tee "$RUN_DIR/run.log"
+    --output "$RUN_DIR" 2>&1 | tee "$RUN_DIR/run.log"; then
+    echo "candidate $VIEWS_PER_RANK views/rank failed; retained log and continuing" >&2
+  fi
 done
 ```
 
@@ -133,29 +136,29 @@ watch -n 2 'nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory \
   --format=csv,noheader,nounits | sort -k2,2n'
 ```
 
-Inspect measured per-rank records instead of using occupancy as a proxy:
+Select from the measured per-rank records instead of using occupancy as a
+proxy. The selector rejects non-finite loss, unconverged UOT, non-positive hard
+feasibility margins, incomplete rank telemetry, and reserved memory above 85%:
 
 ```bash
-$GRAFT_GS_PYTHON - <<'PY'
-import glob, json
-for path in sorted(glob.glob("outputs/concurrency/*/vpr-*/overfit_metrics.json")):
-    report = json.load(open(path))
-    print(path)
-    for row in report["rank_performance"]:
-        print(
-            " rank", row["rank"], "views", int(row["local_views"]),
-            "views/s", round(row["local_views_per_second"], 3),
-            "allocated", round(row["peak_allocated_fraction"], 3),
-            "reserved", round(row["peak_reserved_fraction"], 3),
-        )
-PY
+"$GRAFT_GS_PYTHON" scripts/select_a800_view_budget.py \
+  "outputs/concurrency/$GRAFT_GS_TRAIN_OBJECT_ID/vpr-*/overfit_metrics.json" \
+  --maximum-reserved-fraction 0.85 \
+  --throughput-fraction 0.97 \
+  --output "outputs/concurrency/$GRAFT_GS_TRAIN_OBJECT_ID/selection.json"
+
+export GRAFT_GS_SELECTED_VIEWS_PER_RANK=$(
+  "$GRAFT_GS_PYTHON" -c \
+  'import json,sys; print(json.load(open(sys.argv[1]))["recommended_views_per_rank"])' \
+  "outputs/concurrency/$GRAFT_GS_TRAIN_OBJECT_ID/selection.json"
+)
+echo "selected useful views per rank: $GRAFT_GS_SELECTED_VIEWS_PER_RANK"
 ```
 
-Select the largest budget that increases aggregate useful views/s, keeps every
-finite-state guard passing, and retains headroom. Initially reject a two-step
-Phase-B setting above 0.85 peak reserved fraction; Phase-D/F refinement peaks
-can be larger. If 16 views/rank remains below 0.70 and improves views/s, repeat
-once with 24. Never reserve dummy memory merely to reach 80 GiB.
+The default 0.97 throughput fraction chooses the largest view count whose
+aggregate useful throughput is within 3% of the fastest admissible run. Never
+reserve dummy memory merely to reach 80 GiB. Repeat the sweep in Phase D before
+full training because flow, rendering, and refined atlases have higher peaks.
 
 For corpus training, use ordinary object-level DDP (omit
 `--same-object-view-shards`). Every visible GPU receives a different complete
@@ -165,7 +168,9 @@ object, while `--maximum-views` controls its local geometric view budget:
 bash scripts/launch_a800_6gpu.sh \
   "$GRAFT_GS_MESHFLEET_ROOT" B 1000 \
   --manifest "$GRAFT_GS_MESHFLEET_MANIFEST" --split train \
-  --maximum-views 24 --dataloader-workers 8 \
+  --maximum-views "$GRAFT_GS_SELECTED_VIEWS_PER_RANK" \
+  --minimum-global-object-batch 6 \
+  --dataloader-workers 8 \
   --dataloader-prefetch-factor 4 \
   --vggt-checkpoint "$VGGT_CHECKPOINT" \
   --trellis-checkpoint "$TRELLIS_CHECKPOINT" \

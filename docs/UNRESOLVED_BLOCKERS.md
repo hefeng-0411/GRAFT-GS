@@ -165,3 +165,19 @@ checkpoints, data, or a compiled server dependency.
   configured displacement budget, this is an invalid proposed embedding, not
   permission to reduce `minimum_separation`. Retain the complete candidate
   failure string for topology-proposal diagnosis.
+
+## 2026-07-22 useful-concurrency measurement boundary
+
+- The 15--16 GiB snapshot is one pre-selection operating point and contains no
+  utilization or views/s trace. Run the protocol's 16/24/32/48/64 view sweep
+  with the current telemetry schema, then retain `selection.json`. The selected
+  value is not A800 validated until every candidate process has exited cleanly
+  and the selector accepts at least one report.
+- Larger 4096/16384 radius-graph chunks require the existing sparse-support and
+  dense/sparse UOT numerical tests under Torch 2.4. If a threshold-boundary
+  fixture differs, retain both supports and revert the chunk sizes rather than
+  redefining equivalence.
+- Phase-B selection does not prove Phase-D/F memory safety. Repeat a shortened
+  sweep after flow/rendering activation; retain at least 15% peak reserved
+  headroom for corpus variation unless measured tail-object profiling supports
+  a different limit.

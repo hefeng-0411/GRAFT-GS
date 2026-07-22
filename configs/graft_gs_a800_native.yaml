@@ -51,6 +51,11 @@ model:
   refinement_rounds: 1
   renderer_backend: cuda
 transport:
+  # A800-native reference chunks reduce Python/kernel-launch overhead without
+  # changing the transport formulation. Support equivalence is conditional on
+  # no distance lying at the radius threshold (a discrete support boundary).
+  atlas_chunk_size: 4096
+  evidence_chunk_size: 16384
   epsilon: 0.03
   tau_source: 0.5
   tau_target: 0.5

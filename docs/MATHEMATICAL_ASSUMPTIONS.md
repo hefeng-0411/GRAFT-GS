@@ -323,3 +323,20 @@
   mass from a supported row or column, the solve aborts. Implicit gradients are
   valid only after both the primal fixed-point and transposed fixed-point
   equations meet their recorded scale-relative tolerances.
+- Transport chunk-size changes preserve the mathematical radius graph provided
+  no computed distance lies exactly on the strict support threshold and no
+  nearest-neighbor tie changes under floating reduction ordering. The A800
+  sweep must rerun sparse-support/plan equivalence before the larger chunks are
+  treated as performance-validated.
+- Sparse support membership is a discrete active-set operation and has no
+  derivative across radius or nearest-neighbor switches. Conditional on a
+  fixed support, cost, plan, chart moments, and evidence coordinates retain
+  their ordinary gradient; suppressing the support-search `cdist` tape removes
+  no mathematically defined gradient used by this architecture.
+- A minimum global object batch is realized as
+  `WORLD_SIZE * ceil(target/WORLD_SIZE)` independent objects. It may exceed the
+  requested minimum when the target is not divisible by the visible rank
+  count. Learning-rate invariance is not inferred from batch scaling; the
+  configured learning rate remains fixed unless an explicit ablation changes
+  it. Same-object multiview sharding does not satisfy this independence
+  assumption and therefore cannot activate the policy.

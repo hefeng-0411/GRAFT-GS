@@ -413,3 +413,18 @@ counted as a manifest pass or a source regression, and no cache was deleted.
 After the barrier synchronization consolidation and stable Cholesky transport-
 cost solve, the 65-file in-memory compile and 33-test non-writing gate passed
 again. Numerical equivalence and throughput impact remain A800-pending.
+
+A800 useful-concurrency selection cycle (2026-07-22): the supplied process
+table reports about 15.1 and 16.1 GiB on two 80-GiB A800s, establishing
+headroom but not an optimal budget. The selector's three PyTorch-independent
+tests pass: it chooses the largest safe near-throughput-optimal candidate and
+rejects an otherwise fast run with excessive memory, unconverged transport, or
+zero separation margin. Whole-tree in-memory compilation passed for 67 Python
+files and the environment/production/selector gate passed 36/36, including the
+empty-constraint `+inf` margin convention. The actual
+16/24/32/48/64 sweep, GPU utilization, global views/s, and selected budget are
+server-pending; no speedup or final occupancy is claimed locally.
+After removing the discrete support-search autograd tape, the 67-file compile
+and 36-test gate passed again. Existing mapping gradient tests exercise the
+selected-edge cost/implicit-plan path on the server; their Torch execution and
+the larger-chunk equivalence measurement remain pending.

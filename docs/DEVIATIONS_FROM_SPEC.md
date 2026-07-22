@@ -240,3 +240,9 @@
     equations, non-finite plans/gradients, invalid measure domains, and complete
     supported-node mass underflow. It does not train on a last iterate while
     labeling it converged.
+42. **A800 occupancy is constrained, not maximized directly.** The specification
+    asks for scalable high-quality training but does not make allocated bytes a
+    scientific objective. GRAFT-GS converts measured headroom into additional
+    physical views and independent accumulated objects. A candidate is selected
+    only after finite-state, UOT, feasibility, throughput, and memory-headroom
+    checks; dummy reservations and multiple ranks per GPU remain prohibited.

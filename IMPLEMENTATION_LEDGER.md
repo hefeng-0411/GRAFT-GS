@@ -714,3 +714,37 @@ The full conditional validity domain is maintained in
   iterations, and the five FP64 nonlinear certificate minima are transferred
   to the host in one operation. Acceptance remains a strict positive-margin
   predicate; the change removes synchronization stalls, not checks.
+
+## 2026-07-22 measured A800 view and object concurrency
+
+- Requirement `A800-USEFUL-CONCURRENCY-02`: a new report-driven selector audits
+  the complete overfit artifact for every candidate view count. It rejects
+  missing/duplicated ranks, non-finite loss, unconverged UOT, non-positive
+  transported row/column mass, non-positive final hard margins, and peak
+  reserved memory above the configured limit. Among runs within 3% of fastest
+  aggregate useful views/s it selects the largest measured per-rank view count,
+  favoring coverage without accepting a large throughput regression.
+- The server protocol now sweeps `16,24,32,48,64` views per rank. This expands
+  the earlier conservative sweep in response to the supplied 15--16 GiB A800
+  occupancy while preserving an 85% reserved-memory ceiling for irregular
+  object/topology peaks. The chosen value is passed explicitly to corpus
+  training and remains checkpoint provenance.
+- Requirement `DDP-DYNAMIC-BATCH-02`: production training accepts a minimum
+  global independent-object batch and derives accumulation as
+  `ceil(target/WORLD_SIZE)`. This preserves statistical batch scale across a
+  scheduler-variable visible GPU subset while maintaining exactly one process
+  per GPU. Same-object view sharding rejects this option because repeated views
+  of one object are not independent object samples.
+- A800 reference transport chunks are raised to 4096 atlas by 16384 evidence
+  rows to reduce Python/kernel-launch overhead. The mathematical support is
+  unchanged away from the discrete radius-threshold boundary; equivalence and
+  throughput remain part of the server sweep.
+- Radius/nearest-neighbor support discovery is explicitly `no_grad`: sparse
+  indices are discrete and cannot carry a derivative, while the subsequent
+  selected-edge cost is evaluated from the original tensors and preserves the
+  conditional transport gradient. This removes a large unusable `cdist` tape
+  before spending memory on additional physical views.
+- Changed production files: `scripts/select_a800_view_budget.py`,
+  `scripts/overfit_meshfleet_object.py`, `scripts/train_a800.py`,
+  `graft_gs/engine/configuration.py`,
+  `graft_gs/mapping/manifold_mapping.py`, and the A800 YAML/protocol.

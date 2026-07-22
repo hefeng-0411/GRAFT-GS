@@ -188,6 +188,8 @@ class ManifoldMappingConfig:
     def __post_init__(self) -> None:
         if self.support_radius_factor <= 0 or self.radial_support_factor <= 0:
             raise ValueError("transport support factors must be positive")
+        if self.atlas_chunk_size < 1 or self.evidence_chunk_size < 1:
+            raise ValueError("transport chunk sizes must be positive")
         if self.metric_epsilon <= 0 or self.metric_normal_weight < 0:
             raise ValueError("metric regularization must be positive/non-negative")
         if self.retention_shrinkage <= 0:
@@ -909,12 +911,19 @@ class GeometricEvidenceBuilder(nn.Module):
         return result
 
 
+@torch.no_grad()
 def build_sparse_transport_graph(
     atlas: PersistentOctreeAtlas,
     evidence: EvidenceParticles,
     config: ManifoldMappingConfig,
 ) -> SparseTransportGraph:
-    """Construct the radius-truncated COO support with coverage fallbacks."""
+    """Construct the discrete radius-truncated support with coverage fallbacks.
+
+    Radius membership and nearest-neighbor identities are discrete. Recording
+    a ``cdist`` autograd tape cannot differentiate those indices and retains a
+    large useless workspace. The selected-edge cost is evaluated afterwards
+    from the original tensors and carries the complete conditional gradient.
+    """
 
     active = atlas.active_indices
     centers = atlas.chart_centers[active]

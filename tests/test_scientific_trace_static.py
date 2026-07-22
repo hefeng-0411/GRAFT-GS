@@ -34,6 +34,17 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("equation_source = lambda_source", mapping)
         self.assertIn("torch.linalg.solve_triangular", mapping)
         self.assertNotIn("precision = torch.linalg.inv(covariance)", mapping)
+        tree = ast.parse(mapping)
+        graph_builder = next(
+            node
+            for node in ast.walk(tree)
+            if isinstance(node, ast.FunctionDef)
+            and node.name == "build_sparse_transport_graph"
+        )
+        self.assertIn(
+            "torch.no_grad()",
+            [ast.unparse(value) for value in graph_builder.decorator_list],
+        )
         self.assertIn("convergence_check_interval", configuration)
         self.assertIn("convergence_check_interval: 8", config)
 
@@ -440,6 +451,13 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn('"initial_feasibility": scene.feasibility_reports[0].__dict__', overfit)
         self.assertIn('"final_feasibility": scene.feasibility_reports[-1].__dict__', overfit)
         self.assertIn('"fixed_point_residual": transport.fixed_point_residual', overfit)
+        selector = source("scripts/select_a800_view_budget.py")
+        protocol = source("docs/A800_VALIDATION_PROTOCOL.md")
+        self.assertIn("maximum_reserved_fraction", selector)
+        self.assertIn("final feasibility certificate is missing", selector)
+        self.assertIn("sparse transport is not certified converged", selector)
+        self.assertIn("16 24 32 48 64", protocol)
+        self.assertIn("select_a800_view_budget.py", protocol)
         self.assertIn("if trainer.context.rank != 0:", overfit)
         self.assertIn('"--maximum-views"', training)
         self.assertIn("dataset_maximum_views=maximum_views", training)
@@ -477,6 +495,8 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("restoration_relative_margin", config)
         self.assertIn("--dataloader-workers", training)
         self.assertIn("dataloader_prefetch_factor", training)
+        self.assertIn("--minimum-global-object-batch", training)
+        self.assertIn("args.minimum_global_object_batch + world_size - 1", training)
         self.assertIn("find_unused_parameters: false", config)
         self.assertIn("dataloader_workers: 8", config)
         self.assertIn("dataloader_prefetch_factor: 4", config)

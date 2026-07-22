@@ -88,6 +88,14 @@ def load_server_config(
         mapping=replace(
             base.mapping,
             sinkhorn=sinkhorn,
+            atlas_chunk_size=int(
+                transport.get("atlas_chunk_size", base.mapping.atlas_chunk_size)
+            ),
+            evidence_chunk_size=int(
+                transport.get(
+                    "evidence_chunk_size", base.mapping.evidence_chunk_size
+                )
+            ),
             retention_shrinkage=float(
                 transport.get("retention_shrinkage", base.mapping.retention_shrinkage)
             ),

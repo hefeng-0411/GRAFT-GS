@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import os
 from pathlib import Path
 
 import torch
@@ -69,12 +70,45 @@ def main() -> None:
     )
     parser.add_argument("--dataloader-workers", type=int)
     parser.add_argument("--dataloader-prefetch-factor", type=int)
+    accumulation = parser.add_mutually_exclusive_group()
+    accumulation.add_argument("--gradient-accumulation-steps", type=int)
+    accumulation.add_argument(
+        "--minimum-global-object-batch",
+        type=int,
+        help=(
+            "choose ceil(target/WORLD_SIZE) accumulation steps for ordinary "
+            "object-level DDP; the realized batch is recorded by world size "
+            "and the checkpointed accumulation count"
+        ),
+    )
     parser.add_argument("--config", type=Path, default=Path("configs/graft_gs_a800_native.yaml"))
     args = parser.parse_args()
     local_device = bind_local_cuda_device(require_cuda=True)
     args.vggt_checkpoint = resolve_vggt_checkpoint(args.vggt_checkpoint)
     phase = TrainingPhase(args.phase)
     model_config, training_config, distributed_config, dataset_config = load_server_config(args.config)
+    world_size = int(os.environ.get("WORLD_SIZE", "1"))
+    if world_size < 1:
+        raise ValueError("WORLD_SIZE must be positive")
+    if args.minimum_global_object_batch is not None:
+        if args.same_object_view_shards:
+            raise ValueError(
+                "--minimum-global-object-batch applies only to independent object-level DDP"
+            )
+        if args.minimum_global_object_batch < 1:
+            raise ValueError("--minimum-global-object-batch must be positive")
+        gradient_accumulation_steps = max(
+            1,
+            (args.minimum_global_object_batch + world_size - 1) // world_size,
+        )
+    else:
+        gradient_accumulation_steps = int(
+            args.gradient_accumulation_steps
+            if args.gradient_accumulation_steps is not None
+            else training_config.get("gradient_accumulation_steps", 1)
+        )
+    if gradient_accumulation_steps < 1:
+        raise ValueError("gradient accumulation steps must be positive")
     maximum_views = int(
         args.maximum_views
         if args.maximum_views is not None
@@ -181,7 +215,7 @@ def main() -> None:
         TrainerConfig(
             phase=phase,
             learning_rate=float(training_config.get("learning_rate", 1.0e-4)),
-            gradient_accumulation_steps=int(training_config.get("gradient_accumulation_steps", 1)),
+            gradient_accumulation_steps=gradient_accumulation_steps,
             maximum_gradient_norm=float(training_config.get("maximum_gradient_norm", 1.0)),
             find_unused_parameters=bool(
                 distributed_config.get("find_unused_parameters", False)
