@@ -106,3 +106,12 @@ checkpoints, data, or a compiled server dependency.
   requirements first. Executing the Bash launcher, NCCL initialization, staged
   backward passes, checkpoint boundaries, runtime, and peak memory remains an
   external scheduler-visible A800 task.
+
+## 2026-07-22 TRELLIS decoded-grid rerun boundary
+
+- The supplied real-checkpoint run established a pre-repair failure:
+  flow-latent resolution 16 was incorrectly applied to decoded coordinates in
+  `[0,63]`. Runtime decoder-shape capture and CPU regression definitions are
+  implemented. The focused CRAFT adapter tests, checkpoint-backed TRELLIS
+  preflight, and one-object DDP overfit must be rerun on the server before the
+  repair is called A800 validated.

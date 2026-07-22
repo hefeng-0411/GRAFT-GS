@@ -156,6 +156,29 @@ depth `atol=rtol=2e-2`, and mean visible normal cosine above `0.9`. It must also
 prove that the loaded extension exposes TRELLIS' `kernel_size` and
 `subpixel_offset` ABI.
 
+## TRELLIS latent/decoded-grid contract
+
+The released structure flow samples a 16-cubed latent, but its decoder emits a
+64-cubed occupancy field. Validate the decoder-observed coordinate contract
+before any overfit or staged run:
+
+```bash
+$GRAFT_GS_PYTHON -m unittest -v tests.test_external_adapters \
+  2>&1 | tee outputs/validation/trellis_contract_cpu.log
+
+$GRAFT_GS_PYTHON scripts/validate_external_models.py \
+  trellis "$GRAFT_GS_MESHFLEET_ROOT" "$GRAFT_GS_MESHFLEET_MANIFEST" \
+  --object-id "$GRAFT_GS_TEST_OBJECT_ID" \
+  --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
+  --trellis-samples 2 --trellis-sampler-steps 2 \
+  --output outputs/validation/trellis.json \
+  2>&1 | tee outputs/validation/trellis.log
+```
+
+The JSON must report `resolution: 64`, finite support values, coordinates
+inside `[0,63]`, and no fallback to `max(coordinate)+1`. The flow model's 16 is
+retained only as latent-model metadata.
+
 ## Exact checkpoint and next-step replay
 
 ```bash

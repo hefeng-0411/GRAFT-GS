@@ -12,11 +12,14 @@
 - Released VGGT includes a query-conditioned track head but not the
   specification's dense patch-descriptor tensor. Projective track-cycle
   supervision assumes depth/camera predictions describe the same static scene.
-- TRELLIS tensor conditioning is floating RGB `[K,3,H,W]` in `[0,1]`; its
-  sparse structure is `[batch,x,y,z]` on the declared integer resolution. The
-  empirical Beta-Bernoulli support assumes posterior draws are deterministic
-  under the recorded object seed and checkpoint. It is a prior, not calibrated
-  ground-truth occupancy.
+- TRELLIS tensor conditioning is floating RGB `[K,3,H,W]` in `[0,1]`. Its
+  sparse-structure flow resolution is the latent grid (16 for the released
+  checkpoint), not the coordinate domain returned after decoding. The adapter
+  observes the actual cubic decoder output `[1,1,R,R,R]` on every draw and
+  validates returned `[batch,x,y,z]` coordinates against that decoded `R` (64
+  for the released checkpoint). The empirical Beta-Bernoulli support assumes
+  posterior draws are deterministic under the recorded object seed and
+  checkpoint. It is a prior, not calibrated ground-truth occupancy.
 - In same-object DDP the TRELLIS pipeline is frozen and evaluated under
   `no_grad`; source-only sampling followed by exact tensor broadcast is
   mathematically equivalent to redundant identical-rank sampling conditional

@@ -146,6 +146,8 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn('import_external_module("trellis.pipelines")', trellis)
         self.assertIn('mode="multidiffusion"', trellis)
         self.assertIn("TRELLIS tensor inputs must use the released [0,1] RGB contract", trellis)
+        self.assertIn("decoded_resolutions.append(_decoded_structure_resolution(output))", trellis)
+        self.assertIn("len(set(decoded_resolutions)) != 1", trellis)
         self.assertIn('values.view(torch.uint8).numpy().tobytes(order="C")', trellis)
         self.assertIn("self._sample_cache.popitem(last=False)", trellis)
         self.assertIn('DEFAULT_VGGT_CHECKPOINT = "facebook/VGGT-1B"', external)
@@ -180,6 +182,12 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
             for node in ast.walk(tree)
             if isinstance(node, ast.FunctionDef) and node.name == "sample"
         )
+        sample_source = ast.get_source_segment(trellis, sample)
+        self.assertIsNotNone(sample_source)
+        self.assertNotIn(
+            'models["sparse_structure_flow_model"].resolution',
+            sample_source,
+        )
         posterior_loop = next(
             node
             for node in ast.walk(sample)
@@ -204,11 +212,13 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         trainer = source("graft_gs/engine/trainer.py")
         pipeline = source("graft_gs/integration/pipeline.py")
         distributed_test = source("tests/test_distributed_evidence.py")
+        overfit = source("scripts/overfit_meshfleet_object.py")
         self.assertIn("def should_sample_trellis_prior", trainer)
         self.assertIn("non-source TRELLIS rank must not sample", trainer)
         self.assertIn("distributed_synchronizer.should_sample_trellis_prior()", pipeline)
         self.assertIn("prior_measure,\n                            dtype=root_bounds[0].dtype", pipeline)
         self.assertIn("if context.rank == 0\n            else None", distributed_test)
+        self.assertIn("synchronize_object_atlas=True", overfit)
 
     def test_remote_entry_points_resolve_checkpoint_environment_at_runtime(self) -> None:
         scripts = (

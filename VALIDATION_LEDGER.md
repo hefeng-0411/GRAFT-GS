@@ -288,3 +288,21 @@ training convergence, or asset-quality result is claimed.
 Exact locally executed commands:
 `C:\Users\10992\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe -m compileall -q graft_gs scripts tests`, then
 `-m unittest -v tests.test_meshfleet_dynamic_discovery tests.test_meshfleet_manifest_static tests.test_server_manifest_handoff_static tests.test_scientific_trace_static tests.test_environment_contract_static`.
+
+TRELLIS decoded-grid repair cycle (2026-07-22): the supplied checkpoint-backed
+A800 preflight failed after successful sampling because 30,875 coordinate
+components were outside the incorrectly declared latent resolution 16; emitted
+coordinates were integer `[P,3]` with range `[0,63]`. Both overfit DDP ranks
+failed at the same validation boundary, so the elastic `ChildFailedError` was
+secondary rather than a distinct collective failure. Upstream source inspection
+confirmed two decoder upsampling stages and a 64-cubed occupancy output.
+
+After repair, whole-tree `compileall`, `git diff --check`, and all 26
+PyTorch-independent scientific production-path guards passed locally. Seven
+new PyTorch regression cases in `test_external_adapters.py` are syntax checked
+but locally unexecuted because the drafting runtime has no PyTorch. The exact
+CRAFT checkpoint-backed TRELLIS preflight and DDP overfit reruns remain A800
+pending; no post-repair model-forward or convergence result is claimed.
+The overfit entry point is now statically guarded to activate same-object view
+sharding/source-only prior sampling; its NCCL collectives and global-evidence
+gradients remain part of the same pending server rerun.

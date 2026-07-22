@@ -561,3 +561,25 @@ The full conditional validity domain is maintained in
   installed 7.4.9 client is an exact-environment violation. The validator now
   records and prints exact synchronization/verification commands for either a
   pin mismatch or `pip check` failure; no dependency constraint was loosened.
+
+## 2026-07-22 TRELLIS decoded-grid contract repair
+
+- Requirement `TRELLIS-DECODED-GRID-01`: the returned A800 trace proved that
+  `sparse_structure_flow_model.resolution=16` describes the sampled latent,
+  while `sparse_structure_decoder` emits occupancy on a 64-cubed lattice and
+  `sample_sparse_structure` returns coordinates in `[0,63]`.
+- Production path changed in `integration/trellis_prior.py`: a temporary
+  decoder forward hook records the authoritative cubic output extent for every
+  posterior draw, requires `[1,1,R,R,R]`, requires one consistent `R`, removes
+  itself under `finally`, and validates coordinates/support mass using decoded
+  `R`. No value is hard-coded and no resolution is inferred from occupied
+  coordinate maxima. Exact cache hits retain the observed decoded resolution.
+- `test_external_adapters.py` now covers 16-to-64 decoding, boundary cells,
+  cache identity, exact canonical cell centers and area mass, and rejection of
+  malformed/non-cubic/inconsistent decoder domains. The existing flow-latent
+  metadata remains validated separately.
+- `overfit_meshfleet_object.py` now explicitly activates the existing
+  same-object DDP contract. Ranks receive deterministic view shards, build one
+  global autograd-gathered evidence measure, synchronize the atlas/stratum, and
+  run the frozen TRELLIS sampler only on the source rank. Ordinary corpus
+  object-level DDP is unchanged.

@@ -152,6 +152,10 @@ def main() -> None:
             maximum_gradient_norm=float(training_config.get("maximum_gradient_norm", 1.0)),
             checkpoint_every=max(1, args.steps // 5),
             output_directory=str(args.output),
+            # Every DDP rank receives this same object. Shard its views and
+            # construct one global evidence/UOT/atlas state instead of treating
+            # identical replicas as unrelated object-level batches.
+            synchronize_object_atlas=True,
             dataset_manifest=str(args.manifest.resolve()),
             dataset_manifest_sha256=hashlib.sha256(args.manifest.read_bytes()).hexdigest(),
             dataset_split=args.split,

@@ -9,11 +9,11 @@ git add .
 # 提交（请根据实际改动内容修改 commit message）
 git commit -m "feat: update engine precision, training scripts and validation docs"
 
-# 推送到远程 main 分支
-git push origin main
-```
+# 2. 验证切换结果（确认输出为 https 开头）
+git remote -v
 
-> 💡 **提示**：由于改动文件较多（36个修改 + 2个新增），建议提交前用 `git diff --stat` 快速确认变更范围，确保没有误包含敏感配置或临时调试代码。
+# 3. 推送代码到 GitHub
+git push origin main
 
 ---
 

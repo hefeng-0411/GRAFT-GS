@@ -181,3 +181,10 @@
     barrier decisions. The executable YAML policy disables TF32 and is stored
     in format-6 checkpoints. This is stricter than the Markdown's broad mixed-
     precision allowance and intentionally prioritizes reconstruction fidelity.
+33. **Decoded TRELLIS occupancy resolution is runtime-observed.** The released
+    flow model's `resolution=16` is a latent-domain size, whereas its decoder
+    produces the 64-cubed sparse-coordinate domain. GRAFT-GS observes the
+    decoder tensor extent on each posterior draw and rejects non-cubic or
+    inconsistent outputs. It does not hard-code the released checkpoint's 64
+    and does not infer a grid from the largest occupied coordinate, which would
+    contract shapes whose sampled support does not touch the boundary.

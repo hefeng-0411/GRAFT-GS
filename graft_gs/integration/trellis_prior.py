@@ -25,6 +25,42 @@ from .external import (
 )
 
 
+def _decoded_structure_resolution(value: object) -> int:
+    """Return the cubic spatial extent of one TRELLIS decoder output.
+
+    The released pipeline samples a dense latent at the flow model's
+    ``resolution`` and then upsamples it in ``sparse_structure_decoder`` before
+    taking ``argwhere``.  Consequently the flow resolution is not the integer
+    coordinate domain of the returned sparse structure.
+    """
+
+    if not isinstance(value, Tensor):
+        raise TypeError("TRELLIS decoded sparse-structure output must be a tensor")
+    if value.ndim != 5:
+        raise ValueError(
+            "TRELLIS decoded sparse-structure output must have shape [B,C,D,H,W]"
+        )
+    if tuple(value.shape[:2]) != (1, 1):
+        raise ValueError(
+            "one-sample TRELLIS decoding requires one batch and one occupancy channel"
+        )
+    spatial_shape = tuple(int(size) for size in value.shape[-3:])
+    if min(spatial_shape) < 1 or len(set(spatial_shape)) != 1:
+        raise ValueError(
+            "TRELLIS decoded sparse-structure output must use a non-empty cubic grid"
+        )
+    return spatial_shape[0]
+
+
+def _explicit_decoder_resolution(decoder: object) -> Optional[int]:
+    """Read an unambiguous output-grid declaration for non-Module adapters."""
+
+    value = getattr(decoder, "output_resolution", None)
+    if type(value) is not int or value < 1:
+        return None
+    return value
+
+
 @dataclass
 class TrellisStructurePrior:
     coordinates: list[Tensor]
@@ -65,19 +101,40 @@ class TrellisPriorMeasure:
 
     def validate(self) -> None:
         count = self.coordinates.shape[0]
+        if type(self.resolution) is not int or self.resolution < 1:
+            raise ValueError("TRELLIS prior measure resolution must be positive")
+        if type(self.sample_count) is not int or self.sample_count < 1:
+            raise ValueError("TRELLIS prior measure sample count must be positive")
         if tuple(self.coordinates.shape) != (count, 3):
             raise ValueError("prior coordinates must have shape [P,3]")
+        if self.coordinates.dtype.is_floating_point:
+            raise TypeError("prior coordinates must use an integer dtype")
+        if torch.any(self.coordinates < 0) or torch.any(
+            self.coordinates >= self.resolution
+        ):
+            raise ValueError("prior coordinates lie outside the decoded grid")
         if tuple(self.positions.shape) != (count, 3):
             raise ValueError("prior positions must have shape [P,3]")
         for name in ("probability", "mass", "mass_variance", "vote_count"):
             if tuple(getattr(self, name).shape) != (count,):
                 raise ValueError(f"prior {name} must have shape [P]")
+        if not torch.all(torch.isfinite(self.positions)):
+            raise ValueError("TRELLIS prior positions contain non-finite values")
+        for name in ("probability", "mass", "mass_variance"):
+            if not torch.all(torch.isfinite(getattr(self, name))):
+                raise ValueError(f"TRELLIS prior {name} contains non-finite values")
         if torch.any(self.probability <= 0) or torch.any(self.probability >= 1):
             raise ValueError("Jeffreys prior probabilities must lie strictly inside (0,1)")
         if torch.any(self.mass <= 0):
             raise ValueError("TRELLIS prior support mass must be positive")
         if torch.any(self.mass_variance < 0):
             raise ValueError("TRELLIS prior mass variance must be non-negative")
+        if self.vote_count.dtype.is_floating_point:
+            raise TypeError("TRELLIS prior vote counts must use an integer dtype")
+        if torch.any(self.vote_count < 1) or torch.any(
+            self.vote_count > self.sample_count
+        ):
+            raise ValueError("TRELLIS prior vote count is outside [1,sample_count]")
 
 
 class TrellisPriorAdapter:
@@ -133,9 +190,19 @@ class TrellisPriorAdapter:
         sampler = getattr(pipeline, "sparse_structure_sampler", None)
         if sampler is None or not callable(getattr(sampler, "sample", None)):
             raise TypeError("TRELLIS sparse-structure sampler is unavailable")
-        resolution = getattr(models["sparse_structure_flow_model"], "resolution", None)
-        if not isinstance(resolution, int) or resolution < 1:
-            raise ValueError("TRELLIS sparse-structure resolution is invalid")
+        latent_resolution = getattr(
+            models["sparse_structure_flow_model"], "resolution", None
+        )
+        if type(latent_resolution) is not int or latent_resolution < 1:
+            raise ValueError("TRELLIS sparse-structure latent resolution is invalid")
+        decoder = models["sparse_structure_decoder"]
+        if not callable(getattr(decoder, "register_forward_hook", None)) and (
+            _explicit_decoder_resolution(decoder) is None
+        ):
+            raise TypeError(
+                "TRELLIS sparse-structure decoder must expose its decoded grid "
+                "through a forward hook or positive output_resolution"
+            )
 
     @classmethod
     def from_pretrained(
@@ -191,31 +258,70 @@ class TrellisPriorAdapter:
             raise TypeError("TRELLIS get_cond must return cond and neg_cond tensors")
         condition["neg_cond"] = condition["neg_cond"][:1]
         structures = []
+        decoded_resolutions: list[int] = []
+        decoder = self.pipeline.models["sparse_structure_decoder"]
+        register_hook = getattr(decoder, "register_forward_hook", None)
+        hook_handle = None
+        if callable(register_hook):
+            def record_decoded_resolution(
+                _module: object,
+                _arguments: tuple[object, ...],
+                output: object,
+            ) -> None:
+                decoded_resolutions.append(_decoded_structure_resolution(output))
+
+            hook_handle = register_hook(record_decoded_resolution)
         parameters = {"steps": self.sampler_steps}
-        for sample_index in range(self.samples):
-            # The released injector installs run-local sampler state. Recreate
-            # that state for every posterior draw instead of reusing a context
-            # whose callback counters/conditioning schedule have been consumed.
-            context = self.pipeline.inject_sampler_multi_image(
-                "sparse_structure_sampler",
-                scene_images.shape[0],
-                self.sampler_steps,
-                mode="multidiffusion",
-            ) if scene_images.shape[0] > 1 else nullcontext()
-            with context:
-                devices = [scene_images.device] if scene_images.is_cuda else []
-                # TRELLIS does not expose a generator argument. Isolate its
-                # sampling RNG so topology priors cannot perturb flow-time or
-                # training augmentation randomness in the surrounding model.
-                with torch.random.fork_rng(devices=devices):
-                    torch.manual_seed(seed + sample_index)
-                    coordinates = self.pipeline.sample_sparse_structure(condition, 1, parameters)
-                if coordinates.ndim != 2 or coordinates.shape[1] != 4:
-                    raise ValueError("TRELLIS sparse_structure output must have shape [P,4]")
-                if torch.any(coordinates[:, 0] != 0):
-                    raise ValueError("one-sample TRELLIS structure contains a nonzero batch index")
-                structures.append(coordinates[:, 1:].to(torch.int64))
-        resolution = int(self.pipeline.models["sparse_structure_flow_model"].resolution)
+        try:
+            for sample_index in range(self.samples):
+                # The released injector installs run-local sampler state. Recreate
+                # that state for every posterior draw instead of reusing a context
+                # whose callback counters/conditioning schedule have been consumed.
+                context = self.pipeline.inject_sampler_multi_image(
+                    "sparse_structure_sampler",
+                    scene_images.shape[0],
+                    self.sampler_steps,
+                    mode="multidiffusion",
+                ) if scene_images.shape[0] > 1 else nullcontext()
+                with context:
+                    devices = [scene_images.device] if scene_images.is_cuda else []
+                    # TRELLIS does not expose a generator argument. Isolate its
+                    # sampling RNG so topology priors cannot perturb flow-time or
+                    # training augmentation randomness in the surrounding model.
+                    with torch.random.fork_rng(devices=devices):
+                        torch.manual_seed(seed + sample_index)
+                        coordinates = self.pipeline.sample_sparse_structure(
+                            condition, 1, parameters
+                        )
+                    if coordinates.ndim != 2 or coordinates.shape[1] != 4:
+                        raise ValueError(
+                            "TRELLIS sparse_structure output must have shape [P,4]"
+                        )
+                    if torch.any(coordinates[:, 0] != 0):
+                        raise ValueError(
+                            "one-sample TRELLIS structure contains a nonzero batch index"
+                        )
+                    structures.append(coordinates[:, 1:].to(torch.int64))
+        finally:
+            if hook_handle is not None:
+                hook_handle.remove()
+
+        if hook_handle is not None:
+            if len(decoded_resolutions) != len(structures):
+                raise RuntimeError(
+                    "TRELLIS sparse-structure decoder did not execute exactly once "
+                    "per posterior draw"
+                )
+            if len(set(decoded_resolutions)) != 1:
+                raise RuntimeError(
+                    "TRELLIS decoded structure changed grid resolution "
+                    "between posterior draws"
+                )
+            resolution = decoded_resolutions[0]
+        else:
+            resolution = _explicit_decoder_resolution(decoder)
+            if resolution is None:  # guarded by _validate_upstream_contract
+                raise RuntimeError("TRELLIS decoded structure resolution is unavailable")
         prior = TrellisStructurePrior(structures, resolution)
         prior.validate()
         if cache_key is not None:

@@ -38,7 +38,7 @@ class _MockTrellisPipeline:
         self.models = {
             "image_cond_model": object(),
             "sparse_structure_flow_model": SimpleNamespace(resolution=8),
-            "sparse_structure_decoder": object(),
+            "sparse_structure_decoder": SimpleNamespace(output_resolution=8),
         }
         self.sparse_structure_sampler = SimpleNamespace(sample=lambda *args: None)
         self.injection_count = 0
@@ -72,6 +72,70 @@ class _MockTrellisPipeline:
             [[0, offset, 1, 2], [0, offset + 1, 1, 2]],
             dtype=torch.int32,
         )
+
+
+class _MockSparseStructureDecoder(nn.Module):
+    """Expose the decoded occupancy lattice to the adapter's forward hook."""
+
+    def __init__(
+        self,
+        output_shapes: list[tuple[int, int, int]],
+        output_prefix: tuple[int, int] = (1, 1),
+    ) -> None:
+        super().__init__()
+        self.output_shapes = output_shapes
+        self.output_prefix = output_prefix
+        self.call_count = 0
+
+    def forward(self, latent: torch.Tensor) -> torch.Tensor:
+        del latent
+        shape = self.output_shapes[min(self.call_count, len(self.output_shapes) - 1)]
+        self.call_count += 1
+        return torch.zeros((*self.output_prefix, *shape), dtype=torch.float32)
+
+
+class _MockDecodedGridTrellisPipeline:
+    """Model the released 16^3 latent -> 64^3 decoded structure contract."""
+
+    def __init__(
+        self,
+        coordinates: torch.Tensor,
+        *,
+        output_shapes: list[tuple[int, int, int]] | None = None,
+        output_prefix: tuple[int, int] = (1, 1),
+    ) -> None:
+        decoder = _MockSparseStructureDecoder(
+            [(64, 64, 64)] if output_shapes is None else output_shapes,
+            output_prefix,
+        )
+        self.models = {
+            "image_cond_model": object(),
+            "sparse_structure_flow_model": SimpleNamespace(resolution=16),
+            "sparse_structure_decoder": decoder,
+        }
+        self.sparse_structure_sampler = SimpleNamespace(sample=lambda *args: None)
+        self.coordinates = coordinates.to(dtype=torch.int32)
+        self.sample_count = 0
+
+    def to(self, device):
+        return self
+
+    def get_cond(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
+        return {
+            "cond": torch.ones(images.shape[0], 1, 2),
+            "neg_cond": torch.zeros(images.shape[0], 1, 2),
+        }
+
+    @contextmanager
+    def inject_sampler_multi_image(self, name, views, steps, mode):
+        yield
+
+    def sample_sparse_structure(self, condition, num_samples, parameters):
+        del condition, num_samples, parameters
+        self.sample_count += 1
+        decoder = self.models["sparse_structure_decoder"]
+        decoder(torch.empty(1, 1, 16, 16, 16))
+        return self.coordinates.clone()
 
 
 class TrellisAdapterBoundaryTest(unittest.TestCase):
@@ -131,6 +195,125 @@ class TrellisAdapterBoundaryTest(unittest.TestCase):
             adapter.sample(images)
         with self.assertRaisesRegex(TypeError, "floating-point"):
             adapter.sample(torch.zeros(1, 3, 4, 4, dtype=torch.uint8))
+
+    def test_decoded_grid_extent_overrides_latent_flow_resolution(self) -> None:
+        pipeline = _MockDecodedGridTrellisPipeline(
+            # Keeping every occupied coordinate below 16 ensures the adapter
+            # cannot obtain 64 from max(coordinate)+1.
+            torch.tensor([[0, 2, 3, 4], [0, 7, 8, 9]]),
+        )
+        adapter = TrellisPriorAdapter(pipeline, samples=1, sampler_steps=1)
+        prior = adapter.sample(torch.zeros(1, 3, 8, 8), seed=4)
+        self.assertEqual(prior.resolution, 64)
+        self.assertEqual(
+            pipeline.models["sparse_structure_flow_model"].resolution,
+            16,
+        )
+        prior.validate()
+
+    def test_decoded_grid_resolution_survives_exact_cache_hit(self) -> None:
+        pipeline = _MockDecodedGridTrellisPipeline(
+            torch.tensor([[0, 0, 0, 0], [0, 63, 63, 63]]),
+        )
+        adapter = TrellisPriorAdapter(
+            pipeline,
+            samples=1,
+            sampler_steps=1,
+            cache_entries=1,
+        )
+        images = torch.zeros(1, 3, 8, 8)
+        first = adapter.sample(images, seed=17)
+        second = adapter.sample(images.clone(), seed=17)
+        self.assertEqual(first.resolution, 64)
+        self.assertEqual(second.resolution, 64)
+        self.assertEqual(pipeline.sample_count, 1)
+        self.assertEqual(pipeline.models["sparse_structure_decoder"].call_count, 1)
+
+    def test_64_grid_support_centers_and_area_mass_are_not_scaled_as_16_grid(self) -> None:
+        pipeline = _MockDecodedGridTrellisPipeline(
+            torch.tensor([[0, 0, 0, 0], [0, 63, 63, 63]]),
+        )
+        adapter = TrellisPriorAdapter(pipeline, samples=1, sampler_steps=1)
+        prior = adapter.sample(torch.zeros(1, 3, 8, 8))
+        measure = adapter.support_measure(
+            prior,
+            torch.full((3,), -0.5, dtype=torch.float64),
+            torch.full((3,), 0.5, dtype=torch.float64),
+        )
+        expected_centers = torch.tensor(
+            [[-63.0 / 128.0] * 3, [63.0 / 128.0] * 3],
+            dtype=torch.float64,
+        )
+        torch.testing.assert_close(measure.positions, expected_centers, atol=0.0, rtol=0.0)
+        # One observation with Jeffreys Beta(1/2,1/2) smoothing has mean 3/4.
+        expected_mass = torch.full((2,), 0.75 / (64.0**2), dtype=torch.float64)
+        torch.testing.assert_close(measure.mass, expected_mass, atol=0.0, rtol=0.0)
+        self.assertEqual(measure.resolution, 64)
+
+    def test_coordinates_outside_decoded_grid_remain_invalid(self) -> None:
+        for name, coordinates in {
+            "negative": torch.tensor([[0, -1, 0, 0]]),
+            "upper_boundary": torch.tensor([[0, 64, 0, 0]]),
+        }.items():
+            with self.subTest(name=name):
+                adapter = TrellisPriorAdapter(
+                    _MockDecodedGridTrellisPipeline(coordinates),
+                    samples=1,
+                    sampler_steps=1,
+                )
+                with self.assertRaisesRegex(ValueError, "outside its declared grid"):
+                    adapter.sample(torch.zeros(1, 3, 8, 8))
+
+    def test_support_measure_rejects_resolution_corruption_after_transport(self) -> None:
+        pipeline = _MockDecodedGridTrellisPipeline(
+            torch.tensor([[0, 0, 0, 0], [0, 63, 63, 63]]),
+        )
+        adapter = TrellisPriorAdapter(pipeline, samples=1, sampler_steps=1)
+        prior = adapter.sample(torch.zeros(1, 3, 8, 8))
+        measure = adapter.support_measure(
+            prior,
+            torch.full((3,), -0.5),
+            torch.full((3,), 0.5),
+        )
+        measure.resolution = 16
+        with self.assertRaisesRegex(ValueError, "outside the decoded grid"):
+            measure.validate()
+
+    def test_non_cubic_or_inconsistent_decoded_grids_are_rejected(self) -> None:
+        cases = {
+            "non_cubic": (ValueError, 1, [(64, 32, 64)]),
+            "inconsistent_samples": (
+                RuntimeError,
+                2,
+                [(64, 64, 64), (32, 32, 32)],
+            ),
+        }
+        for name, (exception, samples, shapes) in cases.items():
+            with self.subTest(name=name):
+                adapter = TrellisPriorAdapter(
+                    _MockDecodedGridTrellisPipeline(
+                        torch.tensor([[0, 1, 2, 3]]),
+                        output_shapes=shapes,
+                    ),
+                    samples=samples,
+                    sampler_steps=1,
+                )
+                with self.assertRaisesRegex(exception, "decoder.*(cubic|resolution)"):
+                    adapter.sample(torch.zeros(1, 3, 8, 8))
+
+    def test_decoded_grid_requires_one_batch_and_one_occupancy_channel(self) -> None:
+        for name, prefix in {"batch": (2, 1), "channel": (1, 2)}.items():
+            with self.subTest(name=name):
+                adapter = TrellisPriorAdapter(
+                    _MockDecodedGridTrellisPipeline(
+                        torch.tensor([[0, 1, 2, 3]]),
+                        output_prefix=prefix,
+                    ),
+                    samples=1,
+                    sampler_steps=1,
+                )
+                with self.assertRaisesRegex(ValueError, "one batch and one occupancy channel"):
+                    adapter.sample(torch.zeros(1, 3, 8, 8))
 
 
 class VGGTAdapterBoundaryTest(unittest.TestCase):
