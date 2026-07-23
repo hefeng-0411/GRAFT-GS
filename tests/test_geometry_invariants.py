@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import unittest
+from unittest import mock
 
 import torch
 
@@ -43,8 +44,10 @@ from graft_gs.topology.strata import (
     TopologySelector,
     TopologySelectorConfig,
     betti_numbers,
+    persistence_wasserstein,
     persistence_critical_occupancy_thresholds,
     persistent_homology,
+    sliced_persistence_wasserstein,
 )
 
 
@@ -196,6 +199,45 @@ class GaugeEquivarianceTest(unittest.TestCase):
 
 
 class TopologyAndManifoldTest(unittest.TestCase):
+    def test_large_persistence_matching_is_linear_memory_symmetric_and_differentiable(self) -> None:
+        dtype = torch.float64
+        birth = torch.linspace(0.0, 0.8, 600, dtype=dtype)
+        left = torch.stack((birth, birth + 0.05), dim=-1).requires_grad_(True)
+        right = torch.stack(
+            (birth + 0.01 * torch.sin(7.0 * birth), birth + 0.055),
+            dim=-1,
+        )
+        # The large path must never call the dense two-dimensional cdist.
+        with mock.patch("torch.cdist", side_effect=AssertionError("dense cdist used")):
+            forward = persistence_wasserstein(
+                left,
+                right,
+                order=2,
+                maximum_exact_points=32,
+                sliced_directions=8,
+            )
+            reverse = persistence_wasserstein(
+                right,
+                left,
+                order=2,
+                maximum_exact_points=32,
+                sliced_directions=8,
+            )
+        torch.testing.assert_close(forward, reverse, atol=1.0e-12, rtol=1.0e-12)
+        self.assertGreater(float(forward), 0.0)
+        gradient = torch.autograd.grad(forward, left)[0]
+        self.assertTrue(torch.all(torch.isfinite(gradient)))
+        self.assertGreater(float(gradient.abs().sum()), 0.0)
+
+        identical = left.detach().clone().requires_grad_(True)
+        zero = sliced_persistence_wasserstein(
+            identical, identical, order=2, directions=8
+        )
+        torch.testing.assert_close(zero, torch.zeros_like(zero))
+        zero_gradient = torch.autograd.grad(zero, identical)[0]
+        self.assertTrue(torch.all(torch.isfinite(zero_gradient)))
+        torch.testing.assert_close(zero_gradient, torch.zeros_like(zero_gradient))
+
     def test_diffuse_occupancy_retains_all_support_filtration_stratum(self) -> None:
         atlas = _grid_atlas()
         active = atlas.active_indices
@@ -277,6 +319,9 @@ class TopologyAndManifoldTest(unittest.TestCase):
         diagram = persistent_homology(complex_, filtration)
         self.assertGreaterEqual(diagram[0].shape[0], 1)
         self.assertGreaterEqual(diagram[2].shape[0], 1)
+        for values in diagram.values():
+            if values.numel():
+                self.assertTrue(torch.all(values[:, 1] > values[:, 0]))
         persistence_loss = sum(values.sum() for values in diagram.values())
         persistence_loss.backward()
         self.assertIsNotNone(filtration.grad)

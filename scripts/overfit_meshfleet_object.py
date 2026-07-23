@@ -352,6 +352,13 @@ def main() -> None:
         "selected_topology": {
             "identifier": scene.topology.selected.identifier,
             "betti": list(scene.topology.selected.betti),
+            "persistence_cardinality": [
+                list(cardinality)
+                for cardinality in scene.topology.selected.persistence_cardinality
+            ],
+            "persistence_matching_mode": list(
+                scene.topology.selected.persistence_matching_mode
+            ),
         },
         "initial_feasibility": scene.feasibility_reports[0].__dict__,
         "final_feasibility": scene.feasibility_reports[-1].__dict__,

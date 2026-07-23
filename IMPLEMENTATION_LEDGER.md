@@ -783,3 +783,36 @@ The full conditional validity domain is maintained in
   `scripts/overfit_meshfleet_object.py`,
   `scripts/select_a800_view_budget.py`, and
   `configs/graft_gs_a800_native.yaml`.
+
+## 2026-07-23 scalable persistence matching at refined-atlas scale
+
+- Requirement `TOPOLOGY-PERSISTENCE-MEMORY-03`: the first post-log-UOT A800
+  smoke passed transport and surface-complex proposal, then both ranks failed
+  in `torch.cdist` while persistence matching requested 11.42 GiB on top of
+  approximately 69.67 GiB of retained differentiable state. The former
+  diagonal-augmented Hungarian construction required `O(nm+(n+m)^2)` memory
+  and `O((n+m)^3)` assignment time; it is not a valid production operator for
+  refined diagrams.
+- Exact zero-lifetime lower-star pairs are now removed in one vectorized
+  detached active-set operation. This is not pruning: diagonal points have
+  exactly zero optimal diagonal cost. Diagrams with at most 512 combined
+  off-diagonal points retain the exact Hungarian reference.
+- Larger diagrams use deterministic midpoint-quadrature sliced persistence
+  Wasserstein. Each direction solves the exact projected one-dimensional
+  assignment by sorting diagonal-augmented projections, using `O(n+m)` peak
+  working memory and `O(L(n+m) log(n+m))` time for `L=32`. Values and gradients
+  remain on-device; only ordering/ties define the usual piecewise stratum.
+  Identical diagrams select the finite zero subgradient rather than evaluating
+  `sqrt(0)` with an infinite outer derivative.
+- Selected topology artifacts now record per-homology-dimension diagram
+  cardinalities and whether matching was `exact` or `sliced`. The view-budget
+  selector rejects reports without this certificate, preventing pre-repair
+  artifacts from entering concurrency selection.
+- A verified accidental local paste of the supplied server log was removed
+  from between `_sinkhorn_fixed_point` and `_ImplicitUnbalancedSinkhorn`;
+  exactly 19,044 contaminated characters were deleted and the restored module
+  compiles.
+- Production files: `graft_gs/topology/strata.py`,
+  `graft_gs/topology/__init__.py`, `graft_gs/engine/configuration.py`,
+  `scripts/overfit_meshfleet_object.py`,
+  `scripts/select_a800_view_budget.py`, and the A800 YAML.

@@ -9,7 +9,7 @@ flow is permitted to add/remove a cell after selection.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from math import sqrt
+from math import pi, sqrt
 from typing import Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 
 import torch
@@ -38,10 +38,16 @@ class TopologySelectorConfig:
     adaptive_threshold_quantiles: Tuple[float, ...] = (0.2, 0.4, 0.6, 0.8)
     maximum_persistence_thresholds: int = 6
     minimum_persistence_lifetime: float = 0.02
+    maximum_exact_persistence_points: int = 512
+    sliced_persistence_directions: int = 32
 
     def __post_init__(self) -> None:
         if self.maximum_candidates < 1 or self.maximum_persistence_thresholds < 0:
             raise ValueError("topology candidate counts must be non-negative/positive")
+        if self.maximum_exact_persistence_points < 1:
+            raise ValueError("maximum exact persistence points must be positive")
+        if self.sliced_persistence_directions < 2:
+            raise ValueError("sliced persistence requires at least two directions")
         if self.minimum_persistence_lifetime < 0:
             raise ValueError("minimum persistence lifetime must be non-negative")
         if self.minimum_vertices < 3 or self.minimum_triangle_area <= 0:
@@ -135,6 +141,8 @@ class TopologyCandidate:
     manifold_incidence_valid: bool = True
     orientation_consistent: bool = True
     boundary_edge_count: int = 0
+    persistence_cardinality: Tuple[Tuple[int, int], ...] = ()
+    persistence_matching_mode: Tuple[str, ...] = ()
 
 
 @dataclass
@@ -247,18 +255,116 @@ def persistent_homology(complex_: SimplicialComplex, vertex_filtration: Tensor) 
     for index, (_, dimension, _, filtration) in enumerate(cells):
         if reduced[index] == 0 and index not in paired_births:
             diagrams[dimension].append(torch.stack((filtration, cap)))
-    return {
-        dimension: torch.stack(values) if values else torch.empty((0, 2), dtype=dtype, device=device)
-        for dimension, values in diagrams.items()
-    }
+    result: Dict[int, Tensor] = {}
+    for dimension, values in diagrams.items():
+        pairs = (
+            torch.stack(values)
+            if values
+            else torch.empty((0, 2), dtype=dtype, device=device)
+        )
+        if pairs.numel():
+            # Zero-length pairs lie exactly on the diagonal and have zero
+            # matching cost. Vectorized detached filtering is an exact diagram
+            # simplification and avoids one device synchronization per
+            # lower-star cancellation.
+            positive_lifetime = (pairs[:, 1] > pairs[:, 0]).detach()
+            pairs = pairs[positive_lifetime]
+        result[dimension] = pairs
+    return result
 
 
-def persistence_wasserstein(left: Tensor, right: Tensor, order: int = 2) -> Tensor:
-    """Exact finite-diagram Wasserstein assignment with diagonal matches."""
+def sliced_persistence_wasserstein(
+    left: Tensor,
+    right: Tensor,
+    order: int = 2,
+    directions: int = 32,
+) -> Tensor:
+    r"""Linear-memory sliced Wasserstein distance for persistence diagrams.
 
+    For direction ``theta``, the 1D diagrams
+
+    ``<theta,left> union <theta,diag(right)>`` and
+    ``<theta,right> union <theta,diag(left)>``
+
+    have equal cardinality and their exact 1D Wasserstein coupling is obtained
+    by sorting. Midpoint quadrature over ``[-pi/2,pi/2)`` is deterministic.
+    Only vectors of length ``n+m`` are materialized, so peak working memory is
+    ``O(n+m)`` rather than ``O(nm+(n+m)^2)``. The ordering is a piecewise
+    differentiable stratum decision; projected filtration values retain their
+    gradients away from ties.
+    """
+
+    if order < 1 or directions < 2:
+        raise ValueError("Wasserstein order and sliced direction count must be positive")
+    if left.ndim != 2 or right.ndim != 2 or left.shape[-1] != 2 or right.shape[-1] != 2:
+        raise ValueError("persistence diagrams must have shape [N,2]")
+    if left.dtype != right.dtype or left.device != right.device:
+        raise ValueError("persistence diagrams must share dtype and device")
+    if left.shape[0] == 0 and right.shape[0] == 0:
+        return left.new_zeros(())
+
+    left_diagonal = 0.5 * (left[:, 0] + left[:, 1])
+    right_diagonal = 0.5 * (right[:, 0] + right[:, 1])
+    accumulated = left.new_zeros(())
+    for direction_index in range(directions):
+        angle = -0.5 * pi + pi * (direction_index + 0.5) / directions
+        cosine = left.new_tensor(angle).cos()
+        sine = left.new_tensor(angle).sin()
+        diagonal_projection_scale = cosine + sine
+        left_projection = torch.cat(
+            (
+                left[:, 0] * cosine + left[:, 1] * sine,
+                right_diagonal * diagonal_projection_scale,
+            )
+        )
+        right_projection = torch.cat(
+            (
+                right[:, 0] * cosine + right[:, 1] * sine,
+                left_diagonal * diagonal_projection_scale,
+            )
+        )
+        left_sorted = torch.sort(left_projection).values
+        right_sorted = torch.sort(right_projection).values
+        accumulated = accumulated + torch.sum(
+            (left_sorted - right_sorted).abs().pow(order)
+        )
+    mean_power_cost = accumulated / directions
+    if not bool(mean_power_cost.detach() > 0):
+        # Select the zero subgradient at identical diagrams. Direct sqrt(0)
+        # would multiply an infinite outer derivative by zero inner
+        # derivatives and can poison an otherwise exact identity match.
+        return mean_power_cost
+    return mean_power_cost.pow(1.0 / order)
+
+
+def persistence_wasserstein(
+    left: Tensor,
+    right: Tensor,
+    order: int = 2,
+    maximum_exact_points: int = 512,
+    sliced_directions: int = 32,
+) -> Tensor:
+    """Scalable persistence distance with an exact small-diagram reference.
+
+    The Hungarian formulation is retained when ``n+m`` is within the explicit
+    memory budget. Larger diagrams use deterministic sliced Wasserstein; an
+    exact dense assignment has cubic time and quadratic memory and is not a
+    valid production operator for a refined surface atlas.
+    """
+
+    if left.ndim != 2 or right.ndim != 2 or left.shape[-1] != 2 or right.shape[-1] != 2:
+        raise ValueError("persistence diagrams must have shape [N,2]")
+    if left.dtype != right.dtype or left.device != right.device:
+        raise ValueError("persistence diagrams must share dtype and device")
     n, m = left.shape[0], right.shape[0]
     if n == 0 and m == 0:
         return left.new_zeros(())
+    if order < 1 or maximum_exact_points < 1:
+        raise ValueError("Wasserstein order and exact point budget must be positive")
+    if n + m > maximum_exact_points:
+        return sliced_persistence_wasserstein(
+            left, right, order=order, directions=sliced_directions
+        )
     size = n + m
     large = left.new_tensor(1.0e12)
     cost = left.new_full((size, size), large)
@@ -278,7 +384,10 @@ def persistence_wasserstein(left: Tensor, right: Tensor, order: int = 2) -> Tens
 
     rows, columns = linear_sum_assignment(cost.detach().cpu().numpy())
     assignment = cost[torch.as_tensor(rows, device=cost.device), torch.as_tensor(columns, device=cost.device)]
-    return assignment.sum().pow(1.0 / order)
+    power_cost = assignment.sum()
+    if not bool(power_cost.detach() > 0):
+        return power_cost
+    return power_cost.pow(1.0 / order)
 
 
 def persistence_critical_occupancy_thresholds(
@@ -719,8 +828,27 @@ class TopologySelector(nn.Module):
                 torch.log1p(-evidence[~selected_mask])
             )
             persistence_energy = sum(
-                persistence_wasserstein(persistence[dimension], reference_persistence[dimension], self.config.persistence_order)
+                persistence_wasserstein(
+                    persistence[dimension],
+                    reference_persistence[dimension],
+                    self.config.persistence_order,
+                    self.config.maximum_exact_persistence_points,
+                    self.config.sliced_persistence_directions,
+                )
                 for dimension in range(3)
+            )
+            persistence_cardinality = tuple(
+                (
+                    int(persistence[dimension].shape[0]),
+                    int(reference_persistence[dimension].shape[0]),
+                )
+                for dimension in range(3)
+            )
+            persistence_matching_mode = tuple(
+                "exact"
+                if sum(cardinality) <= self.config.maximum_exact_persistence_points
+                else "sliced"
+                for cardinality in persistence_cardinality
             )
             positions = atlas.chart_centers[complex_.atlas_node_index]
             face = complex_.faces
@@ -760,6 +888,8 @@ class TopologySelector(nn.Module):
                     manifold_incidence_valid=complex_.manifold_incidence_valid(),
                     orientation_consistent=complex_.orientation_consistent(),
                     boundary_edge_count=complex_.boundary_edge_count(),
+                    persistence_cardinality=persistence_cardinality,
+                    persistence_matching_mode=persistence_matching_mode,
                 )
             )
             if len(candidates) >= self.config.maximum_candidates:
@@ -791,6 +921,7 @@ __all__ = [
     "TopologySelectorConfig",
     "betti_numbers",
     "persistence_wasserstein",
+    "sliced_persistence_wasserstein",
     "persistent_homology",
     "persistence_critical_occupancy_thresholds",
 ]

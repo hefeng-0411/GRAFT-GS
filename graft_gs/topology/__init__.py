@@ -6,6 +6,7 @@ from .strata import (
     TopologySelection,
     TopologySelector,
     TopologySelectorConfig,
+    sliced_persistence_wasserstein,
 )
 
 __all__ = [
@@ -14,5 +15,5 @@ __all__ = [
     "TopologySelection",
     "TopologySelector",
     "TopologySelectorConfig",
+    "sliced_persistence_wasserstein",
 ]
-

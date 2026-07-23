@@ -117,7 +117,13 @@
   structural prior, not a target extracted from the raw MeshFleet mesh.
 - A correct topology is recoverable only if it occurs in the proposed candidate
   family and the evidence/prior energy selects it.
-- Betti numbers and persistence are exact over Z2 for the finite complex.
+- Betti numbers and lower-star persistence pairs are exact over Z2 for the
+  finite complex. Zero-lifetime pairs are omitted exactly because they lie on
+  the diagonal. Candidate-to-reference diagram distance is exact Hungarian for
+  at most 512 combined off-diagonal points. Above that declared budget it is a
+  deterministic finite-direction sliced Wasserstein approximation: symmetry,
+  identity, and conditional gradients are preserved, but equality to the full
+  two-dimensional Wasserstein distance is not claimed.
 - Every admitted stratum has edge incidence one or two and a consistent face
   orientation. Boundary edges are permitted and penalized; a closed-surface
   guarantee additionally requires a zero boundary-edge count.

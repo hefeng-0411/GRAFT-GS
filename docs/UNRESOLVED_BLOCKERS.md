@@ -171,7 +171,7 @@ checkpoints, data, or a compiled server dependency.
 - The supplied 16/24/32/48/64 sweep is pre-repair failure evidence, not a
   utilization result: 16 failed on FP32 UOT storage underflow and every larger
   candidate failed topology proposal. Deploy the FP64/log-domain UOT and
-  maximal-support filtration changes, pass the four focused numerical tests,
+  maximal-support filtration changes, pass the five focused numerical tests,
   rerun the sweep with the new telemetry schema, and retain `selection.json`.
   The selected value is not A800 validated until every candidate process has
   exited cleanly and the selector accepts at least one report.
@@ -183,3 +183,18 @@ checkpoints, data, or a compiled server dependency.
   sweep after flow/rendering activation; retain at least 15% peak reserved
   headroom for corpus variation unless measured tail-object profiling supports
   a different limit.
+
+## 2026-07-23 persistence-memory rerun boundary
+
+- The post-log-UOT smoke passed the previously failing transport and topology
+  proposal boundaries, then failed before backward because dense persistence
+  matching requested 11.42 GiB with approximately 8.5 GiB free. This run is
+  not an OOM-recovery candidate and provides no throughput report.
+- Deploy the zero-pair simplification and hybrid exact/sliced matcher, then run
+  the protocol's five focused numerical tests. The large matcher test must
+  pass with `torch.cdist` deliberately disabled. Rerun the two-step smoke with
+  the mandatory `--output "$SMOKE_DIR"` argument.
+- A valid `overfit_metrics.json` must record three persistence cardinality
+  pairs and three modes (`exact` or `sliced`) for the selected topology. Peak
+  allocated/reserved memory must then be measured anew; the 69.67 GiB
+  pre-repair allocation is not assumed to be the post-repair peak.

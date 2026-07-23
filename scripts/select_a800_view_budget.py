@@ -187,6 +187,35 @@ def audit_report(
             if not _positive_margin(value):
                 reasons.append(f"final feasibility field {name} is not positive")
 
+    topology = report.get("selected_topology")
+    if not isinstance(topology, Mapping):
+        reasons.append("selected topology certificate is missing")
+    else:
+        modes = topology.get("persistence_matching_mode")
+        cardinality = topology.get("persistence_cardinality")
+        if (
+            not isinstance(modes, list)
+            or len(modes) != 3
+            or any(mode not in {"exact", "sliced"} for mode in modes)
+        ):
+            reasons.append("persistence matching modes are invalid or missing")
+        if (
+            not isinstance(cardinality, list)
+            or len(cardinality) != 3
+            or any(
+                not isinstance(pair, list)
+                or len(pair) != 2
+                or any(
+                    not isinstance(value, int)
+                    or isinstance(value, bool)
+                    or value < 0
+                    for value in pair
+                )
+                for pair in cardinality
+            )
+        ):
+            reasons.append("persistence diagram cardinalities are invalid or missing")
+
     return {
         "admissible": not reasons,
         "reasons": sorted(set(reasons)),

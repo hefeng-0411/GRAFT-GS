@@ -25,6 +25,7 @@ def load_server_config(
     distributed = data.get("distributed", {})
     dataset = data.get("dataset", {})
     barrier = data.get("barrier", {})
+    topology = data.get("topology", {})
     for name, value in (
         ("model", model),
         ("transport", transport),
@@ -32,6 +33,7 @@ def load_server_config(
         ("distributed", distributed),
         ("dataset", dataset),
         ("barrier", barrier),
+        ("topology", topology),
     ):
         if not isinstance(value, dict):
             raise ValueError(f"configuration section {name!r} must be a mapping")
@@ -104,6 +106,21 @@ def load_server_config(
             ),
             retention_shrinkage=float(
                 transport.get("retention_shrinkage", base.mapping.retention_shrinkage)
+            ),
+        ),
+        topology=replace(
+            base.topology,
+            maximum_exact_persistence_points=int(
+                topology.get(
+                    "maximum_exact_persistence_points",
+                    base.topology.maximum_exact_persistence_points,
+                )
+            ),
+            sliced_persistence_directions=int(
+                topology.get(
+                    "sliced_persistence_directions",
+                    base.topology.sliced_persistence_directions,
+                )
             ),
         ),
         readout=replace(

@@ -112,15 +112,18 @@ mkdir -p outputs/validation
   tests.test_atlas_mapping.ImplicitSinkhornTest.test_sparse_all_edges_matches_dense_fixed_point_and_has_gradients \
   tests.test_atlas_mapping.ImplicitSinkhornTest.test_implicit_backward_matches_finite_difference \
   tests.test_geometry_invariants.TopologyAndManifoldTest.test_diffuse_occupancy_retains_all_support_filtration_stratum \
+  tests.test_geometry_invariants.TopologyAndManifoldTest.test_large_persistence_matching_is_linear_memory_symmetric_and_differentiable \
   2>&1 | tee outputs/validation/concurrency_numerics.log
 ```
 
-All four must pass. The underflow regression is deliberately disconnected and
+All five must pass. The underflow regression is deliberately disconnected and
 contains a positive exact UOT component near `exp(-196)`: FP32 may store that
 entry as zero, but the FP64/log-domain fixed point and implicit conditional
 probabilities must remain finite. The topology regression requires a valid,
 orientable all-support filtration stratum when every ordinary fixed threshold
-would remove the overlap triangles.
+would remove the overlap triangles. The persistence regression patches
+`torch.cdist` to fail and then exercises a 600-by-600 diagram through the
+linear-memory sliced path, including symmetry, identity, and finite gradients.
 
 After confirming that no previous GRAFT-GS launch remains, sweep distinct views
 per rank. The global loader admits `views_per_rank * world_size` views, then
@@ -427,6 +430,8 @@ $GRAFT_GS_PYTHON -m torch.distributed.run --standalone --nnodes=1 \
 
 Delete nothing and do not reuse `step-00000001.pt` from the pre-repair failed
 smoke: its optimizer step was not protected by the finite-state gate.
+`--output "$SMOKE_DIR"` is mandatory. Setting `SMOKE_DIR` and teeing the log
+does not change the script's artifact destination.
 
 Required artifacts: periodic and final checkpoints, `metrics.jsonl`, decreasing
 overfit objective, input-view renders, deterministic PLY/GLB, reload metrics,

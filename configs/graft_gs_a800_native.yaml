@@ -75,6 +75,12 @@ transport:
   # Conditional chart moments are shrunk toward the persistent chart when
   # retained/source UOT mass is below this dimensionless ratio.
   retention_shrinkage: 0.05
+topology:
+  # Exact diagonal-augmented Hungarian matching is retained for small
+  # diagrams. Refined-atlas diagrams use deterministic linear-memory sliced
+  # persistence Wasserstein rather than an O((n+m)^2) CUDA allocation.
+  maximum_exact_persistence_points: 512
+  sliced_persistence_directions: 32
 barrier:
   minimum_face_area: 1.0e-8
   minimum_orientation_cosine: 0.1

@@ -258,3 +258,12 @@
     endpoint under the same structured energy and constructs its orientable
     subcomplex with parity-constrained cell insertion. This is not a mesh
     fallback, topology label, or bypass of hard manifold admissibility.
+44. **Large persistence diagrams use a declared sliced metric.** The
+    specification's exact finite assignment is retained for small diagrams,
+    but a refined real atlas made its dense `cdist` request 11.42 GiB before
+    the still-larger Hungarian matrix. Exact zero-lifetime pairs are first
+    removed; above 512 remaining combined points, production uses deterministic
+    sliced persistence Wasserstein with exact sorted one-dimensional
+    couplings. This changes the large-diagram soft topology energy, not Betti
+    numbers, persistence reduction, hard incidence/orientation admissibility,
+    or the selected complex. The approximation mode/cardinality is serialized.

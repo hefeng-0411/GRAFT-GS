@@ -87,9 +87,15 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
 
     def test_topology_and_barrier_admissibility_are_hard_checks(self) -> None:
         topology = source("graft_gs/topology/strata.py")
+        configuration = source("graft_gs/engine/configuration.py")
+        config = source("configs/graft_gs_a800_native.yaml")
         self.assertIn("def _orient_faces_consistently", topology)
         self.assertIn("def _greedy_orientable_manifold_faces", topology)
         self.assertIn('"support-endpoint"', topology)
+        self.assertIn("def sliced_persistence_wasserstein", topology)
+        self.assertIn("if n + m > maximum_exact_points", topology)
+        self.assertIn("maximum_exact_persistence_points", configuration)
+        self.assertIn("sliced_persistence_directions: 32", config)
         self.assertIn("not complex_.orientation_consistent()", topology)
         barrier = source("graft_gs/manifold/barrier.py")
         self.assertIn("minimum_linearized_margin", barrier)

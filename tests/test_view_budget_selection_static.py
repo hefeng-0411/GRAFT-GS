@@ -48,6 +48,12 @@ def report(views: int, throughput: float, reserved: float) -> dict[str, object]:
             "feasible": True,
             **{name: 0.01 for name in MODULE.FEASIBILITY_FIELDS},
         },
+        "selected_topology": {
+            "identifier": "support-endpoint-occ-0.0010-b1-0-0",
+            "betti": [1, 0, 0],
+            "persistence_cardinality": [[4, 4], [2, 2], [0, 0]],
+            "persistence_matching_mode": ["exact", "exact", "exact"],
+        },
     }
 
 
@@ -99,6 +105,16 @@ class ViewBudgetSelectionTest(unittest.TestCase):
         )
         self.assertIn(
             "transport zero-marginal fraction exceeds the configured accuracy limit",
+            candidate["reasons"],
+        )
+
+    def test_rejects_stale_report_without_scalable_persistence_certificate(self) -> None:
+        invalid = report(24, 10.0, 0.4)
+        del invalid["selected_topology"]["persistence_matching_mode"]
+        candidate = MODULE.audit_report(invalid, 0.85)
+        self.assertFalse(candidate["admissible"])
+        self.assertIn(
+            "persistence matching modes are invalid or missing",
             candidate["reasons"],
         )
 

@@ -452,3 +452,24 @@ entries. The selector test now also rejects excessive acknowledged
 underflow. The exact four-test A800 command is in
 `docs/A800_VALIDATION_PROTOCOL.md`; no repaired A800 training step, throughput,
 VRAM figure, topology selection, or asset is claimed yet.
+
+Scalable persistence cycle (2026-07-23): the supplied two-rank 16-view smoke
+is pre-repair evidence that the prior UOT and non-degenerate topology failures
+were passed. Both ranks instead reached topology energy evaluation and failed
+at the same dense persistence `cdist`, each requesting 11.42 GiB with only
+about 8.5 GiB free. Allocated PyTorch state was about 69.67 GiB per A800. This
+is an algorithmic quadratic-memory failure, not allocator fragmentation, and
+the failed run produced no admissible concurrency report.
+
+The new server numerical test uses 600-point diagrams while monkey-patching
+`torch.cdist` to raise, proving that the large matcher takes the sliced path.
+It additionally checks symmetry, identity with a finite zero gradient, and a
+finite nonzero gradient under perturbation. The existing small sphere test now
+requires every retained persistence interval to have strictly positive
+lifetime. These Torch tests are server-ready but remain unexecuted locally.
+
+After removing the verified local log paste and implementing the matcher,
+in-memory compilation passed all 67 Python files. The environment,
+scientific-production, and concurrency-policy suites passed 38/38. A
+repository scan found no remaining pasted rank traceback/OOM markers in source.
+No post-repair A800 forward/backward, runtime, memory peak, or asset is claimed.
