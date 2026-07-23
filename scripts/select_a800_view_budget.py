@@ -46,6 +46,8 @@ def _positive_margin(value: object) -> bool:
 def audit_report(
     report: Mapping[str, object],
     maximum_reserved_fraction: float,
+    maximum_storage_underflow_fraction: float = 0.05,
+    maximum_zero_marginal_fraction: float = 0.05,
 ) -> dict[str, object]:
     """Return a normalized candidate record with explicit rejection reasons."""
 
@@ -97,6 +99,9 @@ def audit_report(
         reasons.append("loss history is empty or non-finite")
 
     transport = report.get("transport")
+    underflow_fraction = float("inf")
+    zero_source_fraction = float("inf")
+    zero_target_fraction = float("inf")
     if not isinstance(transport, Mapping):
         reasons.append("transport certificate is missing")
     else:
@@ -107,6 +112,7 @@ def audit_report(
             "effective_tolerance",
             "minimum_source_transport_mass",
             "minimum_target_transport_mass",
+            "internal_minimum_log_plan",
         ):
             value = transport.get(name)
             if not _finite_number(value):
@@ -115,12 +121,60 @@ def audit_report(
             transport.get("effective_tolerance")
         ) and float(transport["fixed_point_residual"]) > float(transport["effective_tolerance"]):
             reasons.append("transport residual exceeds its effective tolerance")
-        for name in (
-            "minimum_source_transport_mass",
-            "minimum_target_transport_mass",
-        ):
-            if _finite_number(transport.get(name)) and float(transport[name]) <= 0:
-                reasons.append(f"transport field {name} is not positive")
+        for name in ("minimum_source_transport_mass", "minimum_target_transport_mass"):
+            if _finite_number(transport.get(name)) and float(transport[name]) < 0:
+                reasons.append(f"transport field {name} is negative")
+        if transport.get("internal_solve_dtype") != "float64":
+            reasons.append("sparse transport was not solved in float64/log space")
+        count_fields = (
+            "storage_underflow_edges",
+            "storage_zero_source_rows",
+            "storage_zero_target_columns",
+            "edge_count",
+            "source_count",
+            "target_count",
+        )
+        parsed_counts: dict[str, int] = {}
+        for name in count_fields:
+            value = transport.get(name)
+            if (
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 0
+            ):
+                reasons.append(f"transport count {name} is invalid or missing")
+            else:
+                parsed_counts[name] = value
+        if all(name in parsed_counts for name in count_fields):
+            if min(
+                parsed_counts["edge_count"],
+                parsed_counts["source_count"],
+                parsed_counts["target_count"],
+            ) <= 0:
+                reasons.append("transport graph cardinalities are not positive")
+            else:
+                underflow_fraction = (
+                    parsed_counts["storage_underflow_edges"]
+                    / parsed_counts["edge_count"]
+                )
+                zero_source_fraction = (
+                    parsed_counts["storage_zero_source_rows"]
+                    / parsed_counts["source_count"]
+                )
+                zero_target_fraction = (
+                    parsed_counts["storage_zero_target_columns"]
+                    / parsed_counts["target_count"]
+                )
+                if underflow_fraction > maximum_storage_underflow_fraction:
+                    reasons.append(
+                        "transport storage-underflow fraction exceeds the "
+                        "configured accuracy limit"
+                    )
+                if max(zero_source_fraction, zero_target_fraction) > maximum_zero_marginal_fraction:
+                    reasons.append(
+                        "transport zero-marginal fraction exceeds the "
+                        "configured accuracy limit"
+                    )
 
     feasibility = report.get("final_feasibility")
     if not isinstance(feasibility, Mapping):
@@ -142,6 +196,9 @@ def audit_report(
         "global_useful_views": sum(local_views),
         "aggregate_views_per_second": sum(throughput),
         "maximum_reserved_fraction": max(reserved) if reserved else float("inf"),
+        "transport_storage_underflow_fraction": underflow_fraction,
+        "transport_zero_source_fraction": zero_source_fraction,
+        "transport_zero_target_fraction": zero_target_fraction,
     }
 
 
@@ -174,11 +231,24 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("reports", nargs="+", help="JSON files or glob patterns")
     parser.add_argument("--maximum-reserved-fraction", type=float, default=0.85)
+    parser.add_argument(
+        "--maximum-storage-underflow-fraction", type=float, default=0.05
+    )
+    parser.add_argument(
+        "--maximum-zero-marginal-fraction", type=float, default=0.05
+    )
     parser.add_argument("--throughput-fraction", type=float, default=0.97)
     parser.add_argument("--output", type=Path, default=Path("outputs/concurrency/selection.json"))
     args = parser.parse_args()
     if not 0 < args.maximum_reserved_fraction < 1:
         raise ValueError("maximum-reserved-fraction must lie in (0,1)")
+    for name in (
+        "maximum_storage_underflow_fraction",
+        "maximum_zero_marginal_fraction",
+    ):
+        value = float(getattr(args, name))
+        if not 0 <= value < 1:
+            raise ValueError(f"{name.replace('_', '-')} must lie in [0,1)")
 
     paths = sorted(
         {
@@ -194,13 +264,20 @@ def main() -> None:
         value = json.loads(path.read_text(encoding="utf8"))
         if not isinstance(value, Mapping):
             raise ValueError(f"report root must be a mapping: {path}")
-        candidate = audit_report(value, args.maximum_reserved_fraction)
+        candidate = audit_report(
+            value,
+            args.maximum_reserved_fraction,
+            args.maximum_storage_underflow_fraction,
+            args.maximum_zero_marginal_fraction,
+        )
         candidate["path"] = str(path)
         audited.append(candidate)
     selected = select_candidate(audited, args.throughput_fraction)
     output = {
         "schema": "graft-gs-a800-view-selection-v1",
         "maximum_reserved_fraction": args.maximum_reserved_fraction,
+        "maximum_storage_underflow_fraction": args.maximum_storage_underflow_fraction,
+        "maximum_zero_marginal_fraction": args.maximum_zero_marginal_fraction,
         "throughput_fraction": args.throughput_fraction,
         "candidates": audited,
         "selected": selected,

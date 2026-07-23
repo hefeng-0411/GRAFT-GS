@@ -40,6 +40,8 @@ from graft_gs.mapping.manifold_mapping import GeometricEvidenceBuilder
 from graft_gs.optimization.quantization import certify_topology_quantization_step
 from graft_gs.topology.strata import (
     SimplicialComplex,
+    TopologySelector,
+    TopologySelectorConfig,
     betti_numbers,
     persistence_critical_occupancy_thresholds,
     persistent_homology,
@@ -194,6 +196,36 @@ class GaugeEquivarianceTest(unittest.TestCase):
 
 
 class TopologyAndManifoldTest(unittest.TestCase):
+    def test_diffuse_occupancy_retains_all_support_filtration_stratum(self) -> None:
+        atlas = _grid_atlas()
+        active = atlas.active_indices
+        # Every configured fixed threshold removes the surface. The terminal
+        # all-support filtration endpoint remains a real structured proposal,
+        # not a fabricated topology label or unconstrained fallback.
+        occupancy = torch.linspace(
+            1.0e-3, 9.0e-3, active.numel(), dtype=torch.float64
+        )
+        selector = TopologySelector(
+            TopologySelectorConfig(
+                occupancy_thresholds=(0.15, 0.3, 0.6),
+                adaptive_threshold_quantiles=(0.6, 0.8),
+                maximum_persistence_thresholds=0,
+                minimum_vertices=4,
+            )
+        ).double()
+        selection = selector(atlas, occupancy)
+        support = [
+            candidate
+            for candidate in selection.candidates
+            if candidate.identifier.startswith("support-endpoint-")
+        ]
+        self.assertEqual(len(support), 1)
+        complex_ = support[0].complex
+        self.assertGreaterEqual(complex_.num_vertices, 4)
+        self.assertGreater(complex_.num_faces, 0)
+        self.assertTrue(complex_.manifold_incidence_valid())
+        self.assertTrue(complex_.orientation_consistent())
+
     def test_spd_spectral_box_is_bounded_and_repeated_spectrum_safe(self) -> None:
         matrix = torch.stack(
             (

@@ -156,6 +156,7 @@ class ImplicitSinkhornConfig:
     backward_damping: float = 0.8
     mass_floor: float = 1.0e-12
     convergence_check_interval: int = 8
+    solve_in_float64: bool = True
 
     def __post_init__(self) -> None:
         if self.epsilon <= 0 or self.tau_source <= 0 or self.tau_target <= 0:
@@ -228,6 +229,11 @@ class SinkhornDiagnostics:
     objective: Tensor
     converged: bool = True
     effective_tolerance: float = 0.0
+    internal_minimum_log_plan: float = 0.0
+    storage_underflow_edges: int = 0
+    storage_zero_source_rows: int = 0
+    storage_zero_target_columns: int = 0
+    internal_solve_dtype: str = ""
 
 
 @dataclass
@@ -402,7 +408,7 @@ def _sinkhorn_fixed_point(
     max_iterations: int,
     tolerance: float,
     convergence_check_interval: int,
-) -> Tuple[Tensor, Tensor, Tensor, int, float, float]:
+) -> Tuple[Tensor, Tensor, Tensor, Tensor, int, float, float]:
     """Solve generalized Sinkhorn scaling on an arbitrary sparse support."""
 
     n, m = log_source_mass.numel(), log_target_mass.numel()
@@ -451,7 +457,7 @@ def _sinkhorn_fixed_point(
                 break
     log_plan = log_kernel + log_u[source] + log_v[target]
     plan = torch.exp(log_plan)
-    return plan, log_u, log_v, iterations, residual, effective_tolerance
+    return plan, log_plan, log_u, log_v, iterations, residual, effective_tolerance
 
 
 class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
@@ -474,11 +480,26 @@ class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
         backward_tolerance: float,
         backward_damping: float,
         convergence_check_interval: int,
+        solve_in_float64: bool,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
-        plan, log_u, log_v, iterations, residual, effective_tolerance = _sinkhorn_fixed_point(
-            cost,
-            log_source_mass,
-            log_target_mass,
+        input_dtype = cost.dtype
+        solve_dtype = (
+            torch.float64
+            if solve_in_float64 and input_dtype == torch.float32
+            else input_dtype
+        )
+        (
+            plan,
+            log_plan,
+            log_u,
+            log_v,
+            iterations,
+            residual,
+            effective_tolerance,
+        ) = _sinkhorn_fixed_point(
+            cost.to(dtype=solve_dtype),
+            log_source_mass.to(dtype=solve_dtype),
+            log_target_mass.to(dtype=solve_dtype),
             source,
             target,
             epsilon,
@@ -488,21 +509,57 @@ class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
             tolerance,
             convergence_check_interval,
         )
-        if not bool(torch.all(torch.isfinite(plan))):
-            raise FloatingPointError("sparse unbalanced Sinkhorn produced a non-finite plan")
+        if not bool(torch.all(torch.isfinite(log_plan))):
+            raise FloatingPointError(
+                "sparse unbalanced Sinkhorn produced non-finite log transport mass"
+            )
         if residual > effective_tolerance:
             raise RuntimeError(
                 "sparse unbalanced Sinkhorn did not converge: "
                 f"iterations={iterations}, residual={residual:.6e}, "
                 f"effective_tolerance={effective_tolerance:.6e}"
             )
-        row = _segment_sum(plan, source, log_source_mass.numel())
-        col = _segment_sum(plan, target, log_target_mass.numel())
-        if bool(torch.any(row <= 0)) or bool(torch.any(col <= 0)):
+        # The UOT marginal penalties are soft: a geometrically incompatible
+        # row/column may legitimately retain exponentially tiny mass.  Form the
+        # conditional probabilities directly in log space so the implicit
+        # Jacobian remains valid even when the absolute mass is below FP64.
+        row_log_mass = _segment_logsumexp(
+            log_plan, source, log_source_mass.numel()
+        )
+        col_log_mass = _segment_logsumexp(
+            log_plan, target, log_target_mass.numel()
+        )
+        row_probability = torch.exp(log_plan - row_log_mass[source])
+        col_probability = torch.exp(log_plan - col_log_mass[target])
+        if (
+            not bool(torch.all(torch.isfinite(row_probability)))
+            or not bool(torch.all(torch.isfinite(col_probability)))
+        ):
             raise FloatingPointError(
-                "sparse unbalanced Sinkhorn underflow removed all transported mass from a supported node"
+                "log-domain Sinkhorn conditional probabilities are non-finite"
             )
-        ctx.save_for_backward(plan, row, col, source, target)
+        storage_plan = plan.to(dtype=input_dtype)
+        storage_row = _segment_sum(
+            storage_plan, source, log_source_mass.numel()
+        )
+        storage_col = _segment_sum(
+            storage_plan, target, log_target_mass.numel()
+        )
+        storage_underflow_edges = int(torch.count_nonzero(storage_plan == 0).item())
+        storage_zero_rows = int(torch.count_nonzero(storage_row == 0).item())
+        storage_zero_columns = int(torch.count_nonzero(storage_col == 0).item())
+        minimum_log_plan = float(log_plan.amin().detach().cpu())
+        if not bool(torch.any(storage_plan > 0)):
+            raise FloatingPointError(
+                "all sparse UOT mass lies below the geometric storage dtype; "
+                f"minimum_log_plan={minimum_log_plan:.6e}, dtype={input_dtype}"
+            )
+        ctx.save_for_backward(
+            plan, row_probability, col_probability, source, target
+        )
+        ctx.input_dtype = input_dtype
+        ctx.source_count = log_source_mass.numel()
+        ctx.target_count = log_target_mass.numel()
         ctx.epsilon = epsilon
         ctx.rho_source = rho_source
         ctx.rho_target = rho_target
@@ -510,11 +567,31 @@ class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
         ctx.backward_tolerance = backward_tolerance
         ctx.backward_damping = backward_damping
         ctx.convergence_check_interval = convergence_check_interval
-        status = cost.new_tensor(
-            (float(iterations), residual, effective_tolerance)
+        # FP64 preserves large COO edge counts exactly beyond FP32's 24-bit
+        # integer mantissa and retains the log-domain dynamic-range diagnostic.
+        status = torch.tensor(
+            (
+                float(iterations),
+                residual,
+                effective_tolerance,
+                minimum_log_plan,
+                float(storage_underflow_edges),
+                float(storage_zero_rows),
+                float(storage_zero_columns),
+                64.0 if solve_dtype == torch.float64 else 32.0,
+            ),
+            dtype=torch.float64,
+            device=cost.device,
         )
-        ctx.mark_non_differentiable(log_u, log_v, status)
-        return plan, log_u, log_v, status
+        storage_log_u = log_u.to(dtype=input_dtype)
+        storage_log_v = log_v.to(dtype=input_dtype)
+        ctx.mark_non_differentiable(storage_log_u, storage_log_v, status)
+        return (
+            storage_plan,
+            storage_log_u,
+            storage_log_v,
+            status,
+        )
 
     @staticmethod
     def backward(
@@ -526,14 +603,14 @@ class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
     ) -> Tuple[Optional[Tensor], ...]:
         del grad_log_u, grad_log_v, grad_status
         if grad_plan is None:
-            return (None,) * 14
-        plan, row, col, source, target = ctx.saved_tensors
-        tiny = torch.finfo(plan.dtype).tiny
-        row_probability = plan / row[source].clamp_min(tiny)
-        col_probability = plan / col[target].clamp_min(tiny)
+            return (None,) * 15
+        plan, row_probability, col_probability, source, target = ctx.saved_tensors
+        grad_plan = grad_plan.to(dtype=plan.dtype)
         weighted_gradient = grad_plan * plan
-        q_source = _segment_sum(weighted_gradient, source, row.numel())
-        q_target = _segment_sum(weighted_gradient, target, col.numel())
+        source_count = ctx.source_count
+        target_count = ctx.target_count
+        q_source = _segment_sum(weighted_gradient, source, source_count)
+        q_target = _segment_sum(weighted_gradient, target, target_count)
 
         # Solve J^T lambda = dL/d(log_u,log_v).  Since both relaxation
         # exponents are strictly below one, this block Gauss-Seidel map is a
@@ -546,11 +623,11 @@ class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
         backward_threshold = float("inf")
         for iteration in range(ctx.backward_max_iterations):
             candidate_source = q_source - ctx.rho_target * _segment_sum(
-                col_probability * lambda_target[target], source, row.numel()
+                col_probability * lambda_target[target], source, source_count
             )
             candidate_source = (1.0 - damping) * lambda_source + damping * candidate_source
             candidate_target = q_target - ctx.rho_source * _segment_sum(
-                row_probability * candidate_source[source], target, col.numel()
+                row_probability * candidate_source[source], target, target_count
             )
             candidate_target = (1.0 - damping) * lambda_target + damping * candidate_target
             lambda_source, lambda_target = candidate_source, candidate_target
@@ -560,10 +637,10 @@ class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
             )
             if should_check:
                 equation_source = lambda_source + ctx.rho_target * _segment_sum(
-                    col_probability * lambda_target[target], source, row.numel()
+                    col_probability * lambda_target[target], source, source_count
                 ) - q_source
                 equation_target = lambda_target + ctx.rho_source * _segment_sum(
-                    row_probability * lambda_source[source], target, col.numel()
+                    row_probability * lambda_source[source], target, target_count
                 ) - q_target
                 residual = torch.maximum(
                     equation_source.abs().amax(), equation_target.abs().amax()
@@ -590,13 +667,13 @@ class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
             ctx.rho_source * lambda_source[source] * row_probability
             + ctx.rho_target * lambda_target[target] * col_probability
         ) / epsilon
-        direct_source = _segment_sum(weighted_gradient, source, row.numel())
-        direct_target = _segment_sum(weighted_gradient, target, col.numel())
+        direct_source = _segment_sum(weighted_gradient, source, source_count)
+        direct_target = _segment_sum(weighted_gradient, target, target_count)
         grad_log_source = direct_source - ctx.rho_target * _segment_sum(
-            col_probability * lambda_target[target], source, row.numel()
+            col_probability * lambda_target[target], source, source_count
         )
         grad_log_target = direct_target - ctx.rho_source * _segment_sum(
-            row_probability * lambda_source[source], target, col.numel()
+            row_probability * lambda_source[source], target, target_count
         )
         gradients_finite = (
             torch.all(torch.isfinite(grad_cost))
@@ -606,9 +683,10 @@ class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
         if not bool(gradients_finite):
             raise FloatingPointError("implicit Sinkhorn adjoint produced non-finite gradients")
         return (
-            grad_cost,
-            grad_log_source,
-            grad_log_target,
+            grad_cost.to(dtype=ctx.input_dtype),
+            grad_log_source.to(dtype=ctx.input_dtype),
+            grad_log_target.to(dtype=ctx.input_dtype),
+            None,
             None,
             None,
             None,
@@ -700,6 +778,7 @@ class ImplicitUnbalancedSinkhorn(nn.Module):
             cfg.backward_tolerance,
             cfg.backward_damping,
             cfg.convergence_check_interval,
+            cfg.solve_in_float64,
         )
         row = _segment_sum(plan, source, source_mass.numel())
         col = _segment_sum(plan, target, target_mass.numel())
@@ -716,6 +795,11 @@ class ImplicitUnbalancedSinkhorn(nn.Module):
             objective=objective,
             converged=True,
             effective_tolerance=float(status[2].item()),
+            internal_minimum_log_plan=float(status[3].item()),
+            storage_underflow_edges=int(status[4].item()),
+            storage_zero_source_rows=int(status[5].item()),
+            storage_zero_target_columns=int(status[6].item()),
+            internal_solve_dtype=f"float{int(status[7].item())}",
         )
         return plan, diagnostics
 

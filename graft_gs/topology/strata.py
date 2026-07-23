@@ -373,6 +373,98 @@ def _orient_faces_consistently(
     return oriented, True
 
 
+def _greedy_orientable_manifold_faces(
+    proposals: Sequence[Tuple[float, Tuple[int, int, int]]],
+) -> List[Tuple[int, int, int]]:
+    """Select a deterministic high-quality orientable 2-subcomplex.
+
+    Edge incidence and orientability are hereditary only under carefully
+    ordered cell insertion.  Building every incidence-valid face and deleting
+    the *entire* complex after one late orientation contradiction discards
+    otherwise admissible surface components.  This routine instead maintains
+    the Z2 face-orientation constraints with a parity union-find and rejects
+    only the face that would make the selected complex non-orientable.
+
+    ``parity[i]`` is the orientation sign of face/component ``i`` relative to
+    its union-find parent.  For two incident faces, opposite traversal of their
+    shared edge gives the constraint
+
+    ``s_right = -direction_left * direction_right * s_left``.
+    """
+
+    parent: List[int] = []
+    parity: List[int] = []
+    faces: List[Tuple[int, int, int]] = []
+    edge_faces: Dict[Tuple[int, int], List[Tuple[int, int]]] = {}
+
+    def find(index: int) -> Tuple[int, int]:
+        root = index
+        sign = 1
+        while parent[root] != root:
+            sign *= parity[root]
+            root = parent[root]
+        # Compression is safe because ``sign`` is the parity from ``index`` to
+        # the root.  The small Python structure is a detached discrete stratum
+        # decision and never participates in autograd.
+        parent[index] = root
+        parity[index] = sign
+        return root, sign
+
+    for _, face in sorted(proposals, reverse=True):
+        directed_edges = (
+            (face[0], face[1]),
+            (face[1], face[2]),
+            (face[2], face[0]),
+        )
+        face_edges = [(min(a, b), max(a, b)) for a, b in directed_edges]
+        if any(len(edge_faces.get(edge, ())) >= 2 for edge in face_edges):
+            continue
+
+        # Required sign of the new face relative to each existing component.
+        requirements: Dict[int, int] = {}
+        admissible = True
+        for (a, b), edge in zip(directed_edges, face_edges):
+            incident = edge_faces.get(edge)
+            if not incident:
+                continue
+            existing_face, existing_direction = incident[0]
+            root, existing_sign = find(existing_face)
+            new_direction = 1 if a < b else -1
+            required = -existing_direction * new_direction * existing_sign
+            previous = requirements.get(root)
+            if previous is not None and previous != required:
+                admissible = False
+                break
+            requirements[root] = required
+        if not admissible:
+            continue
+
+        new_index = len(faces)
+        parent.append(new_index)
+        parity.append(1)
+        if requirements:
+            ordered = sorted(requirements.items())
+            base_root, new_to_base = ordered[0]
+            parent[new_index] = base_root
+            parity[new_index] = new_to_base
+            for root, new_to_root in ordered[1:]:
+                # new = new_to_base * base = new_to_root * root
+                # therefore root = new_to_root * new_to_base * base.
+                parent[root] = base_root
+                parity[root] = new_to_root * new_to_base
+
+        faces.append(face)
+        for (a, b), edge in zip(directed_edges, face_edges):
+            direction = 1 if a < b else -1
+            edge_faces.setdefault(edge, []).append((new_index, direction))
+
+    oriented: List[Tuple[int, int, int]] = []
+    for face_index, face in enumerate(faces):
+        _, sign = find(face_index)
+        oriented.append(face if sign > 0 else (face[0], face[2], face[1]))
+    return oriented
+
+
 def _surface_complex(
     atlas: PersistentOctreeAtlas,
     keep: Tensor,
@@ -417,20 +509,10 @@ def _surface_complex(
                     continue
                 face = (i, k, j) if float(cosine) < 0 else (i, j, k)
                 proposals.append((float(area2), face))
-    # A greedy maximum-quality 2-manifold subcomplex prevents clique tetrahedra
-    # from assigning more than two faces to an edge.
-    incidence: Dict[Tuple[int, int], int] = {}
-    faces: List[Tuple[int, int, int]] = []
-    for _, face in sorted(proposals, reverse=True):
-        face_edges = [(min(a, b), max(a, b)) for a, b in ((face[0], face[1]), (face[1], face[2]), (face[2], face[0]))]
-        if any(incidence.get(edge, 0) >= 2 for edge in face_edges):
-            continue
-        faces.append(face)
-        for edge in face_edges:
-            incidence[edge] = incidence.get(edge, 0) + 1
-    faces, orientable = _orient_faces_consistently(faces)
-    if not orientable:
-        faces = []
+    # A greedy maximum-quality, parity-constrained 2-manifold subcomplex
+    # prevents clique tetrahedra from assigning more than two faces to an edge
+    # and rejects only orientation-conflicting cells.
+    faces = _greedy_orientable_manifold_faces(proposals)
     if not faces:
         return SimplicialComplex(
             atlas_node_index=nodes.new_empty(0),
@@ -499,6 +581,27 @@ class TopologySelector(nn.Module):
             self.config.minimum_triangle_area,
             self.config.triangle_planarity_cosine,
         )
+        if (
+            reference_complex.num_vertices < self.config.minimum_vertices
+            or reference_complex.num_edges == 0
+            or reference_complex.num_faces == 0
+        ):
+            raise RuntimeError(
+                "active atlas overlap graph cannot support a non-degenerate "
+                "surface complex: "
+                f"active_charts={active.numel()}, "
+                f"reference_vertices={reference_complex.num_vertices}, "
+                f"reference_edges={reference_complex.num_edges}, "
+                f"reference_faces={reference_complex.num_faces}"
+            )
+        if (
+            not reference_complex.manifold_incidence_valid()
+            or not reference_complex.orientation_consistent()
+        ):
+            raise RuntimeError(
+                "all-support atlas reference complex violates the hard "
+                "manifold/orientation admissibility conditions"
+            )
         global_to_active = torch.full(
             (atlas.num_nodes,), -1, dtype=torch.int64, device=active.device
         )
@@ -529,7 +632,16 @@ class TopologySelector(nn.Module):
             self.config.maximum_persistence_thresholds,
             self.config.minimum_persistence_lifetime,
         )
-        threshold_records: List[Tuple[str, float]] = []
+        # The maximal observed/prior atlas support is the terminal filtration
+        # stratum.  It must be proposed explicitly: quantiles and fixed
+        # thresholds can all remove the overlap triangles when occupancy is
+        # diffuse, even though the all-support atlas is a valid surface.  A
+        # detached threshold strictly below min(p) represents that endpoint
+        # without fabricating occupancy or bypassing structured selection.
+        support_threshold = 0.5 * float(probability.detach().amin())
+        threshold_records: List[Tuple[str, float]] = [
+            ("support-endpoint", support_threshold)
+        ]
         for source_name, values in (
             ("ph-critical", critical_thresholds),
             ("quantile", adaptive_thresholds),
@@ -545,19 +657,40 @@ class TopologySelector(nn.Module):
                 ):
                     continue
                 threshold_records.append((source_name, threshold))
+        rejection_counts = {
+            "too_few_vertices": 0,
+            "degenerate_complex": 0,
+            "inadmissible_complex": 0,
+            "duplicate_complex": 0,
+        }
+        support_sizes: List[Tuple[str, float, int]] = []
         for threshold_source, threshold in threshold_records:
             keep = probability >= threshold
             if int(keep.sum()) < self.config.minimum_vertices:
                 top = torch.topk(probability, k=min(self.config.minimum_vertices, probability.numel())).indices
                 keep = torch.zeros_like(keep)
                 keep[top] = True
-            complex_ = _surface_complex(
-                atlas,
-                keep,
-                self.config.minimum_triangle_area,
-                self.config.triangle_planarity_cosine,
+            kept_count = int(keep.sum())
+            support_sizes.append((threshold_source, threshold, kept_count))
+            if kept_count < self.config.minimum_vertices:
+                rejection_counts["too_few_vertices"] += 1
+                continue
+            complex_ = (
+                reference_complex
+                if threshold_source == "support-endpoint"
+                else _surface_complex(
+                    atlas,
+                    keep,
+                    self.config.minimum_triangle_area,
+                    self.config.triangle_planarity_cosine,
+                )
             )
-            if complex_.num_faces == 0 or complex_.num_edges == 0:
+            if (
+                complex_.num_vertices < self.config.minimum_vertices
+                or complex_.num_faces == 0
+                or complex_.num_edges == 0
+            ):
+                rejection_counts["degenerate_complex"] += 1
                 continue
             if (
                 not complex_.manifold_incidence_valid()
@@ -566,12 +699,14 @@ class TopologySelector(nn.Module):
                 # This is a discrete admissibility condition, not a soft loss:
                 # an invalid cell complex cannot define a topology stratum for
                 # the subsequent isotopy-preserving flow.
+                rejection_counts["inadmissible_complex"] += 1
                 continue
             complex_key = (
                 tuple(int(value) for value in complex_.atlas_node_index.tolist()),
                 tuple(tuple(int(value) for value in face) for face in complex_.faces.tolist()),
             )
             if complex_key in seen_complexes:
+                rejection_counts["duplicate_complex"] += 1
                 continue
             seen_complexes.add(complex_key)
             selected_index = global_to_active[complex_.atlas_node_index]
@@ -630,7 +765,18 @@ class TopologySelector(nn.Module):
             if len(candidates) >= self.config.maximum_candidates:
                 break
         if not candidates:
-            raise RuntimeError("topology proposal produced no non-degenerate surface complex")
+            probability_range = (
+                float(probability.detach().amin()),
+                float(probability.detach().amax()),
+            )
+            raise RuntimeError(
+                "topology proposal produced no non-degenerate surface complex: "
+                f"active_charts={active.numel()}, "
+                f"probability_range={probability_range}, "
+                f"reference=(V={reference_complex.num_vertices},"
+                f"E={reference_complex.num_edges},F={reference_complex.num_faces}), "
+                f"rejections={rejection_counts}, supports={support_sizes}"
+            )
         energy = torch.stack([candidate.total_energy for candidate in candidates])
         distribution = torch.softmax(-energy / self.config.temperature, dim=0)
         selected = int(torch.argmin(energy).item())

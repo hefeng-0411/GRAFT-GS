@@ -35,6 +35,14 @@ def report(views: int, throughput: float, reserved: float) -> dict[str, object]:
             "effective_tolerance": 1.0e-7,
             "minimum_source_transport_mass": 0.1,
             "minimum_target_transport_mass": 0.1,
+            "internal_minimum_log_plan": -20.0,
+            "internal_solve_dtype": "float64",
+            "storage_underflow_edges": 0,
+            "storage_zero_source_rows": 0,
+            "storage_zero_target_columns": 0,
+            "edge_count": 100,
+            "source_count": 10,
+            "target_count": 20,
         },
         "final_feasibility": {
             "feasible": True,
@@ -73,6 +81,26 @@ class ViewBudgetSelectionTest(unittest.TestCase):
         self.assertIn("sparse transport is not certified converged", candidate["reasons"])
         with self.assertRaisesRegex(RuntimeError, "no concurrency candidate"):
             MODULE.select_candidate([candidate], 0.97)
+
+    def test_rejects_excessive_acknowledged_storage_underflow(self) -> None:
+        invalid = report(32, 10.0, 0.5)
+        invalid["transport"]["storage_underflow_edges"] = 8
+        invalid["transport"]["storage_zero_source_rows"] = 1
+        candidate = MODULE.audit_report(
+            invalid,
+            0.85,
+            maximum_storage_underflow_fraction=0.05,
+            maximum_zero_marginal_fraction=0.05,
+        )
+        self.assertFalse(candidate["admissible"])
+        self.assertIn(
+            "transport storage-underflow fraction exceeds the configured accuracy limit",
+            candidate["reasons"],
+        )
+        self.assertIn(
+            "transport zero-marginal fraction exceeds the configured accuracy limit",
+            candidate["reasons"],
+        )
 
 
 if __name__ == "__main__":

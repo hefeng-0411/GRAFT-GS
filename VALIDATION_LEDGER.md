@@ -428,3 +428,27 @@ After removing the discrete support-search autograd tape, the 67-file compile
 and 36-test gate passed again. Existing mapping gradient tests exercise the
 selected-edge cost/implicit-plan path on the server; their Torch execution and
 the larger-chunk equivalence measurement remain pending.
+
+High-view numerical/topology repair cycle (2026-07-22): the complete supplied
+sweep is retained as pre-repair evidence. At 16 views/rank both ranks failed
+inside sparse UOT because a supported component fell below FP32 absolute-mass
+range. At 24, 32, 48, and 64 views/rank the runs passed transport and failed
+because occupancy cuts produced no non-degenerate topology candidate. None of
+those runs is a valid throughput or memory candidate.
+
+Two executable numerical regressions now target those root causes: a positive
+UOT component near `exp(-196)` must preserve a finite FP64/log-domain implicit
+solve while reporting exactly one FP32 underflow edge/row/column, and diffuse
+occupancy must retain a real orientable all-support filtration complex.
+Existing dense/sparse agreement and gradcheck remain the independent solver
+references. The local drafting runtime has no PyTorch, so these numerical
+tests are server-ready and unexecuted locally.
+
+Locally executed after the repair: in-memory compilation passed all 67 Python
+files. The environment, scientific production-trace, and view-budget suites
+passed 37/37. An AST contract check also confirmed that the custom autograd
+forward has 15 inputs and every explicit backward tuple returns exactly 15
+entries. The selector test now also rejects excessive acknowledged
+underflow. The exact four-test A800 command is in
+`docs/A800_VALIDATION_PROTOCOL.md`; no repaired A800 training step, throughput,
+VRAM figure, topology selection, or asset is claimed yet.

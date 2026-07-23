@@ -68,6 +68,10 @@ transport:
   # Avoid a device-to-host stream synchronization on every fixed-point step.
   # Residual equations are still checked at termination and every 8 steps.
   convergence_check_interval: 8
+  # Sparse UOT potentials and conditional Jacobian probabilities are solved in
+  # FP64/log space. The returned plan uses geometric_state storage; any
+  # representationally negligible entries are reported explicitly.
+  solve_in_float64: true
   # Conditional chart moments are shrunk toward the persistent chart when
   # retained/source UOT mass is below this dimensionless ratio.
   retention_shrinkage: 0.05

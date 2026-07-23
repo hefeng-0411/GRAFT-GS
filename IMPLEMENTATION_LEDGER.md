@@ -689,11 +689,13 @@ The full conditional validity domain is maintained in
   into a soft penalty or fabricated feasible report.
 - Requirement `UOT-CONVERGENCE-02`: sparse KL-UOT now validates finite
   non-negative costs/measures, exact support index domains, common
-  FP32/FP64 dtype/device, positive transported row/column mass, and the actual
-  coupled fixed-point equations. Both forward and implicit-adjoint solves fail
-  closed on non-convergence or non-finite state. Relative stopping scales are
-  explicit, while device/host convergence synchronization is reduced from
-  every iteration to every eighth iteration.
+  FP32/FP64 dtype/device, and the actual coupled fixed-point equations. Both
+  forward and implicit-adjoint solves fail closed on non-convergence or
+  non-finite state. The later `UOT-LOG-DOMAIN-03` cycle supersedes the original
+  absolute row/column positivity gate with FP64 log-conditional validation,
+  because KL-unbalanced marginals may be exponentially small. Relative
+  stopping scales are explicit, while device/host convergence synchronization
+  is reduced from every iteration to every eighth iteration.
 - Requirement `DDP-CHECKPOINT-COMMIT-01`: distributed checkpoint serialization
   is a collective commit transaction. Rank zero atomically replaces the file,
   then broadcasts success/failure before any peer can enter the next NCCL
@@ -748,3 +750,36 @@ The full conditional validity domain is maintained in
   `scripts/overfit_meshfleet_object.py`, `scripts/train_a800.py`,
   `graft_gs/engine/configuration.py`,
   `graft_gs/mapping/manifold_mapping.py`, and the A800 YAML/protocol.
+
+## 2026-07-22 high-view sparse-UOT and topology-proposal repair
+
+- Requirement `UOT-LOG-DOMAIN-03`: the supplied 16-view/rank run reached the
+  real sparse solver and failed because an exponentially rejected supported
+  component was required to remain positive after FP32 exponentiation. UOT
+  potentials, absolute plan state used by the custom adjoint, and row/column
+  conditional probabilities now use FP64 and log-segment normalization. The
+  returned geometric plan retains its configured FP32 storage contract;
+  representational underflow is explicit telemetry rather than a fabricated
+  mass floor. A run still fails if every edge is below storage range.
+- Requirement `TOPOLOGY-FILTRATION-ENDPOINT-02`: the 24/32/48/64-view runs
+  reached topology selection but every quantile/fixed cut removed the overlap
+  triangles. The valid maximal atlas support, which was already used to define
+  reference persistence, is now an explicit terminal filtration candidate at
+  a threshold strictly below `min(p)`. It competes under the same evidence,
+  persistence, geometry, complexity, boundary, and TRELLIS-prior energies.
+- Surface face construction now inserts cells through a parity union-find. An
+  orientation-conflicting face is rejected locally; it can no longer erase a
+  valid incidence-constrained surface component. The all-support reference is
+  independently required to meet minimum vertex, nondegeneracy, incidence,
+  and orientation conditions. Failure diagnostics include occupancy range,
+  reference `V/E/F`, support cardinalities, and rejection classes.
+- One-object reports and the view-budget selector now certify internal solve
+  dtype, minimum log plan, exact storage-underflow counts and graph
+  cardinalities. The selector treats small acknowledged FP32 underflow as an
+  approximation with a configured fraction bound, not as either exact
+  positivity or an unconditional pass.
+- Production files: `graft_gs/mapping/manifold_mapping.py`,
+  `graft_gs/topology/strata.py`, `graft_gs/engine/configuration.py`,
+  `scripts/overfit_meshfleet_object.py`,
+  `scripts/select_a800_view_budget.py`, and
+  `configs/graft_gs_a800_native.yaml`.

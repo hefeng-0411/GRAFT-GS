@@ -12,11 +12,13 @@ class NativePrecisionPolicy:
     r"""Precision boundary required by the high-fidelity reference path.
 
     The released VGGT transformer is the only BF16 region.  Camera/depth
-    heads, sparse transport, atlas/manifold state, feasibility barriers,
-    analytical readout, and the CUDA rasterizer remain FP32.  FP64 is reserved
-    for detached validation diagnostics rather than training state.  TF32 is
-    disabled because its ten-bit product mantissa can perturb marginal SPD,
-    topology, and transport decisions even though tensors report ``float32``.
+    heads, atlas/manifold storage, analytical readout, and the CUDA rasterizer
+    remain FP32. Sparse UOT is the deliberate exception: its fixed-point
+    potentials and implicit conditional probabilities use FP64/log space,
+    while its returned geometric plan uses this policy's FP32 storage. FP64 is
+    also used by strict feasibility/certification diagnostics. TF32 is disabled
+    because its ten-bit product mantissa can perturb marginal SPD, topology,
+    and transport decisions even though tensors report ``float32``.
     """
 
     backbone: str = "bfloat16"

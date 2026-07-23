@@ -140,8 +140,8 @@ checkpoints, data, or a compiled server dependency.
   old processes have exited. Any ownership exception is a correctness failure,
   not a reason to disable the guard.
 - The locally selected default is 24 views per ordinary object-level rank. For
-  same-object overfit, 8, 12, and 16 views per rank must be profiled on the
-  actual visible subset. Choose the highest measured global useful views/s
+  same-object overfit, 16, 24, 32, 48, and 64 views per rank must be profiled on
+  the actual visible subset. Choose the highest measured global useful views/s
   that preserves finite steps and leaves at least phase/object-dependent
   headroom; 100% reserved memory is not a completion criterion. Phase D/F and
   highly refined objects can peak above the two-step Phase-B fixture.
@@ -168,11 +168,13 @@ checkpoints, data, or a compiled server dependency.
 
 ## 2026-07-22 useful-concurrency measurement boundary
 
-- The 15--16 GiB snapshot is one pre-selection operating point and contains no
-  utilization or views/s trace. Run the protocol's 16/24/32/48/64 view sweep
-  with the current telemetry schema, then retain `selection.json`. The selected
-  value is not A800 validated until every candidate process has exited cleanly
-  and the selector accepts at least one report.
+- The supplied 16/24/32/48/64 sweep is pre-repair failure evidence, not a
+  utilization result: 16 failed on FP32 UOT storage underflow and every larger
+  candidate failed topology proposal. Deploy the FP64/log-domain UOT and
+  maximal-support filtration changes, pass the four focused numerical tests,
+  rerun the sweep with the new telemetry schema, and retain `selection.json`.
+  The selected value is not A800 validated until every candidate process has
+  exited cleanly and the selector accepts at least one report.
 - Larger 4096/16384 radius-graph chunks require the existing sparse-support and
   dense/sparse UOT numerical tests under Torch 2.4. If a threshold-boundary
   fixture differs, retain both supports and revert the chunk sizes rather than

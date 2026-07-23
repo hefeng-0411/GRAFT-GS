@@ -102,6 +102,26 @@ $GRAFT_GS_PYTHON -m unittest \
   -v
 ```
 
+Run the exact regressions for the two failures exposed by the first
+16/24/32/48/64 sweep before spending time on TRELLIS sampling:
+
+```bash
+mkdir -p outputs/validation
+"$GRAFT_GS_PYTHON" -m unittest -v \
+  tests.test_atlas_mapping.ImplicitSinkhornTest.test_float32_storage_underflow_uses_log_domain_float64_reference \
+  tests.test_atlas_mapping.ImplicitSinkhornTest.test_sparse_all_edges_matches_dense_fixed_point_and_has_gradients \
+  tests.test_atlas_mapping.ImplicitSinkhornTest.test_implicit_backward_matches_finite_difference \
+  tests.test_geometry_invariants.TopologyAndManifoldTest.test_diffuse_occupancy_retains_all_support_filtration_stratum \
+  2>&1 | tee outputs/validation/concurrency_numerics.log
+```
+
+All four must pass. The underflow regression is deliberately disconnected and
+contains a positive exact UOT component near `exp(-196)`: FP32 may store that
+entry as zero, but the FP64/log-domain fixed point and implicit conditional
+probabilities must remain finite. The topology regression requires a valid,
+orientable all-support filtration stratum when every ordinary fixed threshold
+would remove the overlap triangles.
+
 After confirming that no previous GRAFT-GS launch remains, sweep distinct views
 per rank. The global loader admits `views_per_rank * world_size` views, then
 shards the CPU sample before its non-blocking CUDA transfer:
@@ -138,12 +158,15 @@ watch -n 2 'nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory \
 
 Select from the measured per-rank records instead of using occupancy as a
 proxy. The selector rejects non-finite loss, unconverged UOT, non-positive hard
-feasibility margins, incomplete rank telemetry, and reserved memory above 85%:
+feasibility margins, incomplete rank telemetry, more than 5% acknowledged
+FP32 transport underflow/zero marginals, and reserved memory above 85%:
 
 ```bash
 "$GRAFT_GS_PYTHON" scripts/select_a800_view_budget.py \
   "outputs/concurrency/$GRAFT_GS_TRAIN_OBJECT_ID/vpr-*/overfit_metrics.json" \
   --maximum-reserved-fraction 0.85 \
+  --maximum-storage-underflow-fraction 0.05 \
+  --maximum-zero-marginal-fraction 0.05 \
   --throughput-fraction 0.97 \
   --output "outputs/concurrency/$GRAFT_GS_TRAIN_OBJECT_ID/selection.json"
 
@@ -159,6 +182,10 @@ The default 0.97 throughput fraction chooses the largest view count whose
 aggregate useful throughput is within 3% of the fastest admissible run. Never
 reserve dummy memory merely to reach 80 GiB. Repeat the sweep in Phase D before
 full training because flow, rendering, and refined atlases have higher peaks.
+Every admitted report must record `internal_solve_dtype=float64`, the minimum
+log-plan value, COO cardinalities, and the exact number of plan entries/source
+rows/target columns that underflowed only when returned to geometric-state
+storage.
 
 For corpus training, use ordinary object-level DDP (omit
 `--same-object-view-shards`). Every visible GPU receives a different complete

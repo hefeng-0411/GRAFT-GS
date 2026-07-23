@@ -319,10 +319,23 @@
   stays within `maximum_position_speed` of its transported input.
 - Sparse implicit UOT assumes positive finite relaxation scales and a support
   covering every source and target node. Zero input mass is represented only
-  through the declared `mass_floor`; if exponentiation removes all transported
-  mass from a supported row or column, the solve aborts. Implicit gradients are
-  valid only after both the primal fixed-point and transposed fixed-point
-  equations meet their recorded scale-relative tolerances.
+  through the declared `mass_floor`. Potentials and row/column conditional
+  probabilities are evaluated in FP64 log space, so a soft unbalanced marginal
+  is allowed to be smaller than FP32 absolute storage range. The returned plan
+  may therefore contain acknowledged zeros; each such FP32 entry has absolute
+  cast error below the FP32 subnormal range, and counts/zero marginals are
+  recorded. An all-zero stored plan aborts. Implicit gradients are valid only
+  after both the primal fixed-point and transposed fixed-point equations meet
+  their recorded scale-relative tolerances; no classical accuracy claim is
+  made for exact values below FP64 range.
+- The terminal topology filtration threshold is chosen strictly below the
+  detached minimum active occupancy. It changes no probability and selects the
+  maximal atlas support already used by reference persistence. Its
+  admissibility still requires at least the configured number of vertices,
+  positive-area faces, edge incidence at most two, and a consistent global
+  face orientation. This guarantees a candidate only when the atlas overlap
+  graph itself contains such a surface complex; it does not repair a
+  topologically wrong atlas.
 - Transport chunk-size changes preserve the mathematical radius graph provided
   no computed distance lies exactly on the strict support threshold and no
   nearest-neighbor tie changes under floating reduction ordering. The A800

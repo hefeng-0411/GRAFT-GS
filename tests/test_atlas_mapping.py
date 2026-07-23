@@ -420,6 +420,37 @@ class PersistentAtlasTest(unittest.TestCase):
 
 
 class ImplicitSinkhornTest(unittest.TestCase):
+    def test_float32_storage_underflow_uses_log_domain_float64_reference(self) -> None:
+        # The second disconnected component has a mathematically positive UOT
+        # mass near exp(-196), below FP32 storage. It must not invalidate the
+        # fixed point or its implicit Jacobian.
+        edge = torch.tensor([[0, 1], [0, 1]], dtype=torch.int64)
+        cost = torch.tensor(
+            [0.0, 200.0], dtype=torch.float32, requires_grad=True
+        )
+        mass = torch.tensor([0.5, 0.5], dtype=torch.float32)
+        solver = ImplicitUnbalancedSinkhorn(
+            ImplicitSinkhornConfig(
+                max_iterations=1000,
+                tolerance=1.0e-10,
+                backward_max_iterations=1000,
+                backward_tolerance=1.0e-10,
+                solve_in_float64=True,
+            )
+        )
+        plan, diagnostics = solver(cost, mass, mass, edge)
+        self.assertEqual(plan.dtype, torch.float32)
+        self.assertEqual(diagnostics.internal_solve_dtype, "float64")
+        self.assertLess(diagnostics.internal_minimum_log_plan, -100.0)
+        self.assertEqual(diagnostics.storage_underflow_edges, 1)
+        self.assertEqual(diagnostics.storage_zero_source_rows, 1)
+        self.assertEqual(diagnostics.storage_zero_target_columns, 1)
+        self.assertGreater(float(plan[0]), 0.0)
+        self.assertEqual(float(plan[1]), 0.0)
+        plan.sum().backward()
+        self.assertIsNotNone(cost.grad)
+        self.assertTrue(torch.all(torch.isfinite(cost.grad)))
+
     def test_solver_rejects_invalid_measure_and_nonconvergence(self) -> None:
         dtype = torch.float64
         edge = torch.tensor([[0, 0, 1, 1], [0, 1, 0, 1]], dtype=torch.int64)

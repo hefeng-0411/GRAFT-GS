@@ -35,6 +35,11 @@ def load_server_config(
     ):
         if not isinstance(value, dict):
             raise ValueError(f"configuration section {name!r} must be a mapping")
+    solve_in_float64 = transport.get(
+        "solve_in_float64", base.mapping.sinkhorn.solve_in_float64
+    )
+    if not isinstance(solve_in_float64, bool):
+        raise ValueError("transport.solve_in_float64 must be a YAML Boolean")
     sinkhorn = replace(
         base.mapping.sinkhorn,
         epsilon=float(transport.get("epsilon", base.mapping.sinkhorn.epsilon)),
@@ -67,6 +72,7 @@ def load_server_config(
                 base.mapping.sinkhorn.convergence_check_interval,
             )
         ),
+        solve_in_float64=solve_in_float64,
     )
     config = replace(
         base,

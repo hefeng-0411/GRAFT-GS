@@ -339,6 +339,14 @@ def main() -> None:
             "minimum_target_transport_mass": float(
                 transport.target_transport_mass.detach().amin().cpu()
             ),
+            "internal_minimum_log_plan": transport.internal_minimum_log_plan,
+            "internal_solve_dtype": transport.internal_solve_dtype,
+            "storage_underflow_edges": transport.storage_underflow_edges,
+            "storage_zero_source_rows": transport.storage_zero_source_rows,
+            "storage_zero_target_columns": transport.storage_zero_target_columns,
+            "edge_count": scene.mapping.graph.num_edges,
+            "source_count": scene.mapping.graph.source_count,
+            "target_count": scene.mapping.graph.target_count,
             "objective": float(transport.objective.detach().cpu()),
         },
         "selected_topology": {

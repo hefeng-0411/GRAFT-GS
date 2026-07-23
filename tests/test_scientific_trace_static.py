@@ -32,6 +32,9 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("sparse unbalanced Sinkhorn did not converge", mapping)
         self.assertIn("implicit Sinkhorn adjoint did not converge", mapping)
         self.assertIn("equation_source = lambda_source", mapping)
+        self.assertIn("solve_in_float64", mapping)
+        self.assertIn("row_log_mass = _segment_logsumexp", mapping)
+        self.assertIn("storage_underflow_edges", mapping)
         self.assertIn("torch.linalg.solve_triangular", mapping)
         self.assertNotIn("precision = torch.linalg.inv(covariance)", mapping)
         tree = ast.parse(mapping)
@@ -47,6 +50,7 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         )
         self.assertIn("convergence_check_interval", configuration)
         self.assertIn("convergence_check_interval: 8", config)
+        self.assertIn("solve_in_float64: true", config)
 
     def test_refined_chart_fit_is_not_decorated_no_grad(self) -> None:
         tree = ast.parse(source("graft_gs/geometry/atlas.py"))
@@ -84,6 +88,8 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
     def test_topology_and_barrier_admissibility_are_hard_checks(self) -> None:
         topology = source("graft_gs/topology/strata.py")
         self.assertIn("def _orient_faces_consistently", topology)
+        self.assertIn("def _greedy_orientable_manifold_faces", topology)
+        self.assertIn('"support-endpoint"', topology)
         self.assertIn("not complex_.orientation_consistent()", topology)
         barrier = source("graft_gs/manifold/barrier.py")
         self.assertIn("minimum_linearized_margin", barrier)

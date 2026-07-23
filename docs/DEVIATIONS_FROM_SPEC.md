@@ -237,8 +237,12 @@
 41. **Implicit transport convergence is an executable precondition.** The
     Markdown describes an implicit sparse Sinkhorn solve but does not prescribe
     failure semantics. Production now rejects unconverged primal or adjoint
-    equations, non-finite plans/gradients, invalid measure domains, and complete
-    supported-node mass underflow. It does not train on a last iterate while
+    equations, non-finite log plans/gradients, invalid measure domains, and an
+    all-zero geometric-storage plan. Unlike the earlier implementation, it
+    does not reject a valid KL-unbalanced solution merely because one relaxed
+    marginal is below FP32: FP64 log-domain conditional probabilities retain
+    the implicit system, while storage underflow is measured and bounded by
+    the concurrency quality gate. It does not train on a last iterate while
     labeling it converged.
 42. **A800 occupancy is constrained, not maximized directly.** The specification
     asks for scalable high-quality training but does not make allocated bytes a
@@ -246,3 +250,11 @@
     physical views and independent accumulated objects. A candidate is selected
     only after finite-state, UOT, feasibility, throughput, and memory-headroom
     checks; dummy reservations and multiple ranks per GPU remain prohibited.
+43. **Maximal atlas support is an explicit topology filtration endpoint.** The
+    specification emphasizes persistence events but does not state that the
+    terminal support must survive a finite positive-threshold proposal budget.
+    Real diffuse occupancy made every quantile/fixed cut degenerate even though
+    the reference all-support complex existed. Production now proposes that
+    endpoint under the same structured energy and constructs its orientable
+    subcomplex with parity-constrained cell insertion. This is not a mesh
+    fallback, topology label, or bypass of hard manifold admissibility.
