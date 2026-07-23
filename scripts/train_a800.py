@@ -327,6 +327,9 @@ def main() -> None:
             require_mesh_depth_normals=bool(
                 training_config.get("require_mesh_depth_normals", False)
             ),
+            mesh_supervision_view_chunk_size=int(
+                training_config.get("mesh_supervision_view_chunk_size", 2)
+            ),
             teacher_bundle_root=(
                 str(args.teacher_bundle_root.resolve())
                 if args.teacher_bundle_root is not None

@@ -359,3 +359,11 @@
   configured learning rate remains fixed unless an explicit ablation changes
   it. Same-object multiview sharding does not satisfy this independence
   assumption and therefore cannot activate the policy.
+- Mesh-derived depth and normal targets are independent functions of each
+  audited camera and the same immutable triangle soup. Contiguous view
+  chunking is therefore mathematically equivalent to full-view instance-mode
+  rasterization provided nvdiffrast does not couple batches through a
+  cross-view reduction. Concatenation preserves manifest order; the A800
+  equivalence test checks depth, normal, visibility, and validity tensors.
+  This supervision path is explicitly `no_grad` because neither source mesh
+  nor ground-truth cameras are trainable state.

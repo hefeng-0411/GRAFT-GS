@@ -231,6 +231,15 @@ def main() -> None:
             trellis_latent_pseudo_confidence=float(
                 dataset_config.get("trellis_latent_pseudo_confidence", 0.5)
             ),
+            derive_mesh_depth_normals=bool(
+                training_config.get("derive_mesh_depth_normals", True)
+            ),
+            require_mesh_depth_normals=bool(
+                training_config.get("require_mesh_depth_normals", False)
+            ),
+            mesh_supervision_view_chunk_size=int(
+                training_config.get("mesh_supervision_view_chunk_size", 2)
+            ),
         ),
         loss_weights=loss_weights,
     )
@@ -328,6 +337,11 @@ def main() -> None:
         "global_training_views": maximum_views,
         "evaluation_views": evaluation_view_count,
         "rank_performance": rank_performance,
+        "mesh_supervision": {
+            "derive_depth_normals": trainer.config.derive_mesh_depth_normals,
+            "required": trainer.config.require_mesh_depth_normals,
+            "view_chunk_size": trainer.config.mesh_supervision_view_chunk_size,
+        },
         "transport": {
             "iterations": transport.iterations,
             "fixed_point_residual": transport.fixed_point_residual,

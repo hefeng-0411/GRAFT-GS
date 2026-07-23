@@ -246,7 +246,9 @@ class MeshFleetAuditTest(unittest.TestCase):
             )
         )
         sample = dataset[_audited_dataset_index(dataset)]
-        target = MeshGroundTruthRasterizer(torch.device("cuda"))(
+        target = MeshGroundTruthRasterizer(
+            torch.device("cuda"), view_chunk_size=2
+        )(
             sample["modality_paths"]["render_mesh"],
             sample["extrinsics_world_to_camera"].cuda(),
             sample["intrinsics"].cuda(),
@@ -258,6 +260,19 @@ class MeshFleetAuditTest(unittest.TestCase):
         self.assertTrue(bool(torch.any(target.visibility)))
         self.assertTrue(torch.isfinite(target.depth).all())
         self.assertTrue(torch.isfinite(target.normal).all())
+        chunked = MeshGroundTruthRasterizer(
+            torch.device("cuda"), view_chunk_size=1
+        )(
+            sample["modality_paths"]["render_mesh"],
+            sample["extrinsics_world_to_camera"].cuda(),
+            sample["intrinsics"].cuda(),
+            64,
+            64,
+        )
+        torch.testing.assert_close(chunked.depth, target.depth, atol=1.0e-6, rtol=1.0e-6)
+        torch.testing.assert_close(chunked.normal, target.normal, atol=1.0e-6, rtol=1.0e-6)
+        torch.testing.assert_close(chunked.visibility, target.visibility)
+        torch.testing.assert_close(chunked.normal_validity, target.normal_validity)
 
     def test_invalid_topology_cannot_activate_betti_loss(self) -> None:
         output = SimpleNamespace(

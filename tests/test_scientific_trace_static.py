@@ -439,6 +439,45 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn('"$PYTHON_BIN" -m torch.distributed.run', launcher)
         self.assertIn("torch.cuda.device_count()", launcher)
 
+    def test_mesh_supervision_is_chunked_before_trainable_forward(self) -> None:
+        trainer = source("graft_gs/engine/trainer.py")
+        rasterizer = source("graft_gs/data/mesh_supervision.py")
+        overfit = source("scripts/overfit_meshfleet_object.py")
+        training = source("scripts/train_a800.py")
+        config = source("configs/graft_gs_a800_native.yaml")
+
+        train_step = trainer.index("def train_step(")
+        target_derivation = trainer.index(
+            "mesh_targets = self._derive_mesh_targets(", train_step
+        )
+        trainable_forward = trainer.index("output = forward_model()", train_step)
+        self.assertLess(target_derivation, trainable_forward)
+        validation = trainer.index("def validate(")
+        validation_targets = trainer.index(
+            "mesh_targets = self._derive_mesh_targets(", validation
+        )
+        validation_forward = trainer.index("output = self.model(", validation)
+        self.assertLess(validation_targets, validation_forward)
+        self.assertIn("@torch.no_grad()", rasterizer)
+        self.assertIn(
+            "for start in range(0, k, self.view_chunk_size):", rasterizer
+        )
+        self.assertIn("mesh_supervision_view_chunk_size: int = 2", trainer)
+        self.assertIn('"mesh_supervision_view_chunk_size",', trainer)
+        self.assertIn(
+            'training_config.get("mesh_supervision_view_chunk_size", 2)',
+            overfit,
+        )
+        self.assertIn(
+            '"view_chunk_size": trainer.config.mesh_supervision_view_chunk_size',
+            overfit,
+        )
+        self.assertIn(
+            'training_config.get("mesh_supervision_view_chunk_size", 2)',
+            training,
+        )
+        self.assertIn("mesh_supervision_view_chunk_size: 2", config)
+
     def test_a800_concurrency_uses_useful_views_and_early_rank_binding(self) -> None:
         trainer = source("graft_gs/engine/trainer.py")
         overfit = source("scripts/overfit_meshfleet_object.py")

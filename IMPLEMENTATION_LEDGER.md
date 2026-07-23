@@ -816,3 +816,35 @@ The full conditional validity domain is maintained in
   `graft_gs/topology/__init__.py`, `graft_gs/engine/configuration.py`,
   `scripts/overfit_meshfleet_object.py`,
   `scripts/select_a800_view_budget.py`, and the A800 YAML.
+
+## 2026-07-23 bounded exact-camera mesh supervision
+
+- Requirement `MESHFLEET-RASTER-MEMORY-02`: the post-persistence two-rank
+  16-view/rank run advanced through TRELLIS, UOT, atlas, and topology, then
+  failed in nvdiffrast `cudaMalloc` while deriving immutable mesh depth/normal
+  targets after the full trainable forward graph had already occupied device
+  memory. This was a tensor-lifetime and batch-workspace defect, not permission
+  to drop geometrically valid supervision.
+- `MeshGroundTruthRasterizer` now renders deterministic contiguous view chunks
+  of size two against the same triangle soup, cameras, projection, and
+  nvdiffrast context. Transient transformed-vertex/binning storage scales with
+  chunk size rather than every local view. Depth, normal, visibility, and
+  normal-validity tensors are concatenated in original view order.
+- Train and validation target derivation now occurs before the model forward.
+  The target path is explicitly `no_grad`; no learned gradient is removed
+  because source mesh geometry and audited cameras are immutable supervision.
+  The total target storage remains present for the loss, while nvdiffrast's
+  transient workspace no longer overlaps the forward activation peak.
+- The chunk size is a positive, checkpoint-resume-sensitive
+  `TrainerConfig` field read by both `train_a800.py` and
+  `overfit_meshfleet_object.py` from the A800 YAML. The overfit entry point now
+  also honors the existing derive/require mesh-supervision YAML controls
+  instead of relying on dataclass defaults.
+- The A800 MeshFleet test compares chunk size one with the former two-view
+  batch at `1e-6` for continuous outputs and exactly for Boolean masks.
+- A verified stray `z` after `GraftGSConfig()` in the current configuration
+  loader was removed after direct `py_compile` reproduced the syntax failure.
+- Production files: `graft_gs/data/mesh_supervision.py`,
+  `graft_gs/engine/trainer.py`, `graft_gs/engine/configuration.py`,
+  `scripts/train_a800.py`, `scripts/overfit_meshfleet_object.py`, and
+  `configs/graft_gs_a800_native.yaml`.

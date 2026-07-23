@@ -105,6 +105,7 @@ class TrainerConfig:
     trellis_latent_pseudo_confidence: float = 0.0
     derive_mesh_depth_normals: bool = True
     require_mesh_depth_normals: bool = False
+    mesh_supervision_view_chunk_size: int = 2
     teacher_bundle_root: Optional[str] = None
     teacher_bundle_digest: Optional[str] = None
     teacher_bundle_minimum_confidence: float = 0.0
@@ -167,6 +168,8 @@ class TrainerConfig:
             raise ValueError("DINO pseudo confidence must lie in [0,1]")
         if not 0 <= self.trellis_latent_pseudo_confidence <= 1:
             raise ValueError("TRELLIS latent pseudo confidence must lie in [0,1]")
+        if self.mesh_supervision_view_chunk_size < 1:
+            raise ValueError("mesh supervision view chunk size must be positive")
         if not 0 <= self.teacher_bundle_minimum_confidence <= 1:
             raise ValueError("teacher bundle minimum confidence must lie in [0,1]")
         if (self.teacher_bundle_root is None) != (self.teacher_bundle_digest is None):
@@ -1107,6 +1110,13 @@ class GraftGSTrainer:
         for adversary in scale_adversaries:
             adversary.reset_adversary()
         forward_rng_state = self._capture_forward_rng() if scale_adversaries else None
+        # These targets are immutable functions of the audited mesh and camera
+        # manifests. Render them before the trainable forward graph exists so
+        # nvdiffrast's transient binning/geometry workspace cannot overlap the
+        # model's peak activation state.
+        mesh_targets = self._derive_mesh_targets(
+            batch, view_supervision, images.shape[-2:]
+        )
 
         def forward_model() -> GraftGSOutput:
             return self.model(
@@ -1132,9 +1142,7 @@ class GraftGSTrainer:
             loss_batch["evidence_mask"] = valid_mask
             if "alpha" in view_supervision:
                 loss_batch["alpha"] = view_supervision["alpha"]
-            loss_batch.update(
-                self._derive_mesh_targets(batch, view_supervision, images.shape[-2:])
-            )
+            loss_batch.update(mesh_targets)
             if self.config.phase is TrainingPhase.TOPOLOGY_HARDENING:
                 loss_batch["feasibility_relative_margin"] = (
                     self.config.topology_hardening_relative_margin
@@ -1540,6 +1548,9 @@ class GraftGSTrainer:
             }
             atlas_root_bounds = self._atlas_root_bounds(batch)
             trellis_prior_seed = self._trellis_prior_seed(batch)
+            mesh_targets = self._derive_mesh_targets(
+                batch, view_supervision, images.shape[-2:]
+            )
             output = self.model(
                 images,
                 valid_mask=valid_mask,
@@ -1556,9 +1567,7 @@ class GraftGSTrainer:
             loss_batch["evidence_mask"] = valid_mask
             if "alpha" in view_supervision:
                 loss_batch["alpha"] = view_supervision["alpha"]
-            loss_batch.update(
-                self._derive_mesh_targets(batch, view_supervision, images.shape[-2:])
-            )
+            loss_batch.update(mesh_targets)
             total, terms = self.loss(self.module, output, loss_batch, self.config.phase.value)
             values = {**terms, "total": total}
             for name, value in values.items():
@@ -1677,7 +1686,10 @@ class GraftGSTrainer:
         if self._mesh_supervisor is None:
             from ..data.mesh_supervision import MeshGroundTruthRasterizer
 
-            self._mesh_supervisor = MeshGroundTruthRasterizer(self.context.device)
+            self._mesh_supervisor = MeshGroundTruthRasterizer(
+                self.context.device,
+                view_chunk_size=self.config.mesh_supervision_view_chunk_size,
+            )
         extrinsics = view_supervision["extrinsics_world_to_camera"]
         intrinsics = view_supervision["intrinsics"]
         if extrinsics.shape[0] != 1:
@@ -1899,6 +1911,7 @@ class GraftGSTrainer:
                 "trellis_latent_pseudo_confidence",
                 "derive_mesh_depth_normals",
                 "require_mesh_depth_normals",
+                "mesh_supervision_view_chunk_size",
                 "teacher_bundle_root",
                 "teacher_bundle_digest",
                 "teacher_bundle_minimum_confidence",

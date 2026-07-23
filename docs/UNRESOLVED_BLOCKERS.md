@@ -198,3 +198,24 @@ checkpoints, data, or a compiled server dependency.
   pairs and three modes (`exact` or `sliced`) for the selected topology. Peak
   allocated/reserved memory must then be measured anew; the 69.67 GiB
   pre-repair allocation is not assumed to be the post-repair peak.
+
+## 2026-07-23 mesh-target raster-memory rerun boundary
+
+- The next run passed topology and failed later in nvdiffrast target
+  rasterization with CUDA error 2. It used the old post-forward full-view
+  target schedule and a malformed command ending in
+  `tee "$SMOKE_DIR/run.log"-1`; it produced no valid metrics/checkpoint/assets
+  certificate.
+- Deploy the bounded rasterizer and pre-forward target schedule. Run the
+  protocol's six focused tests; the MeshFleet test must establish continuous
+  chunk/full-batch agreement at `1e-6` and exact Boolean masks on the A800
+  implementation.
+- Rerun a fresh two-step smoke with explicit `--evaluation-views 24`,
+  `--steps 2`, `--minimum-relative-improvement -1`, and
+  `--output "$SMOKE_DIR"`. Do not reuse any output directory from a malformed
+  or failed command.
+- A pass requires two finite optimizer steps, converged FP64/log UOT,
+  cardinality/mode persistence telemetry, positive final feasibility margins,
+  a committed final checkpoint, rank-zero evaluation, and independently
+  reloadable PLY/GLB. New rank-local peak allocated/reserved memory is required
+  before increasing views per rank.

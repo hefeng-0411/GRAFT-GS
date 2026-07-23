@@ -79,13 +79,27 @@ def load_triangle_soup(path: str | Path, device: torch.device) -> TriangleSoup:
 
 
 class MeshGroundTruthRasterizer:
-    """Exact-camera CUDA rasterization with a bounded triangle-soup cache."""
+    """Exact-camera CUDA rasterization with bounded geometry and view memory.
 
-    def __init__(self, device: torch.device, near: float = 0.01, far: float = 100.0, cache_size: int = 2) -> None:
+    Mesh targets are immutable supervision, not a trainable renderer.  Views are
+    therefore rasterized in deterministic contiguous chunks.  This preserves
+    the exact per-view camera/triangle result while preventing nvdiffrast's
+    transient geometry and binning buffers from scaling with the full
+    same-object DDP view budget.
+    """
+
+    def __init__(
+        self,
+        device: torch.device,
+        near: float = 0.01,
+        far: float = 100.0,
+        cache_size: int = 2,
+        view_chunk_size: int = 2,
+    ) -> None:
         if device.type != "cuda":
             raise ValueError("mesh-derived rasterization is an A800 CUDA supervision path")
-        if not 0 < near < far or cache_size < 1:
-            raise ValueError("invalid near/far planes or cache size")
+        if not 0 < near < far or cache_size < 1 or view_chunk_size < 1:
+            raise ValueError("invalid near/far planes, cache size, or view chunk size")
         try:
             import nvdiffrast.torch as dr
         except ImportError as error:
@@ -98,6 +112,7 @@ class MeshGroundTruthRasterizer:
         self.near = near
         self.far = far
         self.cache_size = cache_size
+        self.view_chunk_size = view_chunk_size
         self.cache: OrderedDict[str, TriangleSoup] = OrderedDict()
 
     def _mesh(self, path: str | Path) -> TriangleSoup:
@@ -112,6 +127,7 @@ class MeshGroundTruthRasterizer:
             self.cache.popitem(last=False)
         return mesh
 
+    @torch.no_grad()
     def __call__(
         self,
         path: str | Path,
@@ -130,51 +146,81 @@ class MeshGroundTruthRasterizer:
         if intrinsics.shape != (extrinsics.shape[0], 3, 3):
             raise ValueError("mesh intrinsics must have shape [K,3,3]")
         k = extrinsics.shape[0]
-        full_extrinsic = torch.eye(4, device=self.device, dtype=mesh.vertices.dtype).expand(k, 4, 4).clone()
-        full_extrinsic[:, :3] = extrinsics
-        normalized = intrinsics.clone()
-        normalized[:, 0] /= float(width)
-        normalized[:, 1] /= float(height)
-        projection = torch.zeros(k, 4, 4, dtype=mesh.vertices.dtype, device=self.device)
-        projection[:, 0, 0] = 2.0 * normalized[:, 0, 0]
-        projection[:, 1, 1] = 2.0 * normalized[:, 1, 1]
-        projection[:, 0, 2] = 2.0 * normalized[:, 0, 2] - 1.0
-        projection[:, 1, 2] = -2.0 * normalized[:, 1, 2] + 1.0
-        projection[:, 2, 2] = self.far / (self.far - self.near)
-        projection[:, 2, 3] = self.near * self.far / (self.near - self.far)
-        projection[:, 3, 2] = 1.0
+        if k < 1:
+            raise ValueError("mesh supervision requires at least one camera")
         homogeneous = torch.cat(
             (mesh.vertices, torch.ones_like(mesh.vertices[:, :1])), dim=-1
-        ).expand(k, -1, -1)
-        camera_vertex = homogeneous @ full_extrinsic.transpose(-1, -2)
-        clip_vertex = homogeneous @ (projection @ full_extrinsic).transpose(-1, -2)
-        raster, _ = self.dr.rasterize(
-            self.context,
-            clip_vertex,
-            mesh.faces,
-            (height, width),
         )
-        visibility = raster[..., 3:4] > 0
-        depth = self.dr.interpolate(
-            camera_vertex[..., 2:3].contiguous(), raster, mesh.faces
-        )[0]
-        camera_normal = torch.einsum(
-            "kij,vj->kvi", extrinsics[:, :3, :3], mesh.normals
-        )
-        normal = self.dr.interpolate(camera_normal.contiguous(), raster, mesh.faces)[0]
-        normal_length = torch.linalg.vector_norm(normal, dim=-1, keepdim=True)
-        normal_validity = visibility & (normal_length > 1.0e-8)
-        normal = torch.where(
-            normal_validity,
-            normal / normal_length.clamp_min(1.0e-8),
-            torch.zeros_like(normal),
-        )
-        depth = torch.where(visibility, depth, torch.zeros_like(depth))
+        depths: list[Tensor] = []
+        normals: list[Tensor] = []
+        visibilities: list[Tensor] = []
+        normal_validities: list[Tensor] = []
+        for start in range(0, k, self.view_chunk_size):
+            stop = min(start + self.view_chunk_size, k)
+            chunk_extrinsics = extrinsics[start:stop]
+            chunk_intrinsics = intrinsics[start:stop]
+            chunk_size = stop - start
+            full_extrinsic = (
+                torch.eye(4, device=self.device, dtype=mesh.vertices.dtype)
+                .expand(chunk_size, 4, 4)
+                .clone()
+            )
+            full_extrinsic[:, :3] = chunk_extrinsics
+            normalized = chunk_intrinsics.clone()
+            normalized[:, 0] /= float(width)
+            normalized[:, 1] /= float(height)
+            projection = torch.zeros(
+                chunk_size, 4, 4, dtype=mesh.vertices.dtype, device=self.device
+            )
+            projection[:, 0, 0] = 2.0 * normalized[:, 0, 0]
+            projection[:, 1, 1] = 2.0 * normalized[:, 1, 1]
+            projection[:, 0, 2] = 2.0 * normalized[:, 0, 2] - 1.0
+            projection[:, 1, 2] = -2.0 * normalized[:, 1, 2] + 1.0
+            projection[:, 2, 2] = self.far / (self.far - self.near)
+            projection[:, 2, 3] = self.near * self.far / (self.near - self.far)
+            projection[:, 3, 2] = 1.0
+
+            chunk_homogeneous = homogeneous.expand(chunk_size, -1, -1)
+            camera_vertex = chunk_homogeneous @ full_extrinsic.transpose(-1, -2)
+            clip_vertex = chunk_homogeneous @ (
+                projection @ full_extrinsic
+            ).transpose(-1, -2)
+            raster, _ = self.dr.rasterize(
+                self.context,
+                clip_vertex,
+                mesh.faces,
+                (height, width),
+            )
+            visibility = raster[..., 3:4] > 0
+            depth = self.dr.interpolate(
+                camera_vertex[..., 2:3].contiguous(), raster, mesh.faces
+            )[0]
+            camera_normal = torch.einsum(
+                "kij,vj->kvi",
+                chunk_extrinsics[:, :3, :3],
+                mesh.normals,
+            )
+            normal = self.dr.interpolate(
+                camera_normal.contiguous(), raster, mesh.faces
+            )[0]
+            normal_length = torch.linalg.vector_norm(normal, dim=-1, keepdim=True)
+            normal_validity = visibility & (normal_length > 1.0e-8)
+            normal = torch.where(
+                normal_validity,
+                normal / normal_length.clamp_min(1.0e-8),
+                torch.zeros_like(normal),
+            )
+            depth = torch.where(visibility, depth, torch.zeros_like(depth))
+            depths.append(depth.permute(0, 3, 1, 2))
+            normals.append(normal.permute(0, 3, 1, 2))
+            visibilities.append(visibility.permute(0, 3, 1, 2))
+            normal_validities.append(normal_validity.permute(0, 3, 1, 2))
+
         return MeshDerivedTargets(
-            depth=depth.permute(0, 3, 1, 2),
-            normal=normal.permute(0, 3, 1, 2),
-            visibility=visibility.permute(0, 3, 1, 2),
-            normal_validity=normal_validity.permute(0, 3, 1, 2),
+            depth=torch.cat(depths, dim=0),
+            normal=torch.cat(normals, dim=0),
+            visibility=torch.cat(visibilities, dim=0),
+            normal_validity=torch.cat(normal_validities, dim=0),
             normal_provenance=mesh.normal_provenance,
         )
 

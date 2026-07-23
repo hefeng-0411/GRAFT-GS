@@ -113,10 +113,11 @@ mkdir -p outputs/validation
   tests.test_atlas_mapping.ImplicitSinkhornTest.test_implicit_backward_matches_finite_difference \
   tests.test_geometry_invariants.TopologyAndManifoldTest.test_diffuse_occupancy_retains_all_support_filtration_stratum \
   tests.test_geometry_invariants.TopologyAndManifoldTest.test_large_persistence_matching_is_linear_memory_symmetric_and_differentiable \
+  tests.test_meshfleet_contract.MeshFleetAuditTest.test_nonmanifold_mesh_still_derives_depth_and_normals \
   2>&1 | tee outputs/validation/concurrency_numerics.log
 ```
 
-All five must pass. The underflow regression is deliberately disconnected and
+All six must pass. The underflow regression is deliberately disconnected and
 contains a positive exact UOT component near `exp(-196)`: FP32 may store that
 entry as zero, but the FP64/log-domain fixed point and implicit conditional
 probabilities must remain finite. The topology regression requires a valid,
@@ -124,6 +125,10 @@ orientable all-support filtration stratum when every ordinary fixed threshold
 would remove the overlap triangles. The persistence regression patches
 `torch.cdist` to fail and then exercises a 600-by-600 diagram through the
 linear-memory sliced path, including symmetry, identity, and finite gradients.
+The MeshFleet raster test compares one-view chunks against the former two-view
+batch for depth, normals, visibility, and normal validity. This is the
+numerical boundary for moving immutable mesh targets before the trainable graph
+and bounding nvdiffrast workspace.
 
 After confirming that no previous GRAFT-GS launch remains, sweep distinct views
 per rank. The global loader admits `views_per_rank * world_size` views, then

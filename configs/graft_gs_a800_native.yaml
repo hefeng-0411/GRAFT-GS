@@ -138,6 +138,9 @@ training:
   teacher_topology_confidence: 0.5
   derive_mesh_depth_normals: true
   require_mesh_depth_normals: false
+  # Exact-camera targets are invariant per view. Chunking bounds nvdiffrast
+  # geometry/binning workspace without reducing view count or target precision.
+  mesh_supervision_view_chunk_size: 2
 loss:
   transport: 1.0
   surface: 5.0

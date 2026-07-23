@@ -473,3 +473,23 @@ in-memory compilation passed all 67 Python files. The environment,
 scientific-production, and concurrency-policy suites passed 38/38. A
 repository scan found no remaining pasted rank traceback/OOM markers in source.
 No post-repair A800 forward/backward, runtime, memory peak, or asset is claimed.
+
+Bounded mesh-supervision cycle (2026-07-23): the next supplied two-rank run is
+pre-repair evidence that execution passed the persistence matcher. Rank 1 then
+failed at `nvdiffrast.rasterize_fwd_cuda` with CUDA error 2 while
+`_derive_mesh_targets` ran after the trainable forward. The supplied shell
+command was also malformed: `tee "$SMOKE_DIR/run.log"-1` replaced the intended
+evaluation/step/minimum-improvement/output arguments, so it cannot produce a
+valid smoke certificate even if the CUDA call were to pass.
+
+After view chunking, pre-forward target scheduling, entry-point/config wiring,
+and removal of the confirmed `configuration.py` stray character, in-memory
+compilation passed all 67 Python files. The environment, scientific production
+trace, and view-budget suites passed 39/39 locally. The real nvdiffrast
+chunk/full-batch equivalence test was generated but is not claimed locally
+because the drafting runtime lacks PyTorch/CUDA/nvdiffrast. The corrected
+six-test A800 command and two-step smoke remain server-pending; no post-repair
+VRAM, throughput, optimizer step, checkpoint, render, PLY, or GLB is claimed.
+An already-installed local PyYAML interpreter also parsed the complete A800
+YAML and verified `training.mesh_supervision_view_chunk_size == 2`; no package
+was installed or changed.
