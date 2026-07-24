@@ -14,6 +14,12 @@ SPEC = importlib.util.spec_from_file_location(
 assert SPEC is not None and SPEC.loader is not None
 MODULE = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(MODULE)
+SWEEP_SPEC = importlib.util.spec_from_file_location(
+    "sweep_a800_view_budget", ROOT / "scripts" / "sweep_a800_view_budget.py"
+)
+assert SWEEP_SPEC is not None and SWEEP_SPEC.loader is not None
+SWEEP = importlib.util.module_from_spec(SWEEP_SPEC)
+SWEEP_SPEC.loader.exec_module(SWEEP)
 
 
 def report(views: int, throughput: float, reserved: float) -> dict[str, object]:
@@ -54,10 +60,46 @@ def report(views: int, throughput: float, reserved: float) -> dict[str, object]:
             "persistence_cardinality": [[4, 4], [2, 2], [0, 0]],
             "persistence_matching_mode": ["exact", "exact", "exact"],
         },
+        "rendering": {
+            "backend": "cuda",
+            "checkpoint_views": True,
+        },
     }
 
 
 class ViewBudgetSelectionTest(unittest.TestCase):
+    def test_sweep_command_is_complete_and_oom_stops_larger_candidates(self) -> None:
+        candidates = SWEEP.validate_candidates((16, 24, 32, 48, 64))
+        self.assertEqual(candidates, (16, 24, 32, 48, 64))
+        with self.assertRaisesRegex(ValueError, "strictly increasing"):
+            SWEEP.validate_candidates((16, 32, 24))
+        self.assertTrue(
+            SWEEP.log_reports_oom("RuntimeError: CUDA error: out of memory")
+        )
+        command = SWEEP.build_overfit_command(
+            python="/pinned/python",
+            nproc_per_node=2,
+            dataset_root=Path("/dataset"),
+            manifest=Path("/manifest.jsonl"),
+            object_id="object",
+            config=Path("configs/graft_gs_a800_native.yaml"),
+            vggt_checkpoint="vggt",
+            trellis_checkpoint="trellis",
+            views_per_rank=32,
+            evaluation_views=24,
+            steps=3,
+            minimum_relative_improvement=-1.0,
+            output=Path("/output"),
+        )
+        for option in (
+            "--views-per-rank",
+            "--evaluation-views",
+            "--steps",
+            "--minimum-relative-improvement",
+            "--output",
+        ):
+            self.assertIn(option, command)
+
     def test_empty_constraint_family_positive_infinity_is_admissible(self) -> None:
         value = report(16, 10.0, 0.3)
         value["final_feasibility"]["minimum_separation_margin"] = float("inf")
@@ -115,6 +157,16 @@ class ViewBudgetSelectionTest(unittest.TestCase):
         self.assertFalse(candidate["admissible"])
         self.assertIn(
             "persistence matching modes are invalid or missing",
+            candidate["reasons"],
+        )
+
+    def test_rejects_stale_report_without_renderer_memory_certificate(self) -> None:
+        invalid = report(24, 10.0, 0.4)
+        del invalid["rendering"]
+        candidate = MODULE.audit_report(invalid, 0.85)
+        self.assertFalse(candidate["admissible"])
+        self.assertIn(
+            "renderer memory-policy certificate is missing",
             candidate["reasons"],
         )
 

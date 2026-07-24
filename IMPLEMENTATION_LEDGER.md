@@ -848,3 +848,41 @@ The full conditional validity domain is maintained in
   `graft_gs/engine/trainer.py`, `graft_gs/engine/configuration.py`,
   `scripts/train_a800.py`, `scripts/overfit_meshfleet_object.py`, and
   `configs/graft_gs_a800_native.yaml`.
+
+## 2026-07-24 high-view renderer recomputation and fail-closed sweep
+
+- Requirement `CUDA-RENDER-TAPE-MEMORY-03`: the supplied fresh sweep advanced
+  through target rasterization and failed at 32 views/rank while the production
+  Gaussian renderer was accumulating three native CUDA rasterizer autograd
+  states per view. The reported `normalize` line is only the allocation
+  synchronization point; the retained per-view splat tapes are the causal
+  linear-in-view memory state.
+- `CudaGaussianRenderer` now wraps each complete deterministic
+  RGB/alpha-depth/normal view operator in PyTorch 2.4 non-reentrant activation
+  checkpointing. All four output tensors and all losses are unchanged; native
+  raster intermediates are recomputed one view at a time during backward.
+  Shared zero-background/subpixel tensors and FP32 analytical inputs are
+  constructed once per camera batch.
+- Checkpointing is a Boolean `TrainerConfig` execution policy, not a
+  `GraftGSConfig` model parameter. Both training entry points read it from the
+  A800 YAML, the trainer applies it before DDP wrapping, metrics record it, and
+  exact resume records it. Checkpoint format 7 adds this field plus the mesh
+  target chunk policy while accepting format-6 checkpoints only at their
+  declared legacy defaults.
+- `select_a800_view_budget.py` schema v2 rejects stale reports without the
+  active CUDA checkpoint certificate. When no candidate is admissible it now
+  writes `selection.json` with every rejection reason before raising; “no
+  candidate” is no longer an opaque terminal message.
+- New `sweep_a800_view_budget.py` eliminates shell-redirection/quoting defects,
+  binds the dynamic visible GPU count to `CUDA_VISIBLE_DEVICES`, requires a
+  fresh root, retains exact child commands/logs, stops larger monotone
+  candidates after CUDA OOM, writes `sweep_summary.json`, and invokes the
+  scientific selector over completed reports only.
+- The A800 regression compares checkpointed and uncheckpointed CUDA forward
+  color/alpha/depth/normal at `1e-6` and Gaussian-state gradients at
+  `2e-5 + 2e-4 relative`; no local CUDA pass is claimed.
+- Production files: `graft_gs/readout/renderer.py`,
+  `graft_gs/engine/trainer.py`, `graft_gs/engine/configuration.py`,
+  `scripts/overfit_meshfleet_object.py`, `scripts/train_a800.py`,
+  `scripts/select_a800_view_budget.py`,
+  `scripts/sweep_a800_view_budget.py`, and the A800 YAML.

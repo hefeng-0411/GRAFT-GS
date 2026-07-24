@@ -37,6 +37,10 @@ def load_server_config(
     ):
         if not isinstance(value, dict):
             raise ValueError(f"configuration section {name!r} must be a mapping")
+    if not isinstance(training.get("renderer_checkpoint_views", True), bool):
+        raise ValueError(
+            "training.renderer_checkpoint_views must be a YAML Boolean"
+        )
     solve_in_float64 = transport.get(
         "solve_in_float64", base.mapping.sinkhorn.solve_in_float64
     )

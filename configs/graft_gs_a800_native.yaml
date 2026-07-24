@@ -141,6 +141,9 @@ training:
   # Exact-camera targets are invariant per view. Chunking bounds nvdiffrast
   # geometry/binning workspace without reducing view count or target precision.
   mesh_supervision_view_chunk_size: 2
+  # Recompute each deterministic CUDA splat during backward instead of
+  # retaining three native rasterizer states for every input view.
+  renderer_checkpoint_views: true
 loss:
   transport: 1.0
   surface: 5.0

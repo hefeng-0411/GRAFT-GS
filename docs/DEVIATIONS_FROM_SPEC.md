@@ -267,3 +267,12 @@
     couplings. This changes the large-diagram soft topology energy, not Betti
     numbers, persistence reduction, hard incidence/orientation admissibility,
     or the selected complex. The approximation mode/cardinality is serialized.
+45. **High-view CUDA rendering recomputes rather than retains native tapes.**
+    The Markdown specifies the differentiable image objective but not its
+    activation-lifetime policy. Production preserves every FP32 TRELLIS
+    mip-splat output and loss while non-reentrant checkpointing recomputes one
+    deterministic view during backward. This trades additional raster work for
+    bounded native autograd state; it does not reduce views, resolution,
+    channels, Gaussian count, camera precision, or supervision.
+    Forward/gradient equivalence remains conditional on the executable A800
+    checkpoint test.

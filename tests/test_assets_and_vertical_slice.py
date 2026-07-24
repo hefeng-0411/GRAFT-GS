@@ -528,6 +528,84 @@ class AnalyticalAssetTest(unittest.TestCase):
         self.assertTrue(torch.all(torch.isfinite(gaussians.covariance.grad)))
         self.assertGreater(float(gaussians.covariance.grad.abs().sum()), 0.0)
 
+    @unittest.skipUnless(
+        importlib.util.find_spec("diff_gaussian_rasterization"),
+        "CUDA rasterizer is built only on the server",
+    )
+    def test_cuda_view_checkpoint_matches_forward_and_gradients(self) -> None:
+        if not torch.cuda.is_available():
+            self.skipTest("CUDA is unavailable")
+        atlas, mapping, selection = _fixture()
+        state = GraftGS._state_from_mapping(atlas, mapping, selection)
+        source, _ = AnalyticalSurfaceReadout().double()(atlas, state, mapping)
+
+        differentiable = {
+            "means",
+            "covariance",
+            "rotation",
+            "sh_coefficients",
+            "opacity",
+        }
+
+        def clone_asset():
+            values = {}
+            for name in source.__dataclass_fields__:
+                value = getattr(source, name).detach().clone().cuda()
+                if value.dtype.is_floating_point:
+                    value = value.float()
+                if name in differentiable:
+                    value.requires_grad_(True)
+                values[name] = value
+            return type(source)(**values)
+
+        direct_asset = clone_asset()
+        checkpointed_asset = clone_asset()
+        extrinsic = torch.eye(4, device="cuda")[:3].repeat(2, 1, 1)
+        extrinsic[:, 2, 3] = 3.0
+        extrinsic[1, 0, 3] = 0.05
+        intrinsic = torch.tensor(
+            [[12.0, 0.0, 7.25], [0.0, 12.0, 8.5], [0.0, 0.0, 1.0]],
+            device="cuda",
+        ).repeat(2, 1, 1)
+        cameras = CameraBatch(extrinsic, intrinsic, 16, 16)
+
+        direct = CudaGaussianRenderer(checkpoint_views=False)(
+            direct_asset, cameras
+        )
+        checkpointed = CudaGaussianRenderer(checkpoint_views=True)(
+            checkpointed_asset, cameras
+        )
+        for name in ("color", "alpha", "depth", "normal"):
+            torch.testing.assert_close(
+                getattr(checkpointed, name),
+                getattr(direct, name),
+                atol=1.0e-6,
+                rtol=1.0e-6,
+            )
+
+        def objective(render):
+            return (
+                render.color.square().mean()
+                + 0.5 * render.alpha.mean()
+                + 0.1 * render.depth.square().mean()
+                + 0.2 * render.normal.square().mean()
+            )
+
+        objective(direct).backward()
+        objective(checkpointed).backward()
+        for name in sorted(differentiable):
+            direct_gradient = getattr(direct_asset, name).grad
+            checkpointed_gradient = getattr(checkpointed_asset, name).grad
+            self.assertIsNotNone(direct_gradient, name)
+            self.assertIsNotNone(checkpointed_gradient, name)
+            self.assertTrue(torch.all(torch.isfinite(checkpointed_gradient)), name)
+            torch.testing.assert_close(
+                checkpointed_gradient,
+                direct_gradient,
+                atol=2.0e-5,
+                rtol=2.0e-4,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()

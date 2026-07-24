@@ -13,6 +13,7 @@ from typing import List
 
 import torch
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from .assets import GaussianAsset, real_sh_basis_degree3
 
@@ -316,13 +317,17 @@ class CudaGaussianRenderer(nn.Module):
         near: float = 0.01,
         far: float = 100.0,
         contract: RasterizationContract = RasterizationContract(),
+        checkpoint_views: bool = True,
     ) -> None:
         super().__init__()
         if not 0 < near < far:
             raise ValueError("projection near/far planes must satisfy 0 < near < far")
+        if not isinstance(checkpoint_views, bool):
+            raise TypeError("checkpoint_views must be Boolean")
         self.near = near
         self.far = far
         self.contract = contract
+        self.checkpoint_views = checkpoint_views
         compiled = RasterizationContract(kernel_size=contract.kernel_size)
         for name in (
             "sigma_extent",
@@ -372,12 +377,13 @@ class CudaGaussianRenderer(nn.Module):
                 "the loaded diff_gaussian_rasterization extension is not the TRELLIS "
                 "mip-splatting ABI (kernel_size/subpixel_offset are required)"
             )
-        color_images, alpha_images, depth_images, normal_images = [], [], [], []
         gaussian.validate()
         # The CUDA extension is a native-FP32 kernel.  Explicit casts keep it
         # outside BF16 autocast while retaining gradients to analytical state.
         means = gaussian.means.to(dtype=torch.float32).contiguous()
         opacity = gaussian.opacity.to(dtype=torch.float32).contiguous()
+        rotation = gaussian.rotation.to(dtype=torch.float32).contiguous()
+        sh_coefficients = gaussian.sh_coefficients.to(dtype=torch.float32).contiguous()
         covariance = gaussian.covariance.to(dtype=torch.float32)
         covariance_packed = torch.stack(
             (
@@ -390,39 +396,63 @@ class CudaGaussianRenderer(nn.Module):
             ),
             dim=-1,
         ).contiguous()
-        for view in range(cameras.extrinsics_world_to_camera.shape[0]):
-            extrinsic = cameras.extrinsics_world_to_camera[view].to(dtype=torch.float32)
-            intrinsic = cameras.intrinsics[view].to(dtype=torch.float32)
-            view_matrix = torch.eye(4, dtype=extrinsic.dtype, device=extrinsic.device)
+        background_color = _background_color(background, means)
+        zero_background = torch.zeros(3, dtype=torch.float32, device=means.device)
+        subpixel_offset = torch.zeros(
+            cameras.height,
+            cameras.width,
+            2,
+            dtype=torch.float32,
+            device=means.device,
+        )
+
+        def render_view(
+            view_means: Tensor,
+            view_opacity: Tensor,
+            view_covariance_packed: Tensor,
+            view_rotation: Tensor,
+            view_sh_coefficients: Tensor,
+            extrinsic: Tensor,
+            intrinsic: Tensor,
+            view_background: Tensor,
+        ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+            """Render one view; checkpointing recomputes this exact operator."""
+
+            view_matrix = torch.eye(
+                4, dtype=extrinsic.dtype, device=extrinsic.device
+            )
             view_matrix[:3] = extrinsic
-            projection = self._projection(intrinsic, cameras.height, cameras.width, self.near, self.far)
-            camera_center = -(extrinsic[:3, :3].transpose(0, 1) @ extrinsic[:3, 3])
-            view_direction = torch.nn.functional.normalize(camera_center[None] - means, dim=-1)
+            projection = self._projection(
+                intrinsic,
+                cameras.height,
+                cameras.width,
+                self.near,
+                self.far,
+            )
+            camera_center = -(
+                extrinsic[:3, :3].transpose(0, 1) @ extrinsic[:3, 3]
+            )
+            view_direction = torch.nn.functional.normalize(
+                camera_center[None] - view_means, dim=-1
+            )
             basis = real_sh_basis_degree3(view_direction)
             color = torch.clamp(
                 0.5
                 + torch.einsum(
                     "gi,gic->gc",
                     basis,
-                    gaussian.sh_coefficients.to(dtype=torch.float32),
+                    view_sh_coefficients,
                 ),
                 0.0,
                 1.0,
             ).contiguous()
-            bg = _background_color(background, means)
             common_settings = dict(
                 image_height=cameras.height,
                 image_width=cameras.width,
                 tanfovx=float(cameras.width / (2.0 * intrinsic[0, 0])),
                 tanfovy=float(cameras.height / (2.0 * intrinsic[1, 1])),
                 kernel_size=self.contract.kernel_size,
-                subpixel_offset=torch.zeros(
-                    cameras.height,
-                    cameras.width,
-                    2,
-                    dtype=torch.float32,
-                    device=means.device,
-                ),
+                subpixel_offset=subpixel_offset,
                 scale_modifier=1.0,
                 viewmatrix=view_matrix.transpose(0, 1).contiguous(),
                 projmatrix=(projection @ view_matrix).transpose(0, 1).contiguous(),
@@ -432,46 +462,92 @@ class CudaGaussianRenderer(nn.Module):
                 debug=False,
             )
             color_rasterizer = GaussianRasterizer(
-                raster_settings=GaussianRasterizationSettings(bg=bg, **common_settings)
+                raster_settings=GaussianRasterizationSettings(
+                    bg=view_background, **common_settings
+                )
             )
             auxiliary_rasterizer = GaussianRasterizer(
                 raster_settings=GaussianRasterizationSettings(
-                    bg=torch.zeros(3, dtype=torch.float32, device=means.device),
-                    **common_settings,
+                    bg=zero_background, **common_settings
                 )
             )
-            screen = torch.zeros_like(means, requires_grad=True)
+            screen = torch.zeros_like(view_means, requires_grad=True)
 
-            def rasterize(rasterizer: nn.Module, precomputed_color: Tensor) -> Tensor:
+            def rasterize(
+                rasterizer: nn.Module, precomputed_color: Tensor
+            ) -> Tensor:
                 rendered, _ = rasterizer(
-                    means3D=means,
+                    means3D=view_means,
                     means2D=screen,
                     shs=None,
                     colors_precomp=precomputed_color,
-                    opacities=opacity,
+                    opacities=view_opacity,
                     scales=None,
                     rotations=None,
-                    cov3D_precomp=covariance_packed,
+                    cov3D_precomp=view_covariance_packed,
                 )
                 return rendered
 
             rendered_color = rasterize(color_rasterizer, color)
-            camera_depth = (means @ extrinsic[:3, :3].transpose(0, 1) + extrinsic[:3, 3])[:, 2]
+            camera_depth = (
+                view_means @ extrinsic[:3, :3].transpose(0, 1)
+                + extrinsic[:3, 3]
+            )[:, 2]
             alpha_depth_features = torch.stack(
-                (torch.ones_like(camera_depth), camera_depth, torch.zeros_like(camera_depth)),
+                (
+                    torch.ones_like(camera_depth),
+                    camera_depth,
+                    torch.zeros_like(camera_depth),
+                ),
                 dim=-1,
             )
             alpha_depth = rasterize(auxiliary_rasterizer, alpha_depth_features)
             alpha = alpha_depth[0:1].clamp(0.0, 1.0)
             depth = alpha_depth[1:2] / alpha.clamp_min(1.0e-8)
             normal_camera = (
-                gaussian.rotation[:, :, 2].to(dtype=torch.float32)
-                @ extrinsic[:3, :3].transpose(0, 1)
+                view_rotation[:, :, 2] @ extrinsic[:3, :3].transpose(0, 1)
             ).contiguous()
             normal_rgb = rasterize(auxiliary_rasterizer, normal_camera)
             normal = normal_rgb / alpha.clamp_min(1.0e-8)
             normal = torch.nn.functional.normalize(normal, dim=0, eps=1.0e-8)
             normal = torch.where(alpha > 0, normal, torch.zeros_like(normal))
+            return rendered_color, alpha, depth, normal
+
+        color_images, alpha_images, depth_images, normal_images = [], [], [], []
+        differentiable_inputs = (
+            means,
+            opacity,
+            covariance_packed,
+            rotation,
+            sh_coefficients,
+        )
+        use_checkpoint = (
+            self.checkpoint_views
+            and torch.is_grad_enabled()
+            and any(value.requires_grad for value in differentiable_inputs)
+        )
+        for view in range(cameras.extrinsics_world_to_camera.shape[0]):
+            extrinsic = cameras.extrinsics_world_to_camera[view].to(dtype=torch.float32)
+            intrinsic = cameras.intrinsics[view].to(dtype=torch.float32)
+            arguments = (
+                means,
+                opacity,
+                covariance_packed,
+                rotation,
+                sh_coefficients,
+                extrinsic,
+                intrinsic,
+                background_color,
+            )
+            if use_checkpoint:
+                rendered_color, alpha, depth, normal = checkpoint(
+                    render_view,
+                    *arguments,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
+                )
+            else:
+                rendered_color, alpha, depth, normal = render_view(*arguments)
             color_images.append(rendered_color)
             alpha_images.append(alpha)
             depth_images.append(depth)

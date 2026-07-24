@@ -493,3 +493,26 @@ VRAM, throughput, optimizer step, checkpoint, render, PLY, or GLB is claimed.
 An already-installed local PyYAML interpreter also parsed the complete A800
 YAML and verified `training.mesh_supervision_view_chunk_size == 2`; no package
 was installed or changed.
+
+High-view renderer cycle (2026-07-24): the supplied sweep is pre-checkpoint
+evidence. At 32 views/rank, rank 1 failed inside the CUDA Gaussian-render path
+after seven repeated 12-step TRELLIS samples. The stack surfaced at normal
+normalization, but CUDA explicitly warned that asynchronous reporting may move
+the line; the implementation retained three custom-rasterizer backward states
+for every completed view. The subsequent selector correctly found no
+scientifically/memory-admissible report under its 0.85 gate; that exception
+does not itself establish a selector defect.
+
+After per-view recomputation, format-7 execution-policy provenance, selector
+schema v2 diagnostics, and the subprocess-safe sweep driver, in-memory
+compilation passed all 68 Python files. The environment, production trace, and
+view-budget suites passed 41/41 locally. The sweep unit test checks complete
+argument construction, ordered candidate validation, and CUDA-OOM
+classification. The real PyTorch 2.4/TRELLIS CUDA forward-gradient equivalence
+test is server-ready but unexecuted locally. No post-repair VRAM, throughput,
+selected view count, optimizer step, checkpoint, render, PLY, or GLB is
+claimed.
+The sweep CLI help executed under the bundled interpreter, the full A800 YAML
+parsed with `mesh_chunk=2` and `renderer_checkpoint=true`, and the source scan
+found no pasted rank traceback or prior confirmed corruption marker. The
+sweep's intentional OOM classifier was excluded from that contamination scan.

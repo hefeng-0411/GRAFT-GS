@@ -219,3 +219,23 @@ checkpoints, data, or a compiled server dependency.
   a committed final checkpoint, rank-zero evaluation, and independently
   reloadable PLY/GLB. New rank-local peak allocated/reserved memory is required
   before increasing views per rank.
+
+## 2026-07-24 high-view CUDA renderer rerun boundary
+
+- The 32-view/rank run predates per-view checkpoint recomputation and is not a
+  valid concurrency candidate. The final `normalize` frame is not interpreted
+  as an algorithmic normal defect because CUDA reported asynchronous OOM.
+- Deploy the renderer/trainer/config/sweep changes together. Run the protocol's
+  seven focused tests; checkpointed and uncheckpointed CUDA rendering must
+  agree for color, alpha, depth, normal, and finite Gaussian gradients.
+- Use a new timestamped sweep root. Format-7 reports must record
+  `rendering.backend == "cuda"` and `rendering.checkpoint_views == true`.
+  Pre-repair reports are deliberately ineligible.
+- If no report is selected, inspect the always-written `selection.json`.
+  Do not increase the 0.85 memory gate until the recorded reasons establish
+  that an otherwise finite, converged, feasible candidate is rejected only for
+  reserved fraction and tail-object profiling justifies a smaller headroom.
+- The selected Phase-B view count remains invalid for Phase D/F until those
+  phases repeat a shortened sweep; activation recomputation removes native
+  renderer tapes but not `O(KHW)` outputs, VGGT tokens, evidence, or
+  object-dependent atlas/UOT growth.

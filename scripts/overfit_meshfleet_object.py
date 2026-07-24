@@ -240,6 +240,9 @@ def main() -> None:
             mesh_supervision_view_chunk_size=int(
                 training_config.get("mesh_supervision_view_chunk_size", 2)
             ),
+            renderer_checkpoint_views=bool(
+                training_config.get("renderer_checkpoint_views", True)
+            ),
         ),
         loss_weights=loss_weights,
     )
@@ -341,6 +344,10 @@ def main() -> None:
             "derive_depth_normals": trainer.config.derive_mesh_depth_normals,
             "required": trainer.config.require_mesh_depth_normals,
             "view_chunk_size": trainer.config.mesh_supervision_view_chunk_size,
+        },
+        "rendering": {
+            "backend": trainer.module.config.renderer_backend,
+            "checkpoint_views": trainer.config.renderer_checkpoint_views,
         },
         "transport": {
             "iterations": transport.iterations,

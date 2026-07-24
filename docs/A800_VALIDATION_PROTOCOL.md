@@ -114,10 +114,11 @@ mkdir -p outputs/validation
   tests.test_geometry_invariants.TopologyAndManifoldTest.test_diffuse_occupancy_retains_all_support_filtration_stratum \
   tests.test_geometry_invariants.TopologyAndManifoldTest.test_large_persistence_matching_is_linear_memory_symmetric_and_differentiable \
   tests.test_meshfleet_contract.MeshFleetAuditTest.test_nonmanifold_mesh_still_derives_depth_and_normals \
+  tests.test_assets_and_vertical_slice.AnalyticalAssetTest.test_cuda_view_checkpoint_matches_forward_and_gradients \
   2>&1 | tee outputs/validation/concurrency_numerics.log
 ```
 
-All six must pass. The underflow regression is deliberately disconnected and
+All seven must pass. The underflow regression is deliberately disconnected and
 contains a positive exact UOT component near `exp(-196)`: FP32 may store that
 entry as zero, but the FP64/log-domain fixed point and implicit conditional
 probabilities must remain finite. The topology regression requires a valid,
@@ -128,34 +129,40 @@ linear-memory sliced path, including symmetry, identity, and finite gradients.
 The MeshFleet raster test compares one-view chunks against the former two-view
 batch for depth, normals, visibility, and normal validity. This is the
 numerical boundary for moving immutable mesh targets before the trainable graph
-and bounding nvdiffrast workspace.
+and bounding nvdiffrast workspace. The CUDA renderer test independently
+requires per-view activation checkpointing to preserve all four outputs and
+analytical-Gaussian gradients relative to the uncheckpointed operator.
 
 After confirming that no previous GRAFT-GS launch remains, sweep distinct views
 per rank. The global loader admits `views_per_rank * world_size` views, then
 shards the CPU sample before its non-blocking CUDA transfer:
 
 ```bash
-set -o pipefail
-for VIEWS_PER_RANK in 16 24 32 48 64; do
-  RUN_DIR="outputs/concurrency/${GRAFT_GS_TRAIN_OBJECT_ID}/vpr-${VIEWS_PER_RANK}"
-  mkdir -p "$RUN_DIR"
-  if ! "$GRAFT_GS_PYTHON" -m torch.distributed.run \
-    --standalone --nnodes=1 \
-    --nproc-per-node="$GRAFT_GS_NPROC_PER_NODE" \
-    scripts/overfit_meshfleet_object.py \
-    "$GRAFT_GS_MESHFLEET_ROOT" "$GRAFT_GS_MESHFLEET_MANIFEST" \
-    --split train --object-id "$GRAFT_GS_TRAIN_OBJECT_ID" \
-    --config configs/graft_gs_a800_native.yaml \
-    --vggt-checkpoint "$VGGT_CHECKPOINT" \
-    --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
-    --views-per-rank "$VIEWS_PER_RANK" \
-    --evaluation-views 24 --steps 3 \
-    --minimum-relative-improvement -1 \
-    --output "$RUN_DIR" 2>&1 | tee "$RUN_DIR/run.log"; then
-    echo "candidate $VIEWS_PER_RANK views/rank failed; retained log and continuing" >&2
-  fi
-done
+RUN_TAG=$(date -u +%Y%m%dT%H%M%SZ)
+SWEEP_ROOT="outputs/concurrency/${GRAFT_GS_TRAIN_OBJECT_ID}/checkpoint-${RUN_TAG}"
+
+"$GRAFT_GS_PYTHON" scripts/sweep_a800_view_budget.py \
+  "$GRAFT_GS_MESHFLEET_ROOT" \
+  "$GRAFT_GS_MESHFLEET_MANIFEST" \
+  --object-id "$GRAFT_GS_TRAIN_OBJECT_ID" \
+  --config configs/graft_gs_a800_native.yaml \
+  --vggt-checkpoint "$VGGT_CHECKPOINT" \
+  --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
+  --views-per-rank 16 24 32 48 64 \
+  --evaluation-views 24 \
+  --steps 3 \
+  --minimum-relative-improvement -1 \
+  --maximum-reserved-fraction 0.85 \
+  --maximum-storage-underflow-fraction 0.05 \
+  --maximum-zero-marginal-fraction 0.05 \
+  --throughput-fraction 0.97 \
+  --output "$SWEEP_ROOT"
 ```
+
+The driver uses the pinned interpreter without shell interpolation, requires a
+fresh root, retains every exact child command/log, and stops monotonically
+larger candidates after a real CUDA OOM. `--continue-after-oom` exists only for
+diagnosing a suspected non-monotone external failure.
 
 In a second terminal, verify that each PID appears on one GPU only:
 
@@ -165,23 +172,18 @@ watch -n 2 'nvidia-smi --query-compute-apps=gpu_uuid,pid,used_memory \
 ```
 
 Select from the measured per-rank records instead of using occupancy as a
-proxy. The selector rejects non-finite loss, unconverged UOT, non-positive hard
-feasibility margins, incomplete rank telemetry, more than 5% acknowledged
-FP32 transport underflow/zero marginals, and reserved memory above 85%:
+proxy. The sweep driver already runs the selector. It rejects non-finite loss,
+unconverged UOT, non-positive hard feasibility margins, incomplete rank
+telemetry, stale reports without the CUDA view-checkpoint certificate, more
+than 5% acknowledged FP32 transport underflow/zero marginals, and reserved
+memory above 85%. When none pass, `selection.json` is still written with every
+rejection reason before the driver fails:
 
 ```bash
-"$GRAFT_GS_PYTHON" scripts/select_a800_view_budget.py \
-  "outputs/concurrency/$GRAFT_GS_TRAIN_OBJECT_ID/vpr-*/overfit_metrics.json" \
-  --maximum-reserved-fraction 0.85 \
-  --maximum-storage-underflow-fraction 0.05 \
-  --maximum-zero-marginal-fraction 0.05 \
-  --throughput-fraction 0.97 \
-  --output "outputs/concurrency/$GRAFT_GS_TRAIN_OBJECT_ID/selection.json"
-
 export GRAFT_GS_SELECTED_VIEWS_PER_RANK=$(
   "$GRAFT_GS_PYTHON" -c \
   'import json,sys; print(json.load(open(sys.argv[1]))["recommended_views_per_rank"])' \
-  "outputs/concurrency/$GRAFT_GS_TRAIN_OBJECT_ID/selection.json"
+  "$SWEEP_ROOT/selection.json"
 )
 echo "selected useful views per rank: $GRAFT_GS_SELECTED_VIEWS_PER_RANK"
 ```

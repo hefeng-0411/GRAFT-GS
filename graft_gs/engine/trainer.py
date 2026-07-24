@@ -106,6 +106,7 @@ class TrainerConfig:
     derive_mesh_depth_normals: bool = True
     require_mesh_depth_normals: bool = False
     mesh_supervision_view_chunk_size: int = 2
+    renderer_checkpoint_views: bool = True
     teacher_bundle_root: Optional[str] = None
     teacher_bundle_digest: Optional[str] = None
     teacher_bundle_minimum_confidence: float = 0.0
@@ -170,6 +171,8 @@ class TrainerConfig:
             raise ValueError("TRELLIS latent pseudo confidence must lie in [0,1]")
         if self.mesh_supervision_view_chunk_size < 1:
             raise ValueError("mesh supervision view chunk size must be positive")
+        if not isinstance(self.renderer_checkpoint_views, bool):
+            raise TypeError("renderer_checkpoint_views must be Boolean")
         if not 0 <= self.teacher_bundle_minimum_confidence <= 1:
             raise ValueError("teacher bundle minimum confidence must lie in [0,1]")
         if (self.teacher_bundle_root is None) != (self.teacher_bundle_digest is None):
@@ -909,8 +912,11 @@ class GraftGSTrainer:
             TrainingPhase.END_TO_END,
             TrainingPhase.QUANTIZATION_DISTILLATION,
             TrainingPhase.TOPOLOGY_HARDENING,
-        }:
+            }:
             model.vggt.install_late_lora()
+        renderer = getattr(model, "renderer", None)
+        if hasattr(renderer, "checkpoint_views"):
+            renderer.checkpoint_views = config.renderer_checkpoint_views
         _set_trainable_phase(model, config.phase)
         self.qat_modules: list[str] = []
         if config.phase in {
@@ -1767,7 +1773,7 @@ class GraftGSTrainer:
                 path.parent.mkdir(parents=True, exist_ok=True)
                 temporary = path.with_suffix(path.suffix + ".tmp")
                 payload = {
-                    "format_version": 6,
+                    "format_version": 7,
                     "global_step": self.global_step,
                     "epoch": self.epoch,
                     "microstep": self.microstep,
@@ -1828,7 +1834,7 @@ class GraftGSTrainer:
     def load_checkpoint(self, path: str | Path) -> None:
         payload = torch.load(path, map_location=self.context.device, weights_only=False)
         format_version = payload.get("format_version")
-        if format_version not in {1, 2, 3, 4, 5, 6}:
+        if format_version not in {1, 2, 3, 4, 5, 6, 7}:
             raise ValueError("unsupported checkpoint format")
         if payload["phase"] != self.config.phase.value:
             raise ValueError("checkpoint phase does not match the configured trainer phase")
@@ -1912,6 +1918,7 @@ class GraftGSTrainer:
                 "derive_mesh_depth_normals",
                 "require_mesh_depth_normals",
                 "mesh_supervision_view_chunk_size",
+                "renderer_checkpoint_views",
                 "teacher_bundle_root",
                 "teacher_bundle_digest",
                 "teacher_bundle_minimum_confidence",
@@ -1929,6 +1936,8 @@ class GraftGSTrainer:
                     current_value = getattr(self.config, field_name)
                     legacy_default = {
                         "teacher_distillation_confidence": 1.0,
+                        "mesh_supervision_view_chunk_size": 2,
+                        "renderer_checkpoint_views": True,
                         "precision_backbone": "bfloat16",
                         "precision_geometric_state": "float32",
                         "precision_analytical_solve": "float32",
@@ -1936,7 +1945,16 @@ class GraftGSTrainer:
                         "precision_float32_matmul": "highest",
                         "precision_allow_tf32": False,
                     }.get(field_name, object())
-                    if format_version < 6 and current_value == legacy_default:
+                    introduced_format = (
+                        7
+                        if field_name
+                        in {
+                            "mesh_supervision_view_chunk_size",
+                            "renderer_checkpoint_views",
+                        }
+                        else 6
+                    )
+                    if format_version < introduced_format and current_value == legacy_default:
                         continue
                     if current_value in {None, False, 0, 0.0}:
                         continue

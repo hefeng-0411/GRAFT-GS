@@ -330,6 +330,9 @@ def main() -> None:
             mesh_supervision_view_chunk_size=int(
                 training_config.get("mesh_supervision_view_chunk_size", 2)
             ),
+            renderer_checkpoint_views=bool(
+                training_config.get("renderer_checkpoint_views", True)
+            ),
             teacher_bundle_root=(
                 str(args.teacher_bundle_root.resolve())
                 if args.teacher_bundle_root is not None

@@ -367,3 +367,11 @@
   equivalence test checks depth, normal, visibility, and validity tensors.
   This supervision path is explicitly `no_grad` because neither source mesh
   nor ground-truth cameras are trainable state.
+- CUDA renderer activation checkpointing assumes each view's TRELLIS
+  mip-splatting operator is deterministic under identical tensors and contains
+  no stochastic state. `preserve_rng_state=False` is valid under that
+  assumption. The non-reentrant checkpoint retains the exact four output
+  tensors and recomputes only intermediates saved for backward; it does not
+  change FP32 accumulation, camera order, tile ordering, supervision weights,
+  or the analytical Gaussian state. Forward/gradient equivalence is an A800
+  validation condition, not inferred solely from API semantics.

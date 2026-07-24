@@ -216,6 +216,15 @@ def audit_report(
         ):
             reasons.append("persistence diagram cardinalities are invalid or missing")
 
+    rendering = report.get("rendering")
+    if not isinstance(rendering, Mapping):
+        reasons.append("renderer memory-policy certificate is missing")
+    else:
+        if rendering.get("backend") != "cuda":
+            reasons.append("view-budget report did not use the production CUDA renderer")
+        if rendering.get("checkpoint_views") is not True:
+            reasons.append("CUDA renderer per-view checkpointing was not active")
+
     return {
         "admissible": not reasons,
         "reasons": sorted(set(reasons)),
@@ -301,20 +310,37 @@ def main() -> None:
         )
         candidate["path"] = str(path)
         audited.append(candidate)
-    selected = select_candidate(audited, args.throughput_fraction)
+    selection_error: str | None = None
+    try:
+        selected = select_candidate(audited, args.throughput_fraction)
+    except RuntimeError as error:
+        selected = None
+        selection_error = str(error)
     output = {
-        "schema": "graft-gs-a800-view-selection-v1",
+        "schema": "graft-gs-a800-view-selection-v2",
         "maximum_reserved_fraction": args.maximum_reserved_fraction,
         "maximum_storage_underflow_fraction": args.maximum_storage_underflow_fraction,
         "maximum_zero_marginal_fraction": args.maximum_zero_marginal_fraction,
         "throughput_fraction": args.throughput_fraction,
         "candidates": audited,
         "selected": selected,
-        "recommended_views_per_rank": selected["minimum_views_per_rank"],
+        "recommended_views_per_rank": (
+            selected["minimum_views_per_rank"] if selected is not None else None
+        ),
+        "selection_error": selection_error,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     args.output.write_text(json.dumps(output, indent=2, sort_keys=True), encoding="utf8")
     print(json.dumps(output, indent=2, sort_keys=True))
+    if selection_error is not None:
+        rejection_summary = "; ".join(
+            f"{candidate['path']}: {', '.join(candidate['reasons'])}"
+            for candidate in audited
+        )
+        raise RuntimeError(
+            f"{selection_error}; audit written to {args.output}; "
+            f"candidate rejections: {rejection_summary}"
+        )
 
 
 if __name__ == "__main__":

@@ -79,7 +79,7 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
 
     def test_checkpoint_format_has_rank_local_rng_and_objective(self) -> None:
         trainer = source("graft_gs/engine/trainer.py")
-        self.assertIn('"format_version": 6', trainer)
+        self.assertIn('"format_version": 7', trainer)
         self.assertIn('"rank_rng_states": rank_rng_states', trainer)
         self.assertIn('"loss_weights": asdict(self.loss.weights)', trainer)
         self.assertIn("exact trainer resume requires the checkpoint world size", trainer)
@@ -503,12 +503,16 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn('"final_feasibility": scene.feasibility_reports[-1].__dict__', overfit)
         self.assertIn('"fixed_point_residual": transport.fixed_point_residual', overfit)
         selector = source("scripts/select_a800_view_budget.py")
+        sweep = source("scripts/sweep_a800_view_budget.py")
         protocol = source("docs/A800_VALIDATION_PROTOCOL.md")
         self.assertIn("maximum_reserved_fraction", selector)
         self.assertIn("final feasibility certificate is missing", selector)
         self.assertIn("sparse transport is not certified converged", selector)
         self.assertIn("16 24 32 48 64", protocol)
-        self.assertIn("select_a800_view_budget.py", protocol)
+        self.assertIn("sweep_a800_view_budget.py", protocol)
+        self.assertIn("if oom and not args.continue_after_oom:", sweep)
+        self.assertIn("sweep output must be fresh", sweep)
+        self.assertIn("scripts/select_a800_view_budget.py", sweep)
         self.assertIn("if trainer.context.rank != 0:", overfit)
         self.assertIn('"--maximum-views"', training)
         self.assertIn("dataset_maximum_views=maximum_views", training)
@@ -568,6 +572,11 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
     def test_a800_precision_and_mip_renderer_contracts_are_production_applied(self) -> None:
         precision = source("graft_gs/engine/precision.py")
         renderer = source("graft_gs/readout/renderer.py")
+        pipeline = source("graft_gs/integration/pipeline.py")
+        trainer = source("graft_gs/engine/trainer.py")
+        configuration = source("graft_gs/engine/configuration.py")
+        overfit = source("scripts/overfit_meshfleet_object.py")
+        selector = source("scripts/select_a800_view_budget.py")
         barrier = source("graft_gs/manifold/barrier.py")
         trainer_entry = source("scripts/train_a800.py")
         config = source("configs/graft_gs_a800_native.yaml")
@@ -577,10 +586,27 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("backbone_dtype=precision_policy.backbone_dtype", trainer_entry)
         self.assertIn("float32_matmul_precision: highest", config)
         self.assertIn("allow_tf32: false", config)
-        self.assertIn("cov3D_precomp=covariance_packed", renderer)
+        self.assertIn("cov3D_precomp=view_covariance_packed", renderer)
         self.assertIn("kernel_size=self.contract.kernel_size", renderer)
         self.assertIn("(2.0 * intrinsic[0, 2] + 1.0) / width", renderer)
         self.assertNotIn("rotations=quaternion", renderer)
+        self.assertIn("from torch.utils.checkpoint import checkpoint", renderer)
+        self.assertIn("use_reentrant=False", renderer)
+        self.assertIn("preserve_rng_state=False", renderer)
+        self.assertIn("CudaGaussianRenderer()", pipeline)
+        self.assertIn("renderer_checkpoint_views: bool = True", trainer)
+        self.assertIn(
+            "renderer.checkpoint_views = config.renderer_checkpoint_views",
+            trainer,
+        )
+        self.assertIn(
+            "training.renderer_checkpoint_views must be a YAML Boolean",
+            configuration,
+        )
+        self.assertIn("renderer_checkpoint_views: true", config)
+        self.assertIn('"checkpoint_views": trainer.config.renderer_checkpoint_views', overfit)
+        self.assertIn("CUDA renderer per-view checkpointing was not active", selector)
+        self.assertIn("audit written to", selector)
         self.assertIn("state.position.detach().to(dtype=torch.float64)", barrier)
         self.assertIn("state.evidence_metric.detach().to(dtype=torch.float64)", barrier)
 
