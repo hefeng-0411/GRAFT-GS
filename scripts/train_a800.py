@@ -144,6 +144,9 @@ def main() -> None:
             strength=float(prior_config["strength"]),
             minimum_probability=float(prior_config["minimum_probability"]),
             uncertainty_discount=float(prior_config["uncertainty_discount"]),
+            release_cuda_cache_after_sampling=bool(
+                prior_config["release_cuda_cache_after_sampling"]
+            ),
             device=local_device,
         )
         if use_prior

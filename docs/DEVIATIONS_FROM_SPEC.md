@@ -276,3 +276,18 @@
     channels, Gaussian count, camera precision, or supervision.
     Forward/gradient equivalence remains conditional on the executable A800
     checkpoint test.
+46. **A800 memory admission uses live and post-step state, not historical peak
+  cache reservation.** The specification requests profiling and memory-safe
+  execution but does not define a caching-allocator statistic. Historical
+  `max_memory_reserved` includes inactive blocks from the frozen rank-0
+  TRELLIS sampler and falsely rejected all completed supplied candidates.
+  GRAFT-GS now reports it diagnostically while admission uses peak
+  allocated/active state, ending reserved state, and driver-visible headroom.
+47. **FP32 sparse-plan underflow is bounded by transported mass rather than zero
+  edge count.** The earlier local policy used a count-fraction proxy not
+  justified by the Markdown. Sparse unbalanced OT intentionally assigns
+  exponentially tiny mass to incompatible supported pairs, so a large zero
+  edge count can have negligible measure. The stronger implementation
+  certifies underflow mass and relative L1 cast error against the FP64
+  log-domain plan. It neither floors masses nor silently calls FP32 storage
+  exact.

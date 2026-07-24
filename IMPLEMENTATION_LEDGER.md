@@ -886,3 +886,48 @@ The full conditional validity domain is maintained in
   `scripts/overfit_meshfleet_object.py`, `scripts/train_a800.py`,
   `scripts/select_a800_view_budget.py`,
   `scripts/sweep_a800_view_budget.py`, and the A800 YAML.
+
+## 2026-07-24 allocator-lifetime and transport-error certification
+
+- Requirement `A800-UPSTREAM-CACHE-LIFETIME-04`: the supplied completed
+  16/24/32-view reports all showed rank-0 peak reserved fractions between
+  `0.9854` and `0.9859`, nearly independent of view count. Same-object DDP
+  samples the frozen TRELLIS posterior only on rank 0, and the exact
+  conditioning cache prevents resampling after the first step. The causal
+  defect was retention of inactive diffusion workspaces by PyTorch's caching
+  allocator, not an equally large live GRAFT-GS state.
+- `TrellisPriorAdapter` now releases inactive CUDA cache exactly after the
+  posterior sparse coordinates and CPU cache entry have been materialized.
+  It synchronizes the source device and asserts that `memory_allocated` is
+  identical before and after release. Live TRELLIS weights, returned prior
+  coordinates, numerical precision, and all trainable gradients are
+  unchanged. The policy is Boolean, config-validated, enabled in the A800 YAML,
+  and passed by all production training/inference/ablation entry points.
+- When audited canonical atlas bounds are supplied, production now samples and
+  synchronizes the frozen TRELLIS measure before VGGT constructs its
+  differentiable multiscale geometry state. This prevents the first cache
+  miss's diffusion workspace from overlapping the VGGT tape. Unbounded
+  inference still derives its root from VGGT evidence and uses the original
+  ordering.
+- Training telemetry now separates peak allocated, peak active, peak reserved,
+  ending allocated/reserved/inactive-reserved, and ending driver-free bytes and
+  fractions. It also records whether the source-rank cache release occurred
+  and how many reserved bytes it returned. Schema-v3 concurrency selection
+  gates live peak, ending allocator state, and driver headroom; historical peak
+  reservation remains diagnostic.
+- Requirement `UOT-STORAGE-ERROR-CERTIFICATE-04`: the previous selector treated
+  the fraction of sparse edges that became zero in FP32 storage as lost
+  transport mass. The supplied values (`0.3781`--`0.4091`) therefore rejected
+  every completed run even though those edges may carry exponentially
+  negligible FP64 mass. The implicit solver now reports underflow mass,
+  zero-source/target mass, and total relative L1 cast error against its FP64
+  log-domain plan. Selector admission uses these measure-valued errors; exact
+  zero counts remain diagnostics and no positive mass floor is fabricated.
+- The old count-based selector flags remain accepted with an explicit warning
+  and are recorded as ignored legacy gates, preventing existing launch scripts
+  from failing argument parsing while avoiding the invalid scientific proxy.
+- Production files: `graft_gs/integration/trellis_prior.py`,
+  `graft_gs/mapping/manifold_mapping.py`, `graft_gs/engine/trainer.py`,
+  `graft_gs/engine/configuration.py`, all TRELLIS-backed entry points,
+  `scripts/select_a800_view_budget.py`,
+  `scripts/sweep_a800_view_budget.py`, and the A800 YAML/protocol.

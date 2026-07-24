@@ -115,13 +115,19 @@ mkdir -p outputs/validation
   tests.test_geometry_invariants.TopologyAndManifoldTest.test_large_persistence_matching_is_linear_memory_symmetric_and_differentiable \
   tests.test_meshfleet_contract.MeshFleetAuditTest.test_nonmanifold_mesh_still_derives_depth_and_normals \
   tests.test_assets_and_vertical_slice.AnalyticalAssetTest.test_cuda_view_checkpoint_matches_forward_and_gradients \
+  tests.test_external_adapters.TrellisAdapterBoundaryTest.test_frozen_sampler_releases_only_inactive_cuda_allocator_blocks \
+  tests.test_external_adapters.TrellisAdapterBoundaryTest.test_cache_release_rejects_a_live_allocation_lifetime_change \
   2>&1 | tee outputs/validation/concurrency_numerics.log
 ```
 
-All seven must pass. The underflow regression is deliberately disconnected and
+All nine must pass. The underflow regression is deliberately disconnected and
 contains a positive exact UOT component near `exp(-196)`: FP32 may store that
 entry as zero, but the FP64/log-domain fixed point and implicit conditional
-probabilities must remain finite. The topology regression requires a valid,
+probabilities must remain finite. It also bounds the discarded mass and total
+relative L1 storage error against the FP64 plan; the number of underflowed
+edges is diagnostic only. The two allocator tests establish that the frozen
+TRELLIS lifetime boundary returns inactive cached blocks without changing one
+live allocated byte. The topology regression requires a valid,
 orientable all-support filtration stratum when every ordinary fixed threshold
 would remove the overlap triangles. The persistence regression patches
 `torch.cdist` to fail and then exercises a 600-by-600 diagram through the
@@ -153,8 +159,10 @@ SWEEP_ROOT="outputs/concurrency/${GRAFT_GS_TRAIN_OBJECT_ID}/checkpoint-${RUN_TAG
   --steps 3 \
   --minimum-relative-improvement -1 \
   --maximum-reserved-fraction 0.85 \
-  --maximum-storage-underflow-fraction 0.05 \
-  --maximum-zero-marginal-fraction 0.05 \
+  --maximum-allocated-fraction 0.90 \
+  --minimum-driver-free-fraction 0.05 \
+  --maximum-storage-relative-l1-error 1e-6 \
+  --maximum-zero-marginal-mass-fraction 1e-12 \
   --throughput-fraction 0.97 \
   --output "$SWEEP_ROOT"
 ```
@@ -175,9 +183,14 @@ Select from the measured per-rank records instead of using occupancy as a
 proxy. The sweep driver already runs the selector. It rejects non-finite loss,
 unconverged UOT, non-positive hard feasibility margins, incomplete rank
 telemetry, stale reports without the CUDA view-checkpoint certificate, more
-than 5% acknowledged FP32 transport underflow/zero marginals, and reserved
-memory above 85%. When none pass, `selection.json` is still written with every
-rejection reason before the driver fails:
+than `1e-6` FP32 plan relative-L1 error, more than `1e-12` discarded
+zero-marginal mass, a live allocated/active peak above 90%, a post-step
+allocator reservation above 85%, or less than 5% driver-visible headroom.
+Historical `peak_reserved` remains in the report but is not a live-memory gate:
+the caching allocator can retain dead upstream workspaces. The source rank
+must explicitly certify the frozen-TRELLIS cache release. When none pass,
+`selection.json` is still written with every rejection reason before the
+driver fails:
 
 ```bash
 export GRAFT_GS_SELECTED_VIEWS_PER_RANK=$(
@@ -193,9 +206,10 @@ aggregate useful throughput is within 3% of the fastest admissible run. Never
 reserve dummy memory merely to reach 80 GiB. Repeat the sweep in Phase D before
 full training because flow, rendering, and refined atlases have higher peaks.
 Every admitted report must record `internal_solve_dtype=float64`, the minimum
-log-plan value, COO cardinalities, and the exact number of plan entries/source
-rows/target columns that underflowed only when returned to geometric-state
-storage.
+log-plan value, COO cardinalities, exact storage-zero counts, their FP64 mass
+fractions, total storage relative-L1 error, peak allocated/active/reserved
+bytes, ending allocated/reserved bytes, driver-free bytes, and the source-rank
+TRELLIS cache-release certificate.
 
 For corpus training, use ordinary object-level DDP (omit
 `--same-object-view-shards`). Every visible GPU receives a different complete

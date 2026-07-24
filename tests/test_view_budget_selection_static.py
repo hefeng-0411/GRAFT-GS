@@ -32,6 +32,11 @@ def report(views: int, throughput: float, reserved: float) -> dict[str, object]:
                 "local_views": views,
                 "local_views_per_second": throughput,
                 "peak_reserved_fraction": reserved,
+                "peak_allocated_fraction": max(reserved - 0.10, 0.0),
+                "peak_active_fraction": max(reserved - 0.10, 0.0),
+                "ending_reserved_fraction": reserved,
+                "ending_driver_free_fraction": 1.0 - reserved,
+                "trellis_cache_release_performed": 1.0 if rank == 0 else 0.0,
             }
             for rank in range(2)
         ],
@@ -46,6 +51,10 @@ def report(views: int, throughput: float, reserved: float) -> dict[str, object]:
             "storage_underflow_edges": 0,
             "storage_zero_source_rows": 0,
             "storage_zero_target_columns": 0,
+            "storage_underflow_mass_fraction": 0.0,
+            "storage_zero_source_mass_fraction": 0.0,
+            "storage_zero_target_mass_fraction": 0.0,
+            "storage_relative_l1_error": 1.0e-8,
             "edge_count": 100,
             "source_count": 10,
             "target_count": 20,
@@ -75,6 +84,12 @@ class ViewBudgetSelectionTest(unittest.TestCase):
             SWEEP.validate_candidates((16, 32, 24))
         self.assertTrue(
             SWEEP.log_reports_oom("RuntimeError: CUDA error: out of memory")
+        )
+        self.assertTrue(
+            SWEEP.log_reports_oom("CUBLAS_STATUS_ALLOC_FAILED")
+        )
+        self.assertFalse(
+            SWEEP.log_reports_oom("NCCL watchdog timed out")
         )
         command = SWEEP.build_overfit_command(
             python="/pinned/python",
@@ -130,24 +145,70 @@ class ViewBudgetSelectionTest(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "no concurrency candidate"):
             MODULE.select_candidate([candidate], 0.97)
 
-    def test_rejects_excessive_acknowledged_storage_underflow(self) -> None:
+    def test_edge_underflow_count_is_diagnostic_when_discarded_mass_is_tiny(self) -> None:
+        valid = report(32, 10.0, 0.5)
+        valid["transport"]["storage_underflow_edges"] = 80
+        valid["transport"]["storage_zero_source_rows"] = 5
+        valid["transport"]["storage_underflow_mass_fraction"] = 1.0e-30
+        valid["transport"]["storage_zero_source_mass_fraction"] = 1.0e-30
+        candidate = MODULE.audit_report(valid, 0.85)
+        self.assertTrue(candidate["admissible"])
+        self.assertEqual(
+            candidate["transport_storage_underflow_edge_fraction"],
+            0.8,
+        )
+
+    def test_rejects_excessive_acknowledged_storage_mass_error(self) -> None:
         invalid = report(32, 10.0, 0.5)
-        invalid["transport"]["storage_underflow_edges"] = 8
-        invalid["transport"]["storage_zero_source_rows"] = 1
+        invalid["transport"]["storage_underflow_edges"] = 80
+        invalid["transport"]["storage_underflow_mass_fraction"] = 1.0e-4
+        invalid["transport"]["storage_relative_l1_error"] = 1.0e-4
+        invalid["transport"]["storage_zero_source_mass_fraction"] = 1.0e-5
+        candidate = MODULE.audit_report(invalid, 0.85)
+        self.assertFalse(candidate["admissible"])
+        self.assertIn(
+            "transport FP32 storage relative-L1 error exceeds the configured accuracy limit",
+            candidate["reasons"],
+        )
+        self.assertIn(
+            "transport zero-marginal discarded mass exceeds the configured accuracy limit",
+            candidate["reasons"],
+        )
+
+    def test_rejects_stale_allocator_proxy_report(self) -> None:
+        invalid = report(24, 10.0, 0.4)
+        del invalid["rank_performance"][0]["ending_reserved_fraction"]
+        candidate = MODULE.audit_report(invalid, 0.85)
+        self.assertFalse(candidate["admissible"])
+        self.assertIn(
+            "rank_performance row lacks numeric telemetry",
+            candidate["reasons"],
+        )
+
+    def test_historical_peak_reserved_is_diagnostic_after_cache_release(self) -> None:
+        value = report(24, 10.0, 0.4)
+        value["rank_performance"][0]["peak_reserved_fraction"] = 0.99
+        candidate = MODULE.audit_report(value, 0.85)
+        self.assertTrue(candidate["admissible"])
+        self.assertEqual(candidate["maximum_peak_reserved_fraction"], 0.99)
+
+    def test_rejects_live_peak_and_missing_source_rank_cache_release(self) -> None:
+        invalid = report(24, 10.0, 0.4)
+        invalid["rank_performance"][0]["peak_allocated_fraction"] = 0.95
+        invalid["rank_performance"][0]["peak_active_fraction"] = 0.96
+        invalid["rank_performance"][0]["trellis_cache_release_performed"] = 0.0
         candidate = MODULE.audit_report(
             invalid,
             0.85,
-            maximum_storage_underflow_fraction=0.05,
-            maximum_zero_marginal_fraction=0.05,
+            maximum_allocated_fraction=0.90,
         )
         self.assertFalse(candidate["admissible"])
         self.assertIn(
-            "transport storage-underflow fraction exceeds the configured accuracy limit",
+            "rank 0 did not certify release of inactive frozen-TRELLIS allocator blocks",
             candidate["reasons"],
         )
-        self.assertIn(
-            "transport zero-marginal fraction exceeds the configured accuracy limit",
-            candidate["reasons"],
+        self.assertTrue(
+            any("live peak fraction" in reason for reason in candidate["reasons"])
         )
 
     def test_rejects_stale_report_without_scalable_persistence_certificate(self) -> None:

@@ -176,6 +176,42 @@ class GraftGS(nn.Module):
             raise ValueError(
                 f"execution_stage must be one of {sorted(valid_execution_stages)}"
             )
+        if images.ndim == 4:
+            images = images.unsqueeze(0)
+        if images.ndim != 5:
+            raise ValueError("images must have shape [B,K,3,H,W]")
+        precomputed_prior_measures: Optional[list[TrellisPriorMeasure]] = None
+        if atlas_root_bounds is not None:
+            atlas_root_bounds = atlas_root_bounds.to(
+                device=images.device,
+                dtype=torch.float32,
+            )
+            if atlas_root_bounds.shape != (images.shape[0], 2, 3):
+                raise ValueError("atlas_root_bounds must have shape [B,2,3]")
+            # Audited MeshFleet bounds are immutable canonical supervision.
+            # Sampling the frozen hidden-support prior before VGGT prevents the
+            # first TRELLIS cache miss from overlapping its diffusion
+            # workspaces with VGGT's differentiable multiscale geometry tape.
+            # Inference without explicit bounds retains the evidence-derived
+            # root path below.
+            if (
+                self.trellis_prior is not None
+                and execution_stage != "evidence_calibration"
+            ):
+                precomputed_prior_measures = []
+                for batch_index in range(images.shape[0]):
+                    with record_function("graft_gs/trellis_structure_prior_prefetch"):
+                        precomputed_prior_measures.append(
+                            self._trellis_prior_measure(
+                                images[batch_index],
+                                (
+                                    atlas_root_bounds[batch_index, 0],
+                                    atlas_root_bounds[batch_index, 1],
+                                ),
+                                distributed_synchronizer,
+                                int(trellis_prior_seed) + batch_index,
+                            )
+                        )
         with record_function("graft_gs/vggt_geometry"):
             vggt_output = self.vggt(images)
         if robustness is not None:
@@ -256,38 +292,15 @@ class GraftGS(nn.Module):
                         atlas_position,
                         self.config.atlas,
                     )
-                with record_function("graft_gs/trellis_structure_prior"):
-                    prior_images = vggt_output.images[batch_index]
-                    if distributed_synchronizer is not None and hasattr(
-                        distributed_synchronizer, "aggregate_prior_images"
-                    ):
-                        prior_images = distributed_synchronizer.aggregate_prior_images(
-                            prior_images
-                        )
-                    should_sample = (
-                        distributed_synchronizer is None
-                        or not hasattr(
+                if precomputed_prior_measures is not None:
+                    prior_measure = precomputed_prior_measures[batch_index]
+                else:
+                    with record_function("graft_gs/trellis_structure_prior"):
+                        prior_measure = self._trellis_prior_measure(
+                            vggt_output.images[batch_index],
+                            root_bounds,
                             distributed_synchronizer,
-                            "should_sample_trellis_prior",
-                        )
-                        or distributed_synchronizer.should_sample_trellis_prior()
-                    )
-                    if should_sample:
-                        prior = self.trellis_prior.sample(
-                            prior_images,
-                            seed=int(trellis_prior_seed) + batch_index,
-                        )
-                        prior_measure = self.trellis_prior.support_measure(
-                            prior,
-                            root_bounds[0],
-                            root_bounds[1],
-                        )
-                    if distributed_synchronizer is not None and hasattr(
-                        distributed_synchronizer, "synchronize_trellis_prior_measure"
-                    ):
-                        prior_measure = distributed_synchronizer.synchronize_trellis_prior_measure(
-                            prior_measure,
-                            dtype=root_bounds[0].dtype,
+                            int(trellis_prior_seed) + batch_index,
                         )
             with record_function("graft_gs/atlas_initialize"):
                 atlas = PersistentOctreeAtlas.from_evidence(
@@ -478,6 +491,49 @@ class GraftGS(nn.Module):
             evidence_particles=particles,
             execution_stage=execution_stage,
         )
+
+    def _trellis_prior_measure(
+        self,
+        prior_images: Tensor,
+        root_bounds: tuple[Tensor, Tensor],
+        distributed_synchronizer: Optional[object],
+        seed: int,
+    ) -> TrellisPriorMeasure:
+        if self.trellis_prior is None:
+            raise RuntimeError("TRELLIS prior measure requested without an adapter")
+        if distributed_synchronizer is not None and hasattr(
+            distributed_synchronizer,
+            "aggregate_prior_images",
+        ):
+            prior_images = distributed_synchronizer.aggregate_prior_images(prior_images)
+        should_sample = (
+            distributed_synchronizer is None
+            or not hasattr(
+                distributed_synchronizer,
+                "should_sample_trellis_prior",
+            )
+            or distributed_synchronizer.should_sample_trellis_prior()
+        )
+        prior_measure: Optional[TrellisPriorMeasure] = None
+        if should_sample:
+            prior = self.trellis_prior.sample(prior_images, seed=seed)
+            prior_measure = self.trellis_prior.support_measure(
+                prior,
+                root_bounds[0],
+                root_bounds[1],
+            )
+        if distributed_synchronizer is not None and hasattr(
+            distributed_synchronizer,
+            "synchronize_trellis_prior_measure",
+        ):
+            prior_measure = distributed_synchronizer.synchronize_trellis_prior_measure(
+                prior_measure,
+                dtype=root_bounds[0].dtype,
+            )
+        if prior_measure is None:
+            raise RuntimeError("TRELLIS prior synchronization returned no measure")
+        prior_measure.validate()
+        return prior_measure
 
     def _select_feasible_stratum(
         self,

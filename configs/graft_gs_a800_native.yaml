@@ -107,6 +107,9 @@ trellis_prior:
   strength: 0.35
   minimum_probability: 0.0
   uncertainty_discount: 0.5
+  # Release only inactive allocator blocks after the frozen source-rank
+  # diffusion sampler. Live TRELLIS weights and sparse priors remain resident.
+  release_cuda_cache_after_sampling: true
 training:
   phases: [A, B, C, D, E, F]
   learning_rate: 1.0e-4

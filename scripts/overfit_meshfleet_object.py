@@ -165,6 +165,9 @@ def main() -> None:
             strength=float(prior_config["strength"]),
             minimum_probability=float(prior_config["minimum_probability"]),
             uncertainty_discount=float(prior_config["uncertainty_discount"]),
+            release_cuda_cache_after_sampling=bool(
+                prior_config["release_cuda_cache_after_sampling"]
+            ),
             device=device,
         )
         if use_prior
@@ -260,9 +263,22 @@ def main() -> None:
     performance_fields = (
         "peak_memory_bytes",
         "peak_reserved_memory_bytes",
+        "peak_active_memory_bytes",
+        "ending_allocated_memory_bytes",
+        "ending_reserved_memory_bytes",
+        "ending_inactive_reserved_memory_bytes",
+        "ending_driver_free_memory_bytes",
         "device_memory_bytes",
         "peak_allocated_fraction",
         "peak_reserved_fraction",
+        "peak_active_fraction",
+        "ending_allocated_fraction",
+        "ending_reserved_fraction",
+        "ending_inactive_reserved_fraction",
+        "ending_driver_free_fraction",
+        "trellis_cache_release_performed",
+        "trellis_cache_released_reserved_bytes",
+        "trellis_cache_reserved_after_bytes",
         "local_views",
         "local_views_per_second",
         "seconds",
@@ -365,6 +381,16 @@ def main() -> None:
             "storage_underflow_edges": transport.storage_underflow_edges,
             "storage_zero_source_rows": transport.storage_zero_source_rows,
             "storage_zero_target_columns": transport.storage_zero_target_columns,
+            "storage_underflow_mass_fraction": (
+                transport.storage_underflow_mass_fraction
+            ),
+            "storage_zero_source_mass_fraction": (
+                transport.storage_zero_source_mass_fraction
+            ),
+            "storage_zero_target_mass_fraction": (
+                transport.storage_zero_target_mass_fraction
+            ),
+            "storage_relative_l1_error": transport.storage_relative_l1_error,
             "edge_count": scene.mapping.graph.num_edges,
             "source_count": scene.mapping.graph.source_count,
             "target_count": scene.mapping.graph.target_count,

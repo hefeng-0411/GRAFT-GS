@@ -239,3 +239,20 @@ checkpoints, data, or a compiled server dependency.
   phases repeat a shortened sweep; activation recomputation removes native
   renderer tapes but not `O(KHW)` outputs, VGGT tokens, evidence, or
   object-dependent atlas/UOT growth.
+## 2026-07-24 allocator/error-certificate server validation
+
+- A fresh schema-v3 A800 sweep is required. Existing schema-v2 reports lack
+  ending allocator/driver telemetry and FP64-referenced transport storage-error
+  mass, so they are intentionally inadmissible.
+- The vpr-48 run returned code 1 after 83.29 seconds but the supplied attachment
+  contains only the sweep summary, not `vpr-48/run.log`. Its cause is genuinely
+  external until that log is supplied or the fresh sweep reproduces it.
+- The vpr-64 OOM remains a measured upper-bound failure, not a reason to weaken
+  precision or supervision. Re-evaluate it only after vpr-48 and the new
+  allocator lifetime telemetry are understood; the sweep stops after the first
+  recognized OOM by default.
+- Required server evidence: all nine focused numerical/allocator tests, per-rank
+  cache-release bytes, peak allocated/active/reserved memory, ending
+  allocated/reserved/driver-free memory, UOT storage relative-L1 and discarded
+  mass, full child logs, and selector schema v3. No corrected memory budget or
+  throughput is claimed before those artifacts exist.

@@ -1282,12 +1282,34 @@ class GraftGSTrainer:
         if self.context.device.type == "cuda":
             peak_memory = torch.cuda.max_memory_allocated(self.context.device)
             peak_reserved_memory = torch.cuda.max_memory_reserved(self.context.device)
+            memory_stats = torch.cuda.memory_stats(self.context.device)
+            peak_active_memory = int(
+                memory_stats.get("active_bytes.all.peak", peak_memory)
+            )
+            ending_allocated_memory = int(
+                torch.cuda.memory_allocated(self.context.device)
+            )
+            ending_reserved_memory = int(
+                torch.cuda.memory_reserved(self.context.device)
+            )
+            ending_inactive_reserved_memory = max(
+                ending_reserved_memory - ending_allocated_memory,
+                0,
+            )
+            ending_driver_free_memory, _ = torch.cuda.mem_get_info(
+                self.context.device
+            )
             device_memory = torch.cuda.get_device_properties(
                 self.context.device
             ).total_memory
         else:
             peak_memory = 0
             peak_reserved_memory = 0
+            peak_active_memory = 0
+            ending_allocated_memory = 0
+            ending_reserved_memory = 0
+            ending_inactive_reserved_memory = 0
+            ending_driver_free_memory = 0
             device_memory = 0
         metrics = {name: float(value.detach().cpu()) for name, value in terms.items()}
         if output.scenes:
@@ -1327,12 +1349,42 @@ class GraftGSTrainer:
             seconds=elapsed,
             peak_memory_bytes=float(peak_memory),
             peak_reserved_memory_bytes=float(peak_reserved_memory),
+            peak_active_memory_bytes=float(peak_active_memory),
+            ending_allocated_memory_bytes=float(ending_allocated_memory),
+            ending_reserved_memory_bytes=float(ending_reserved_memory),
+            ending_inactive_reserved_memory_bytes=float(
+                ending_inactive_reserved_memory
+            ),
+            ending_driver_free_memory_bytes=float(ending_driver_free_memory),
             device_memory_bytes=float(device_memory),
             peak_allocated_fraction=(
                 float(peak_memory / device_memory) if device_memory else 0.0
             ),
             peak_reserved_fraction=(
                 float(peak_reserved_memory / device_memory) if device_memory else 0.0
+            ),
+            peak_active_fraction=(
+                float(peak_active_memory / device_memory) if device_memory else 0.0
+            ),
+            ending_allocated_fraction=(
+                float(ending_allocated_memory / device_memory)
+                if device_memory
+                else 0.0
+            ),
+            ending_reserved_fraction=(
+                float(ending_reserved_memory / device_memory)
+                if device_memory
+                else 0.0
+            ),
+            ending_inactive_reserved_fraction=(
+                float(ending_inactive_reserved_memory / device_memory)
+                if device_memory
+                else 0.0
+            ),
+            ending_driver_free_fraction=(
+                float(ending_driver_free_memory / device_memory)
+                if device_memory
+                else 0.0
             ),
             local_scenes=float(images.shape[0]),
             local_views=float(images.shape[0] * images.shape[1]),
@@ -1342,6 +1394,21 @@ class GraftGSTrainer:
         )
         metrics.update(purification_metrics)
         metrics.update(scale_adversary_metrics)
+        trellis_prior = getattr(self.module, "trellis_prior", None)
+        cache_release = getattr(trellis_prior, "last_cuda_cache_release", None)
+        if not isinstance(cache_release, Mapping):
+            cache_release = {}
+        metrics.update(
+            trellis_cache_release_performed=float(
+                bool(cache_release.get("performed", False))
+            ),
+            trellis_cache_released_reserved_bytes=float(
+                cache_release.get("released_reserved_bytes", 0)
+            ),
+            trellis_cache_reserved_after_bytes=float(
+                cache_release.get("reserved_after_bytes", 0)
+            ),
+        )
         if should_step and self.global_step % self.config.log_every == 0:
             self._log(metrics)
         return metrics

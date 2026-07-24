@@ -375,3 +375,22 @@
   change FP32 accumulation, camera order, tile ordering, supervision weights,
   or the analytical Gaussian state. Forward/gradient equivalence is an A800
   validation condition, not inferred solely from API semantics.
+- Frozen TRELLIS sampling is outside the trainable graph and its returned
+  hidden-support prior is completely represented by the retained sparse
+  coordinate tensors after `sample()` returns. At that lifetime boundary,
+  `torch.cuda.empty_cache()` may return inactive allocator blocks but must not
+  change `memory_allocated`; the implementation checks this equality and fails
+  closed. This is an allocator-state transformation, not a model-state,
+  precision, probability, or gradient transformation.
+- Early TRELLIS execution assumes explicit `atlas_root_bounds` are audited
+  canonical constants and that TRELLIS conditioning uses the same unmodified
+  `[0,1]` input images as VGGT. The prior depends on neither VGGT evidence nor
+  trainable VGGT activations in this branch. When bounds are absent, the code
+  does not make this assumption and waits for evidence-derived root bounds.
+- A sparse plan storage approximation is admitted by measure error, not support
+  cardinality. Let `Gamma_64` be the converged FP64 log-domain plan and
+  `Gamma_s` its geometric-state cast. The reported relative error is
+  `||Gamma_s-Gamma_64||_1 / ||Gamma_64||_1`; underflow and zero-row/column mass
+  are measured in `Gamma_64`. Many zero stored edges are permissible only when
+  these quantities remain below explicit tolerances. This certificate does
+  not assert that every individual edge remains representable in FP32.

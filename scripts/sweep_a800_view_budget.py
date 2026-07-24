@@ -25,6 +25,12 @@ OOM_MARKERS = (
     "cuda error: out of memory",
     "cuda error: 2[cudamalloc",
     "cuda error: 2 [cudamalloc",
+    "cuda_error_out_of_memory",
+    "cudaerror_memoryallocation",
+    "cublas_status_alloc_failed",
+    "cudnn_status_alloc_failed",
+    "failed to allocate cuda",
+    "cuda malloc failed",
 )
 
 
@@ -156,8 +162,24 @@ def main() -> None:
     parser.add_argument("--minimum-relative-improvement", type=float, default=-1.0)
     parser.add_argument("--python", default=os.environ.get("GRAFT_GS_PYTHON", sys.executable))
     parser.add_argument("--maximum-reserved-fraction", type=float, default=0.85)
-    parser.add_argument("--maximum-storage-underflow-fraction", type=float, default=0.05)
-    parser.add_argument("--maximum-zero-marginal-fraction", type=float, default=0.05)
+    parser.add_argument("--maximum-allocated-fraction", type=float, default=0.90)
+    parser.add_argument("--minimum-driver-free-fraction", type=float, default=0.05)
+    parser.add_argument("--maximum-storage-relative-l1-error", type=float, default=1.0e-6)
+    parser.add_argument(
+        "--maximum-zero-marginal-mass-fraction", type=float, default=1.0e-12
+    )
+    parser.add_argument(
+        "--maximum-storage-underflow-fraction",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--maximum-zero-marginal-fraction",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
     parser.add_argument("--throughput-fraction", type=float, default=0.97)
     parser.add_argument(
         "--continue-after-oom",
@@ -165,10 +187,31 @@ def main() -> None:
         help="Diagnostic override; larger candidates are normally skipped after OOM",
     )
     args = parser.parse_args()
+    if (
+        args.maximum_storage_underflow_fraction is not None
+        or args.maximum_zero_marginal_fraction is not None
+    ):
+        print(
+            "warning: edge/row-count underflow limits are deprecated and ignored; "
+            "the selector uses discarded transport mass and relative-L1 error",
+            file=sys.stderr,
+        )
 
     candidates = validate_candidates(args.views_per_rank)
     if args.evaluation_views < 1 or args.steps < 1:
         raise ValueError("evaluation views and steps must be positive")
+    for name in ("maximum_reserved_fraction", "maximum_allocated_fraction"):
+        value = float(getattr(args, name))
+        if not 0 < value < 1:
+            raise ValueError(f"{name.replace('_', '-')} must lie in (0,1)")
+    for name in (
+        "minimum_driver_free_fraction",
+        "maximum_storage_relative_l1_error",
+        "maximum_zero_marginal_mass_fraction",
+    ):
+        value = float(getattr(args, name))
+        if not 0 <= value < 1:
+            raise ValueError(f"{name.replace('_', '-')} must lie in [0,1)")
     for path in (args.dataset_root, args.manifest, args.config):
         if not path.exists():
             raise FileNotFoundError(path)
@@ -224,7 +267,7 @@ def main() -> None:
     summary_path.write_text(
         json.dumps(
             {
-                "schema": "graft-gs-a800-sweep-v1",
+                "schema": "graft-gs-a800-sweep-v2",
                 "nproc_per_node": nproc_per_node,
                 "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
                 "candidates": list(candidates),
@@ -247,10 +290,14 @@ def main() -> None:
         *(str(path) for path in metrics_paths),
         "--maximum-reserved-fraction",
         str(args.maximum_reserved_fraction),
-        "--maximum-storage-underflow-fraction",
-        str(args.maximum_storage_underflow_fraction),
-        "--maximum-zero-marginal-fraction",
-        str(args.maximum_zero_marginal_fraction),
+        "--maximum-allocated-fraction",
+        str(args.maximum_allocated_fraction),
+        "--minimum-driver-free-fraction",
+        str(args.minimum_driver_free_fraction),
+        "--maximum-storage-relative-l1-error",
+        str(args.maximum_storage_relative_l1_error),
+        "--maximum-zero-marginal-mass-fraction",
+        str(args.maximum_zero_marginal_mass_fraction),
         "--throughput-fraction",
         str(args.throughput_fraction),
         "--output",

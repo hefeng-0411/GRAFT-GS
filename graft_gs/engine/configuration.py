@@ -232,6 +232,14 @@ def load_trellis_prior_config(path: str | Path) -> dict[str, object]:
     value = data.get("trellis_prior", {}) if isinstance(data, dict) else {}
     if not isinstance(value, dict):
         raise ValueError("configuration section 'trellis_prior' must be a mapping")
+    release_cuda_cache_after_sampling = value.get(
+        "release_cuda_cache_after_sampling",
+        True,
+    )
+    if not isinstance(release_cuda_cache_after_sampling, bool):
+        raise TypeError(
+            "trellis_prior.release_cuda_cache_after_sampling must be Boolean"
+        )
     config: dict[str, object] = {
         "enabled_after_phase_a": bool(value.get("enabled_after_phase_a", False)),
         "samples": int(value.get("samples", 8)),
@@ -239,6 +247,7 @@ def load_trellis_prior_config(path: str | Path) -> dict[str, object]:
         "strength": float(value.get("strength", 0.35)),
         "minimum_probability": float(value.get("minimum_probability", 0.0)),
         "uncertainty_discount": float(value.get("uncertainty_discount", 0.5)),
+        "release_cuda_cache_after_sampling": release_cuda_cache_after_sampling,
     }
     if int(config["samples"]) < 1 or int(config["sampler_steps"]) < 1:
         raise ValueError("TRELLIS prior samples/steps must be positive")

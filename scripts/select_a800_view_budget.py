@@ -3,7 +3,14 @@
 The selector deliberately treats VRAM as a feasibility constraint rather than
 an objective.  A candidate is admissible only when every rank is represented,
 all losses are finite, sparse transport converged, the final atlas embedding is
-strictly feasible, and peak reserved memory remains below the requested limit.
+strictly feasible, the live peak remains below the requested limit, and the
+post-step caching-allocator state leaves explicit driver headroom.
+
+``peak_reserved`` is retained as a diagnostic but is not a live-memory error
+bound: PyTorch may reserve inactive blocks after a frozen upstream sampler.
+Similarly, the count of FP32-zero OT edges is not a transport error bound.
+Admission uses discarded transport mass and relative L1 storage error computed
+against the FP64 log-domain solve.
 Among admissible runs within ``throughput_fraction`` of the fastest aggregate
 views/second, it chooses the largest measured per-rank view count to favor
 multiview coverage without accepting a severe throughput regression.
@@ -46,8 +53,10 @@ def _positive_margin(value: object) -> bool:
 def audit_report(
     report: Mapping[str, object],
     maximum_reserved_fraction: float,
-    maximum_storage_underflow_fraction: float = 0.05,
-    maximum_zero_marginal_fraction: float = 0.05,
+    maximum_allocated_fraction: float = 0.90,
+    minimum_driver_free_fraction: float = 0.05,
+    maximum_storage_relative_l1_error: float = 1.0e-6,
+    maximum_zero_marginal_mass_fraction: float = 1.0e-12,
 ) -> dict[str, object]:
     """Return a normalized candidate record with explicit rejection reasons."""
 
@@ -63,7 +72,11 @@ def audit_report(
     ranks: list[int] = []
     local_views: list[int] = []
     throughput: list[float] = []
-    reserved: list[float] = []
+    peak_reserved: list[float] = []
+    peak_allocated: list[float] = []
+    peak_active: list[float] = []
+    ending_reserved: list[float] = []
+    ending_driver_free: list[float] = []
     for row in rank_rows:
         if not isinstance(row, Mapping):
             reasons.append("rank_performance contains a malformed row")
@@ -72,7 +85,15 @@ def audit_report(
             rank = int(row["rank"])
             views = int(float(row["local_views"]))
             views_per_second = float(row["local_views_per_second"])
-            reserved_fraction = float(row["peak_reserved_fraction"])
+            peak_reserved_fraction = float(row["peak_reserved_fraction"])
+            peak_allocated_fraction = float(row["peak_allocated_fraction"])
+            peak_active_fraction = float(row["peak_active_fraction"])
+            ending_reserved_fraction = float(row["ending_reserved_fraction"])
+            ending_driver_free_fraction = float(row["ending_driver_free_fraction"])
+            cache_release_value = float(row["trellis_cache_release_performed"])
+            if cache_release_value not in (0.0, 1.0):
+                raise ValueError("cache-release flag is not Boolean")
+            cache_release_performed = bool(cache_release_value)
         except (KeyError, TypeError, ValueError):
             reasons.append("rank_performance row lacks numeric telemetry")
             continue
@@ -80,17 +101,47 @@ def audit_report(
             reasons.append(f"rank {rank} has fewer than two useful views")
         if not isfinite(views_per_second) or views_per_second <= 0:
             reasons.append(f"rank {rank} has invalid useful throughput")
-        if not isfinite(reserved_fraction) or not 0 <= reserved_fraction <= 1:
-            reasons.append(f"rank {rank} has invalid reserved-memory fraction")
-        elif reserved_fraction > maximum_reserved_fraction:
+        for label, fraction in (
+            ("peak reserved", peak_reserved_fraction),
+            ("peak allocated", peak_allocated_fraction),
+            ("peak active", peak_active_fraction),
+            ("ending reserved", ending_reserved_fraction),
+            ("ending driver free", ending_driver_free_fraction),
+        ):
+            if not isfinite(fraction) or not 0 <= fraction <= 1:
+                reasons.append(f"rank {rank} has invalid {label}-memory fraction")
+        live_peak_fraction = max(peak_allocated_fraction, peak_active_fraction)
+        if live_peak_fraction > maximum_allocated_fraction:
             reasons.append(
-                f"rank {rank} reserved fraction {reserved_fraction:.4f} exceeds "
-                f"limit {maximum_reserved_fraction:.4f}"
+                f"rank {rank} live peak fraction "
+                f"{live_peak_fraction:.4f} exceeds live-memory limit "
+                f"{maximum_allocated_fraction:.4f}"
+            )
+        if ending_reserved_fraction > maximum_reserved_fraction:
+            reasons.append(
+                f"rank {rank} ending reserved fraction "
+                f"{ending_reserved_fraction:.4f} exceeds allocator-state limit "
+                f"{maximum_reserved_fraction:.4f}"
+            )
+        if ending_driver_free_fraction < minimum_driver_free_fraction:
+            reasons.append(
+                f"rank {rank} ending driver-free fraction "
+                f"{ending_driver_free_fraction:.4f} is below headroom limit "
+                f"{minimum_driver_free_fraction:.4f}"
+            )
+        if rank == 0 and not cache_release_performed:
+            reasons.append(
+                "rank 0 did not certify release of inactive frozen-TRELLIS "
+                "allocator blocks"
             )
         ranks.append(rank)
         local_views.append(views)
         throughput.append(views_per_second)
-        reserved.append(reserved_fraction)
+        peak_reserved.append(peak_reserved_fraction)
+        peak_allocated.append(peak_allocated_fraction)
+        peak_active.append(peak_active_fraction)
+        ending_reserved.append(ending_reserved_fraction)
+        ending_driver_free.append(ending_driver_free_fraction)
     if ranks and sorted(ranks) != list(range(world_size)):
         reasons.append("rank identities are missing or duplicated")
 
@@ -99,9 +150,11 @@ def audit_report(
         reasons.append("loss history is empty or non-finite")
 
     transport = report.get("transport")
-    underflow_fraction = float("inf")
-    zero_source_fraction = float("inf")
-    zero_target_fraction = float("inf")
+    underflow_edge_fraction = float("inf")
+    underflow_mass_fraction = float("inf")
+    zero_source_mass_fraction = float("inf")
+    zero_target_mass_fraction = float("inf")
+    storage_relative_l1_error = float("inf")
     if not isinstance(transport, Mapping):
         reasons.append("transport certificate is missing")
     else:
@@ -126,6 +179,52 @@ def audit_report(
                 reasons.append(f"transport field {name} is negative")
         if transport.get("internal_solve_dtype") != "float64":
             reasons.append("sparse transport was not solved in float64/log space")
+        for name in (
+            "storage_underflow_mass_fraction",
+            "storage_zero_source_mass_fraction",
+            "storage_zero_target_mass_fraction",
+            "storage_relative_l1_error",
+        ):
+            value = transport.get(name)
+            if (
+                not _finite_number(value)
+                or not 0 <= float(value) <= 1
+            ):
+                reasons.append(f"transport error certificate {name} is invalid or missing")
+        if all(
+            _finite_number(transport.get(name))
+            for name in (
+                "storage_underflow_mass_fraction",
+                "storage_zero_source_mass_fraction",
+                "storage_zero_target_mass_fraction",
+                "storage_relative_l1_error",
+            )
+        ):
+            underflow_mass_fraction = float(
+                transport["storage_underflow_mass_fraction"]
+            )
+            zero_source_mass_fraction = float(
+                transport["storage_zero_source_mass_fraction"]
+            )
+            zero_target_mass_fraction = float(
+                transport["storage_zero_target_mass_fraction"]
+            )
+            storage_relative_l1_error = float(
+                transport["storage_relative_l1_error"]
+            )
+            if storage_relative_l1_error > maximum_storage_relative_l1_error:
+                reasons.append(
+                    "transport FP32 storage relative-L1 error exceeds the "
+                    "configured accuracy limit"
+                )
+            if max(
+                zero_source_mass_fraction,
+                zero_target_mass_fraction,
+            ) > maximum_zero_marginal_mass_fraction:
+                reasons.append(
+                    "transport zero-marginal discarded mass exceeds the "
+                    "configured accuracy limit"
+                )
         count_fields = (
             "storage_underflow_edges",
             "storage_zero_source_rows",
@@ -153,28 +252,10 @@ def audit_report(
             ) <= 0:
                 reasons.append("transport graph cardinalities are not positive")
             else:
-                underflow_fraction = (
+                underflow_edge_fraction = (
                     parsed_counts["storage_underflow_edges"]
                     / parsed_counts["edge_count"]
                 )
-                zero_source_fraction = (
-                    parsed_counts["storage_zero_source_rows"]
-                    / parsed_counts["source_count"]
-                )
-                zero_target_fraction = (
-                    parsed_counts["storage_zero_target_columns"]
-                    / parsed_counts["target_count"]
-                )
-                if underflow_fraction > maximum_storage_underflow_fraction:
-                    reasons.append(
-                        "transport storage-underflow fraction exceeds the "
-                        "configured accuracy limit"
-                    )
-                if max(zero_source_fraction, zero_target_fraction) > maximum_zero_marginal_fraction:
-                    reasons.append(
-                        "transport zero-marginal fraction exceeds the "
-                        "configured accuracy limit"
-                    )
 
     feasibility = report.get("final_feasibility")
     if not isinstance(feasibility, Mapping):
@@ -233,10 +314,26 @@ def audit_report(
         "maximum_views_per_rank": max(local_views) if local_views else 0,
         "global_useful_views": sum(local_views),
         "aggregate_views_per_second": sum(throughput),
-        "maximum_reserved_fraction": max(reserved) if reserved else float("inf"),
-        "transport_storage_underflow_fraction": underflow_fraction,
-        "transport_zero_source_fraction": zero_source_fraction,
-        "transport_zero_target_fraction": zero_target_fraction,
+        "maximum_peak_reserved_fraction": (
+            max(peak_reserved) if peak_reserved else float("inf")
+        ),
+        "maximum_peak_allocated_fraction": (
+            max(peak_allocated) if peak_allocated else float("inf")
+        ),
+        "maximum_peak_active_fraction": (
+            max(peak_active) if peak_active else float("inf")
+        ),
+        "maximum_ending_reserved_fraction": (
+            max(ending_reserved) if ending_reserved else float("inf")
+        ),
+        "minimum_ending_driver_free_fraction": (
+            min(ending_driver_free) if ending_driver_free else float("-inf")
+        ),
+        "transport_storage_underflow_edge_fraction": underflow_edge_fraction,
+        "transport_storage_underflow_mass_fraction": underflow_mass_fraction,
+        "transport_storage_relative_l1_error": storage_relative_l1_error,
+        "transport_zero_source_mass_fraction": zero_source_mass_fraction,
+        "transport_zero_target_mass_fraction": zero_target_mass_fraction,
     }
 
 
@@ -260,7 +357,7 @@ def select_candidate(
         key=lambda candidate: (
             int(candidate["minimum_views_per_rank"]),
             float(candidate["aggregate_views_per_second"]),
-            -float(candidate["maximum_reserved_fraction"]),
+            -float(candidate["maximum_peak_allocated_fraction"]),
         ),
     )
 
@@ -269,20 +366,49 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("reports", nargs="+", help="JSON files or glob patterns")
     parser.add_argument("--maximum-reserved-fraction", type=float, default=0.85)
+    parser.add_argument("--maximum-allocated-fraction", type=float, default=0.90)
+    parser.add_argument("--minimum-driver-free-fraction", type=float, default=0.05)
     parser.add_argument(
-        "--maximum-storage-underflow-fraction", type=float, default=0.05
+        "--maximum-storage-relative-l1-error", type=float, default=1.0e-6
     )
     parser.add_argument(
-        "--maximum-zero-marginal-fraction", type=float, default=0.05
+        "--maximum-zero-marginal-mass-fraction", type=float, default=1.0e-12
+    )
+    parser.add_argument(
+        "--maximum-storage-underflow-fraction",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--maximum-zero-marginal-fraction",
+        type=float,
+        default=None,
+        help=argparse.SUPPRESS,
     )
     parser.add_argument("--throughput-fraction", type=float, default=0.97)
     parser.add_argument("--output", type=Path, default=Path("outputs/concurrency/selection.json"))
     args = parser.parse_args()
-    if not 0 < args.maximum_reserved_fraction < 1:
-        raise ValueError("maximum-reserved-fraction must lie in (0,1)")
+    if (
+        args.maximum_storage_underflow_fraction is not None
+        or args.maximum_zero_marginal_fraction is not None
+    ):
+        print(
+            "warning: edge/row-count underflow limits are deprecated and ignored; "
+            "selection uses FP64-referenced discarded mass and relative-L1 error",
+            file=__import__("sys").stderr,
+        )
     for name in (
-        "maximum_storage_underflow_fraction",
-        "maximum_zero_marginal_fraction",
+        "maximum_reserved_fraction",
+        "maximum_allocated_fraction",
+    ):
+        value = float(getattr(args, name))
+        if not 0 < value < 1:
+            raise ValueError(f"{name.replace('_', '-')} must lie in (0,1)")
+    for name in (
+        "minimum_driver_free_fraction",
+        "maximum_storage_relative_l1_error",
+        "maximum_zero_marginal_mass_fraction",
     ):
         value = float(getattr(args, name))
         if not 0 <= value < 1:
@@ -305,8 +431,10 @@ def main() -> None:
         candidate = audit_report(
             value,
             args.maximum_reserved_fraction,
-            args.maximum_storage_underflow_fraction,
-            args.maximum_zero_marginal_fraction,
+            args.maximum_allocated_fraction,
+            args.minimum_driver_free_fraction,
+            args.maximum_storage_relative_l1_error,
+            args.maximum_zero_marginal_mass_fraction,
         )
         candidate["path"] = str(path)
         audited.append(candidate)
@@ -317,10 +445,22 @@ def main() -> None:
         selected = None
         selection_error = str(error)
     output = {
-        "schema": "graft-gs-a800-view-selection-v2",
+        "schema": "graft-gs-a800-view-selection-v3",
         "maximum_reserved_fraction": args.maximum_reserved_fraction,
-        "maximum_storage_underflow_fraction": args.maximum_storage_underflow_fraction,
-        "maximum_zero_marginal_fraction": args.maximum_zero_marginal_fraction,
+        "maximum_allocated_fraction": args.maximum_allocated_fraction,
+        "minimum_driver_free_fraction": args.minimum_driver_free_fraction,
+        "maximum_storage_relative_l1_error": (
+            args.maximum_storage_relative_l1_error
+        ),
+        "maximum_zero_marginal_mass_fraction": (
+            args.maximum_zero_marginal_mass_fraction
+        ),
+        "ignored_legacy_count_gates": {
+            "maximum_storage_underflow_fraction": (
+                args.maximum_storage_underflow_fraction
+            ),
+            "maximum_zero_marginal_fraction": args.maximum_zero_marginal_fraction,
+        },
         "throughput_fraction": args.throughput_fraction,
         "candidates": audited,
         "selected": selected,

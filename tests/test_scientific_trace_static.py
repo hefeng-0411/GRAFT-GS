@@ -251,7 +251,8 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("def should_sample_trellis_prior", trainer)
         self.assertIn("non-source TRELLIS rank must not sample", trainer)
         self.assertIn("distributed_synchronizer.should_sample_trellis_prior()", pipeline)
-        self.assertIn("prior_measure,\n                            dtype=root_bounds[0].dtype", pipeline)
+        self.assertIn("synchronize_trellis_prior_measure(", pipeline)
+        self.assertIn("dtype=root_bounds[0].dtype", pipeline)
         self.assertIn("if context.rank == 0\n            else None", distributed_test)
         self.assertIn("synchronize_object_atlas=True", overfit)
         self.assertIn("value.to(dtype=torch.int64, copy=True).contiguous()", trainer)
@@ -433,6 +434,7 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
     def test_visible_gpu_training_launcher_cannot_bypass_pinned_interpreter(self) -> None:
         launcher = source("scripts/launch_a800_6gpu.sh")
         config = source("configs/graft_gs_a800_native.yaml")
+        pipeline = source("graft_gs/integration/pipeline.py")
         self.assertIn("/mnt/sda1/miniforge3/envs/CRAFT/bin/python", launcher)
         self.assertIn('"$ROOT/scripts/validate_environment.py"', launcher)
         self.assertIn('--requirements "$ROOT/requirements.txt"', launcher)
@@ -480,6 +482,7 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
 
     def test_a800_concurrency_uses_useful_views_and_early_rank_binding(self) -> None:
         trainer = source("graft_gs/engine/trainer.py")
+        pipeline = source("graft_gs/integration/pipeline.py")
         overfit = source("scripts/overfit_meshfleet_object.py")
         training = source("scripts/train_a800.py")
         launcher = source("scripts/launch_a800_6gpu.sh")
@@ -527,7 +530,17 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         )
         self.assertIn("non_blocking=True", trainer)
         self.assertIn("peak_reserved_memory_bytes", trainer)
+        self.assertIn('"active_bytes.all.peak"', trainer)
+        self.assertIn("ending_driver_free_fraction", trainer)
+        self.assertIn("trellis_cache_released_reserved_bytes", trainer)
         self.assertIn("local_views_per_second", trainer)
+        self.assertIn("release_cuda_cache_after_sampling: true", config)
+        self.assertIn("storage_relative_l1_error", overfit)
+        self.assertIn("maximum_storage_relative_l1_error", selector)
+        self.assertLess(
+            pipeline.index("graft_gs/trellis_structure_prior_prefetch"),
+            pipeline.index('record_function("graft_gs/vggt_geometry")'),
+        )
         self.assertIn("def _clip_grad_norm_high_precision", trainer)
         self.assertIn("dtype=torch.float64", trainer)
         save_start = trainer.index("def save_checkpoint")
@@ -539,7 +552,6 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         )
         self.assertIn("distributed checkpoint commit failed", checkpoint_source)
         barrier = source("graft_gs/manifold/barrier.py")
-        pipeline = source("graft_gs/integration/pipeline.py")
         configuration = source("graft_gs/engine/configuration.py")
         self.assertIn("def restore_feasible_embedding", barrier)
         self.assertIn("metric-minimal hard-constraint steps", barrier)

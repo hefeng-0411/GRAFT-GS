@@ -147,6 +147,7 @@ class TrellisPriorAdapter:
         minimum_probability: float = 0.0,
         uncertainty_discount: float = 0.5,
         cache_entries: int = 64,
+        release_cuda_cache_after_sampling: bool = True,
     ) -> None:
         if samples < 1 or sampler_steps < 1:
             raise ValueError("TRELLIS prior samples and sampler steps must be positive")
@@ -154,6 +155,8 @@ class TrellisPriorAdapter:
             raise ValueError("TRELLIS prior strength/threshold are outside their domains")
         if cache_entries < 0:
             raise ValueError("TRELLIS prior cache_entries must be non-negative")
+        if not isinstance(release_cuda_cache_after_sampling, bool):
+            raise TypeError("release_cuda_cache_after_sampling must be Boolean")
         self.pipeline = pipeline
         if pipeline is not None:
             self._validate_upstream_contract(pipeline)
@@ -163,7 +166,16 @@ class TrellisPriorAdapter:
         self.minimum_probability = minimum_probability
         self.uncertainty_discount = uncertainty_discount
         self.cache_entries = cache_entries
+        self.release_cuda_cache_after_sampling = release_cuda_cache_after_sampling
         self._sample_cache: OrderedDict[str, TrellisStructurePrior] = OrderedDict()
+        self.last_cuda_cache_release: dict[str, int | bool] = {
+            "performed": False,
+            "allocated_before_bytes": 0,
+            "reserved_before_bytes": 0,
+            "allocated_after_bytes": 0,
+            "reserved_after_bytes": 0,
+            "released_reserved_bytes": 0,
+        }
 
     @staticmethod
     def _validate_upstream_contract(pipeline: object) -> None:
@@ -214,6 +226,7 @@ class TrellisPriorAdapter:
         minimum_probability: float = 0.0,
         uncertainty_discount: float = 0.5,
         cache_entries: int = 64,
+        release_cuda_cache_after_sampling: bool = True,
         device: Optional[torch.device | str] = None,
     ) -> "TrellisPriorAdapter":
         checkpoint = resolve_trellis_checkpoint(checkpoint)
@@ -229,6 +242,7 @@ class TrellisPriorAdapter:
             minimum_probability,
             uncertainty_discount,
             cache_entries,
+            release_cuda_cache_after_sampling,
         )
         adapter.upstream_provenance = external_module_provenance(module, checkpoint)
         return adapter
@@ -331,7 +345,54 @@ class TrellisPriorAdapter:
             )
             while len(self._sample_cache) > self.cache_entries:
                 self._sample_cache.popitem(last=False)
+        # TRELLIS sampling is a frozen, no-grad upstream operation. Its diffusion
+        # workspaces are dead here, but PyTorch's caching allocator otherwise
+        # keeps those blocks reserved on the source DDP rank. That rank-local
+        # cache can consume almost the entire A800 and starve later native CUDA
+        # rasterizers even though the active GRAFT-GS state is much smaller.
+        # Emptying the cache cannot free live tensors (including ``prior`` or
+        # model parameters), so this changes allocator ownership only—not
+        # values, precision, gradients, or posterior samples.
+        del condition
+        if "coordinates" in locals():
+            del coordinates
+        self._release_inactive_cuda_cache(scene_images.device)
         return prior
+
+    def _release_inactive_cuda_cache(self, device: torch.device) -> None:
+        if (
+            not self.release_cuda_cache_after_sampling
+            or device.type != "cuda"
+            or not torch.cuda.is_available()
+        ):
+            self.last_cuda_cache_release = {
+                "performed": False,
+                "allocated_before_bytes": 0,
+                "reserved_before_bytes": 0,
+                "allocated_after_bytes": 0,
+                "reserved_after_bytes": 0,
+                "released_reserved_bytes": 0,
+            }
+            return
+        torch.cuda.synchronize(device)
+        allocated_before = int(torch.cuda.memory_allocated(device))
+        reserved_before = int(torch.cuda.memory_reserved(device))
+        torch.cuda.empty_cache()
+        allocated_after = int(torch.cuda.memory_allocated(device))
+        reserved_after = int(torch.cuda.memory_reserved(device))
+        if allocated_after != allocated_before:
+            raise RuntimeError(
+                "empty_cache changed live TRELLIS allocation accounting; "
+                "the frozen-prior lifetime boundary is invalid"
+            )
+        self.last_cuda_cache_release = {
+            "performed": True,
+            "allocated_before_bytes": allocated_before,
+            "reserved_before_bytes": reserved_before,
+            "allocated_after_bytes": allocated_after,
+            "reserved_after_bytes": reserved_after,
+            "released_reserved_bytes": max(reserved_before - reserved_after, 0),
+        }
 
     def _sample_cache_key(self, scene_images: Tensor, seed: int) -> Optional[str]:
         """Hash exact conditioning values; cache hits never approximate images."""

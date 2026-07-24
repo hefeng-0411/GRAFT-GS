@@ -233,6 +233,10 @@ class SinkhornDiagnostics:
     storage_underflow_edges: int = 0
     storage_zero_source_rows: int = 0
     storage_zero_target_columns: int = 0
+    storage_underflow_mass_fraction: float = 0.0
+    storage_zero_source_mass_fraction: float = 0.0
+    storage_zero_target_mass_fraction: float = 0.0
+    storage_relative_l1_error: float = 0.0
     internal_solve_dtype: str = ""
 
 
@@ -548,6 +552,26 @@ class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
         storage_underflow_edges = int(torch.count_nonzero(storage_plan == 0).item())
         storage_zero_rows = int(torch.count_nonzero(storage_row == 0).item())
         storage_zero_columns = int(torch.count_nonzero(storage_col == 0).item())
+        # Edge counts are not an approximation-error measure: sparse UOT
+        # deliberately assigns exponentially tiny mass to incompatible pairs,
+        # so many FP32 storage zeros can carry essentially no measure. Certify
+        # the actual mass and L1 error against the FP64 log-domain solve.
+        plan_mass = plan.sum()
+        underflow_mask = storage_plan == 0
+        zero_row_mask = storage_row == 0
+        zero_column_mask = storage_col == 0
+        storage_underflow_mass_fraction = (
+            plan[underflow_mask].sum() / plan_mass
+        )
+        storage_zero_source_mass_fraction = (
+            plan[zero_row_mask[source]].sum() / plan_mass
+        )
+        storage_zero_target_mass_fraction = (
+            plan[zero_column_mask[target]].sum() / plan_mass
+        )
+        storage_relative_l1_error = (
+            (storage_plan.to(dtype=plan.dtype) - plan).abs().sum() / plan_mass
+        )
         minimum_log_plan = float(log_plan.amin().detach().cpu())
         if not bool(torch.any(storage_plan > 0)):
             raise FloatingPointError(
@@ -579,6 +603,10 @@ class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
                 float(storage_zero_rows),
                 float(storage_zero_columns),
                 64.0 if solve_dtype == torch.float64 else 32.0,
+                float(storage_underflow_mass_fraction.detach().cpu()),
+                float(storage_zero_source_mass_fraction.detach().cpu()),
+                float(storage_zero_target_mass_fraction.detach().cpu()),
+                float(storage_relative_l1_error.detach().cpu()),
             ),
             dtype=torch.float64,
             device=cost.device,
@@ -800,6 +828,10 @@ class ImplicitUnbalancedSinkhorn(nn.Module):
             storage_zero_source_rows=int(status[5].item()),
             storage_zero_target_columns=int(status[6].item()),
             internal_solve_dtype=f"float{int(status[7].item())}",
+            storage_underflow_mass_fraction=float(status[8].item()),
+            storage_zero_source_mass_fraction=float(status[9].item()),
+            storage_zero_target_mass_fraction=float(status[10].item()),
+            storage_relative_l1_error=float(status[11].item()),
         )
         return plan, diagnostics
 

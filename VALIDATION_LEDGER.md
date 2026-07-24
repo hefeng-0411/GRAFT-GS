@@ -516,3 +516,27 @@ The sweep CLI help executed under the bundled interpreter, the full A800 YAML
 parsed with `mesh_chunk=2` and `renderer_checkpoint=true`, and the source scan
 found no pasted rank traceback or prior confirmed corruption marker. The
 sweep's intentional OOM classifier was excluded from that contamination scan.
+## 2026-07-24 allocator and UOT admission repair
+
+- Supplied A800 evidence, retained as pre-repair: vpr-16/24/32 completed, with
+  rank-0 `peak_reserved_fraction` `0.9854003`, `0.9856466`, and `0.9859174`;
+  all were rejected by the old reserved-peak and edge-count UOT gates. Vpr-48
+  exited in 83.29 seconds without a supplied traceback and cannot be diagnosed
+  from `sweep_summary.json`; vpr-64 was classified as CUDA OOM after 1798.22
+  seconds. No throughput candidate is claimed from these stale schema-v2
+  reports.
+- Locally executed with bundled Python 3.12: whole-tree `compileall` passed
+  after the repair. The final environment-contract, production static trace,
+  and view-budget suites passed `45/45`; the focused view-budget subset passed
+  `11/11`.
+- The policy tests independently prove that historical peak reservation may be
+  99% and remain diagnostic after a certified cache release, while excessive
+  live peak or missing source-rank release fails. They also prove that 80% of
+  edges may underflow without rejection when discarded FP64 mass is negligible,
+  and that excessive relative-L1/zero-marginal mass fails.
+- Local Torch-backed execution is unavailable (`ModuleNotFoundError: torch`
+  in the bundled drafting runtime). The TRELLIS mocked allocator tests, UOT
+  numerical mass certificate, sparse/dense agreement, finite difference,
+  renderer checkpoint equivalence, and fresh schema-v3 A800 sweep are
+  server-ready but unexecuted. Exact commands are recorded in
+  `docs/A800_VALIDATION_PROTOCOL.md`.

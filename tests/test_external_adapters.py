@@ -5,6 +5,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 import torch
 from torch import nn
@@ -139,6 +140,64 @@ class _MockDecodedGridTrellisPipeline:
 
 
 class TrellisAdapterBoundaryTest(unittest.TestCase):
+    def test_frozen_sampler_releases_only_inactive_cuda_allocator_blocks(self) -> None:
+        adapter = TrellisPriorAdapter(
+            _MockTrellisPipeline(),
+            samples=1,
+            sampler_steps=1,
+            release_cuda_cache_after_sampling=True,
+        )
+        with (
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(torch.cuda, "synchronize") as synchronize,
+            mock.patch.object(
+                torch.cuda,
+                "memory_allocated",
+                side_effect=(12_000, 12_000),
+            ),
+            mock.patch.object(
+                torch.cuda,
+                "memory_reserved",
+                side_effect=(80_000, 20_000),
+            ),
+            mock.patch.object(torch.cuda, "empty_cache") as empty_cache,
+        ):
+            adapter._release_inactive_cuda_cache(torch.device("cuda", 0))
+        synchronize.assert_called_once_with(torch.device("cuda", 0))
+        empty_cache.assert_called_once_with()
+        self.assertEqual(
+            adapter.last_cuda_cache_release["released_reserved_bytes"],
+            60_000,
+        )
+        self.assertEqual(
+            adapter.last_cuda_cache_release["allocated_after_bytes"],
+            12_000,
+        )
+
+    def test_cache_release_rejects_a_live_allocation_lifetime_change(self) -> None:
+        adapter = TrellisPriorAdapter(
+            _MockTrellisPipeline(),
+            samples=1,
+            sampler_steps=1,
+        )
+        with (
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(torch.cuda, "synchronize"),
+            mock.patch.object(
+                torch.cuda,
+                "memory_allocated",
+                side_effect=(12_000, 11_000),
+            ),
+            mock.patch.object(
+                torch.cuda,
+                "memory_reserved",
+                side_effect=(80_000, 20_000),
+            ),
+            mock.patch.object(torch.cuda, "empty_cache"),
+            self.assertRaisesRegex(RuntimeError, "live TRELLIS allocation"),
+        ):
+            adapter._release_inactive_cuda_cache(torch.device("cuda", 0))
+
     def test_multi_image_context_is_recreated_for_every_posterior_draw(self) -> None:
         pipeline = _MockTrellisPipeline()
         adapter = TrellisPriorAdapter(pipeline, samples=3, sampler_steps=2)
