@@ -66,6 +66,35 @@ when one exists, uses the same admission predicate as production loading, and
 reduces per-smoke loader work from `O(N)` records to one selected record after
 the deterministic manifest scan.
 
+## Bounded precision-to-covariance map
+
+Problem: state initialization and analytical Gaussian uncertainty require a
+covariance in a certified interval, while chart writing naturally supplies a
+precision. The literal inverse-then-spectral-box composition has an unbounded
+intermediate derivative `-M^-1 G M^-1`; the later box cannot retroactively
+condition it.
+
+Candidates considered:
+
+- generic inverse followed by eigenvalue clipping: rejected because it uses
+  an LU backward and has both singular inverse and repeated-spectrum
+  derivatives;
+- Cholesky inverse plus a differentiable spectral box: rejected after the
+  supplied 32-view A800 reruns because both the backend and exact inverse
+  pullbacks still expose the unbounded pre-box inverse;
+- log-Euclidean exponentiation: valid but substantially more expensive per
+  Gaussian and not inverse-like without an additional learned/scaled map;
+- bounded rational functional calculus: selected.
+
+The selected map is
+`C(M)=lI+s(I+sM)^-1`, `s=u-l`. It maps every SPD eigenvalue to
+`l+s/(1+s lambda)`, commutes with SO(3) conjugation, preserves SPD, has a
+bounded Fréchet derivative, and approaches `M^-1` in the resolved interior.
+The shifted system has eigenvalues greater than one and is solved in FP64.
+This is a deliberate deviation from literal inverse-plus-projection, because
+it strengthens the feasibility and numerical invariants without weakening
+the probabilistic interpretation.
+
 ## Selected end-to-end factorization
 
 ```text

@@ -27,6 +27,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ..geometry.atlas import PersistentOctreeAtlas
+from ..manifold.geometry import spd_inverse_logdet_cholesky
 
 
 @dataclass
@@ -1236,21 +1237,29 @@ class TransportCost(nn.Module):
         graph: SparseTransportGraph,
         atlas_features: Optional[Tensor] = None,
         visibility_barrier: Optional[Tensor] = None,
+        evidence_precision: Optional[Tensor] = None,
     ) -> Tensor:
         source, target = graph.source, graph.target
         nodes = graph.atlas_node_index[source]
         delta = atlas.chart_centers[nodes] - evidence.positions[target]
-        covariance = 0.5 * (
-            evidence.covariance[target]
-            + evidence.covariance[target].transpose(-1, -2)
+        if evidence_precision is None:
+            evidence_precision, _ = spd_inverse_logdet_cholesky(
+                evidence.covariance.to(dtype=torch.float64)
+            )
+            evidence_precision = evidence_precision.to(
+                dtype=evidence.covariance.dtype
+            )
+        if evidence_precision.shape != evidence.covariance.shape:
+            raise ValueError(
+                "evidence_precision must match evidence covariance"
+            )
+        precision = evidence_precision[target]
+        mahalanobis = torch.einsum(
+            "ei,eij,ej->e",
+            delta,
+            precision,
+            delta,
         )
-        # Cholesky whitening evaluates delta^T Sigma^-1 delta without forming
-        # an explicit inverse and remains non-negative by construction.
-        covariance_factor = torch.linalg.cholesky(covariance)
-        whitened = torch.linalg.solve_triangular(
-            covariance_factor, delta.unsqueeze(-1), upper=False
-        ).squeeze(-1)
-        mahalanobis = whitened.square().sum(-1)
         ray = evidence.rays[target]
         axial = torch.sum(ray * delta, dim=-1)
         perpendicular = delta - axial[:, None] * ray
@@ -1342,6 +1351,8 @@ class GaugeCovariantChartWriter(nn.Module):
         radial_support_factor: float,
         source_mass: Tensor,
         retention_shrinkage: float,
+        evidence_precision: Optional[Tensor] = None,
+        evidence_logdet: Optional[Tensor] = None,
     ) -> Tuple[Tensor, Tensor, Tensor, Tensor, IrrepMoments, Tensor]:
         source, target = graph.source, graph.target
         nodes = graph.atlas_node_index[source]
@@ -1379,7 +1390,27 @@ class GaugeCovariantChartWriter(nn.Module):
             evidence.covariance[target]
             + evidence.covariance[target].transpose(-1, -2)
         )
-        precision = torch.cholesky_inverse(torch.linalg.cholesky(covariance))
+        if evidence_precision is None or evidence_logdet is None:
+            evidence_precision, evidence_logdet = (
+                spd_inverse_logdet_cholesky(
+                    evidence.covariance.to(dtype=torch.float64)
+                )
+            )
+            evidence_precision = evidence_precision.to(
+                dtype=evidence.covariance.dtype
+            )
+            evidence_logdet = evidence_logdet.to(
+                dtype=evidence.covariance.dtype
+            )
+        if evidence_precision.shape != evidence.covariance.shape:
+            raise ValueError(
+                "evidence_precision must match evidence covariance"
+            )
+        if evidence_logdet.shape != evidence.covariance.shape[:-2]:
+            raise ValueError(
+                "evidence_logdet must have one value per evidence particle"
+            )
+        precision = evidence_precision[target]
         metric_numerator = _segment_sum(
             plan[:, None, None] * precision, source, count
         )
@@ -1451,7 +1482,7 @@ class GaugeCovariantChartWriter(nn.Module):
                 covariance_local[:, 1, 1],
                 covariance_local[:, 2, 2],
                 covariance_local[:, 0, 1],
-                torch.linalg.slogdet(covariance).logabsdet,
+                evidence_logdet[target],
             ),
             dim=-1,
         )
@@ -1496,7 +1527,23 @@ class ManifoldMappingOperator(nn.Module):
     ) -> MappingResult:
         evidence.validate()
         graph = build_sparse_transport_graph(atlas, evidence, self.config)
-        cost = self.cost_model(atlas, evidence, graph, atlas_features, visibility_barrier)
+        evidence_precision, evidence_logdet = spd_inverse_logdet_cholesky(
+            evidence.covariance.to(dtype=torch.float64)
+        )
+        evidence_precision = evidence_precision.to(
+            dtype=evidence.covariance.dtype
+        )
+        evidence_logdet = evidence_logdet.to(
+            dtype=evidence.covariance.dtype
+        )
+        cost = self.cost_model(
+            atlas,
+            evidence,
+            graph,
+            atlas_features,
+            visibility_barrier,
+            evidence_precision,
+        )
         # Atlas prior mass is explicit chart area.  Unobserved charts may retain
         # mass because the transport is unbalanced instead of being forced to
         # consume erroneous or background image evidence.
@@ -1513,6 +1560,8 @@ class ManifoldMappingOperator(nn.Module):
             self.config.radial_support_factor,
             source_mass,
             self.config.retention_shrinkage,
+            evidence_precision,
+            evidence_logdet,
         )
         transported_color = None
         if evidence.colors is not None:

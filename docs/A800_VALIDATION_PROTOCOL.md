@@ -43,6 +43,7 @@ offline-Hub, sparse-barrier, and phase-boundary repairs. Run this focused gate
 before another long sweep:
 
 ```bash
+set -euo pipefail
 mkdir -p outputs/validation
 "$GRAFT_GS_PYTHON" -m unittest -v \
   tests.test_atlas_mapping.PersistentAtlasTest.test_attention_uncertainty_has_finite_zero_reliability_gradient \
@@ -80,6 +81,7 @@ Then create a fresh schema-v5 sweep root. Do not reuse any pre-repair
 `overfit_metrics.json`:
 
 ```bash
+set -euo pipefail
 RUN_TAG=$(date -u +%Y%m%dT%H%M%SZ)
 SWEEP_ROOT="outputs/concurrency/${GRAFT_GS_TRAIN_OBJECT_ID}/sparse-barrier-${RUN_TAG}"
 
@@ -654,27 +656,36 @@ and the subsequent 24-view gate completed an optimizer step, final checkpoint,
 PLY, and GLB. The 32-view gate then localized its failure to the full
 `[112,3,3]` chart-metric cotangent. Do not repeat the passed 24-view run.
 
-The first post-Cholesky 32-view run narrowed the defect further:
-`state_initialization.metric_inverse` received a finite cotangent, while the
-composed Torch 2.4 factorization backward delivered 1,008 non-finite values to
-`state_initialization.riemannian_metric`. The production inverse now uses the
-exact analytical inverse-map pullback instead of differentiating the
-factorization. Validate it with the focused regressions:
+Two subsequent 32-view runs narrowed the defect further. Replacing the backend
+factorization backward with the exact inverse pullback did not close it:
+`state_initialization.riemannian_metric` still received 1,008 non-finite
+values, most recently with maximum finite magnitude `5.650222e-08`.
+The remaining problem was therefore the unbounded inverse-before-box
+composition, not A800 memory or external checkpoint execution. Production now
+uses a fused bounded rational precision-to-covariance map in state
+initialization and readout, plus a shared exact joint evidence
+inverse/log-determinant primitive. Validate the complete closure:
 
 ```bash
+set -euo pipefail
 mkdir -p outputs/validation
 "$GRAFT_GS_PYTHON" -m unittest -v \
   tests.test_geometry_invariants.TopologyAndManifoldTest.test_spd_cholesky_inverse_contractions_are_exact_and_finite \
   tests.test_geometry_invariants.TopologyAndManifoldTest.test_spd_inverse_float32_112_chart_cotangent_is_finite \
   tests.test_geometry_invariants.TopologyAndManifoldTest.test_spd_inverse_analytical_pullback_passes_gradcheck \
+  tests.test_geometry_invariants.TopologyAndManifoldTest.test_bounded_precision_covariance_closes_112_chart_backward \
+  tests.test_geometry_invariants.TopologyAndManifoldTest.test_bounded_precision_covariance_is_so3_covariant \
   tests.test_assets_and_vertical_slice.AnalyticalAssetTest.test_flat_chart_analytical_readout_backward_is_finite \
   tests.test_assets_and_vertical_slice.AnalyticalAssetTest.test_anisotropic_metric_readout_backward_is_finite \
-  2>&1 | tee outputs/validation/spd_analytical_pullback_numerics.log
+  2>&1 | tee outputs/validation/bounded_spd_numerics.log
 ```
 
-Then rerun only the unresolved 32-view boundary:
+All seven tests must pass. Then rerun only the unresolved 32-view boundary.
+The executable itself performs the same 112-chart CUDA stress before resolving
+or loading VGGT/TRELLIS; require its versioned pass marker:
 
 ```bash
+set -euo pipefail
 RUN_TAG=$(date -u +%Y%m%dT%H%M%SZ)
 TOTAL_VIEWS=32
 RUN_DIR="outputs/spd_metric_gate/${GRAFT_GS_TRAIN_OBJECT_ID}/${RUN_TAG}/views-${TOTAL_VIEWS}"
@@ -694,13 +705,19 @@ mkdir -p "$RUN_DIR"
   --minimum-relative-improvement -1 \
   --output "$RUN_DIR" \
   2>&1 | tee "$RUN_DIR/run.log"
+
+grep -F "GRAFT_GS_NUMERICAL_PREFLIGHT=phase-b-rational-spd-v1:passed" \
+  "$RUN_DIR/run.log"
+test -f "$RUN_DIR/final.pt"
+test -f "$RUN_DIR/meshfleet_overfit.ply"
+test -f "$RUN_DIR/meshfleet_overfit.glb"
 ```
 
 `--maximum-views` fixes the global same-object evidence count even when
 `CUDA_VISIBLE_DEVICES` exposes a dynamic number of ranks; `--views-per-rank`
 would multiply the numerical problem by `WORLD_SIZE` and would not reproduce
-the one-A800 boundary. A pass requires
-one finite optimizer step, a committed checkpoint, finite FP64/log-UOT
+the one-A800 boundary. A pass requires the versioned preflight marker, one
+finite optimizer step, a committed checkpoint, finite FP64/log-UOT
 diagnostics, positive feasibility margins,
 `evaluation_execution_stage=atlas_autoencoding`, and silence from every named
 `chart_writer.*`, `transport_attention.*`, `state_initialization.*`, and

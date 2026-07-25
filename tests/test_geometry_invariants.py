@@ -30,8 +30,10 @@ from graft_gs.manifold.geometry import (
     ManifoldState,
     ManifoldTangent,
     geodesic_interpolate,
+    precision_to_bounded_covariance,
     retract,
     spd_inverse_cholesky,
+    spd_inverse_logdet_cholesky,
     spd_inverse_quadratic_trace,
     spectral_box_spd,
     so3_exp,
@@ -488,6 +490,152 @@ class TopologyAndManifoldTest(unittest.TestCase):
                 atol=2.0e-6,
                 rtol=2.0e-5,
             )
+        )
+        inverse, log_determinant = spd_inverse_logdet_cholesky(matrix)
+        torch.testing.assert_close(
+            inverse.detach(),
+            torch.linalg.inv(matrix.detach()),
+            atol=1.0e-10,
+            rtol=1.0e-10,
+        )
+        torch.testing.assert_close(
+            log_determinant.detach(),
+            torch.linalg.slogdet(matrix.detach()).logabsdet,
+            atol=1.0e-11,
+            rtol=1.0e-11,
+        )
+        self.assertTrue(
+            torch.autograd.gradcheck(
+                spd_inverse_logdet_cholesky,
+                (matrix,),
+                eps=1.0e-6,
+                atol=1.0e-6,
+                rtol=1.0e-5,
+            )
+        )
+        self.assertTrue(
+            torch.autograd.gradgradcheck(
+                spd_inverse_logdet_cholesky,
+                (matrix,),
+                eps=1.0e-6,
+                atol=2.0e-6,
+                rtol=2.0e-5,
+            )
+        )
+
+    def test_bounded_precision_covariance_closes_112_chart_backward(self) -> None:
+        count = 112
+        lower, upper = 1.0e-6, 0.25
+        angle = torch.linspace(-0.8, 0.95, count, dtype=torch.float32)
+        cosine, sine = torch.cos(angle), torch.sin(angle)
+        zero, one = torch.zeros_like(angle), torch.ones_like(angle)
+        rotation = torch.stack(
+            (
+                torch.stack((cosine, -sine, zero), dim=-1),
+                torch.stack((sine, cosine, zero), dim=-1),
+                torch.stack((zero, zero, one), dim=-1),
+            ),
+            dim=-2,
+        )
+        eigenvalue = torch.stack(
+            (
+                torch.logspace(-5.0, 1.0, count, dtype=torch.float32),
+                torch.logspace(1.0, 7.0, count, dtype=torch.float32),
+                torch.logspace(6.0, 12.0, count, dtype=torch.float32),
+            ),
+            dim=-1,
+        )
+        precision = (
+            rotation
+            @ torch.diag_embed(eigenvalue)
+            @ rotation.transpose(-1, -2)
+        ).requires_grad_(True)
+        covariance = precision_to_bounded_covariance(
+            precision,
+            lower,
+            upper,
+        )
+        covariance_eigenvalue = torch.linalg.eigvalsh(covariance.detach())
+        # The map is evaluated in FP64 but intentionally stored as FP32; allow
+        # one storage-rounding envelope around the strict analytical interval.
+        self.assertTrue(torch.all(covariance_eigenvalue >= lower - 1.0e-8))
+        self.assertTrue(torch.all(covariance_eigenvalue <= upper + 1.0e-6))
+        output_cotangent = torch.linspace(
+            -6.0e-8,
+            6.0e-8,
+            count * 9,
+            dtype=torch.float32,
+        ).reshape(count, 3, 3)
+        gradient = torch.autograd.grad(
+            covariance,
+            precision,
+            grad_outputs=output_cotangent,
+        )[0]
+        self.assertTrue(torch.all(torch.isfinite(gradient)))
+
+        probe = torch.tensor(
+            [
+                [2.0, 0.2, -0.1],
+                [0.2, 1.5, 0.15],
+                [-0.1, 0.15, 1.2],
+            ],
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        self.assertTrue(
+            torch.autograd.gradcheck(
+                lambda value: precision_to_bounded_covariance(
+                    value,
+                    lower,
+                    upper,
+                ),
+                (probe,),
+                eps=1.0e-6,
+                atol=1.0e-6,
+                rtol=1.0e-5,
+            )
+        )
+        self.assertTrue(
+            torch.autograd.gradgradcheck(
+                lambda value: precision_to_bounded_covariance(
+                    value,
+                    lower,
+                    upper,
+                ),
+                (probe,),
+                eps=1.0e-6,
+                atol=2.0e-6,
+                rtol=2.0e-5,
+            )
+        )
+
+    def test_bounded_precision_covariance_is_so3_covariant(self) -> None:
+        precision = torch.tensor(
+            [
+                [5.0, 0.4, -0.2],
+                [0.4, 3.0, 0.1],
+                [-0.2, 0.1, 2.0],
+            ],
+            dtype=torch.float64,
+        )
+        rotation = so3_exp(
+            torch.tensor([0.3, -0.2, 0.4], dtype=torch.float64)
+        )
+        reference = precision_to_bounded_covariance(
+            precision,
+            1.0e-6,
+            0.25,
+        )
+        transformed = precision_to_bounded_covariance(
+            rotation @ precision @ rotation.T,
+            1.0e-6,
+            0.25,
+        )
+        torch.testing.assert_close(
+            transformed,
+            rotation @ reference @ rotation.T,
+            atol=2.0e-12,
+            rtol=2.0e-12,
         )
 
     def test_persistence_critical_proposal_thresholds(self) -> None:

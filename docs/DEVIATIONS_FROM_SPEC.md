@@ -345,3 +345,13 @@
   cotangents despite finite mathematical inputs. The replacement is an exact
   derivative and is validated against finite differences/gradcheck; it is not
   a custom approximation.
+## Fused bounded covariance instead of inverse then spectral projection
+
+The implementation converts transported precision to state/readout covariance
+with `C(M)=lI+(u-l)(I+(u-l)M)^-1` rather than materializing `M^-1` and then
+projecting its spectrum. This preserves SPD, the configured covariance
+interval, SO(3) covariance, and differentiability while bounding the
+pre-feasibility derivative that failed on the real 112-chart A800 graph. It is
+inverse-like away from the active bounds but intentionally differs near them;
+therefore this is documented as a strengthened feasibility realization, not
+claimed as a literal algebraic implementation of an unconstrained inverse.

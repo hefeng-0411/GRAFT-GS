@@ -1096,3 +1096,43 @@ The full conditional validity domain is maintained in
   gradcheck both inverse and contraction operators in FP64. Local compilation
   and all 76 executable static/environment/data/selection guards pass; Torch
   numerical and 32-view production reruns remain server-pending.
+
+## 2026-07-25 bounded precision-to-covariance closure
+
+- Requirement `A800-BOUNDED-PRECISION-CLOSURE-09`: the second supplied
+  32-view A800 gate still reached
+  `state_initialization.riemannian_metric` with all 1,008 cotangent entries
+  non-finite (`maximum_finite_abs=5.650222e-08`). The run completed VGGT,
+  TRELLIS, sparse transport, atlas construction, readout, and rendering and
+  did not OOM. This disproved the assumption that changing only the
+  factorization backward was sufficient.
+- Root cause class: the production map first materialized an unbounded
+  precision inverse and only then applied a covariance spectral box. Even an
+  exact inverse pullback contains two factors of `M^-1`; feasibility imposed
+  after that operation cannot bound the preceding intermediate derivative.
+- State initialization and continuous analytical readout now use the fused
+  orthogonally covariant rational map
+  `C(M)=lI+(u-l)(I+(u-l)M)^-1`. For every SPD eigenvalue `lambda`, its
+  covariance eigenvalue is
+  `l+(u-l)/(1+(u-l)lambda)`, strictly in `(l,u)`. The map is inverse-like in
+  the resolved interval, smoothly saturates at the feasibility limits, and
+  has a bounded derivative. Its well-conditioned `I+(u-l)M` solve runs in
+  FP64 and returns FP32 geometric storage.
+- The same numerical closure was applied systematically to the Phase-B
+  graph: evidence precision/log-determinant are factored once per evidence
+  particle and shared by cost and chart writing; their forward factorization
+  has an exact joint analytical pullback. Surface uncertainty calibration,
+  atlas curvature normal equations, and SH ridge equations use the shared
+  FP64 SPD primitives rather than backend LU/Cholesky backward paths.
+- `scripts/overfit_meshfleet_object.py` now executes a 112-chart rotated,
+  condition-spread CUDA forward/backward preflight before resolving or loading
+  VGGT/TRELLIS checkpoints. A patched run must print
+  `GRAFT_GS_NUMERICAL_PREFLIGHT=phase-b-rational-spd-v1:passed`; otherwise
+  training never begins.
+- Numerical tests cover the 112-chart FP32 cotangent, strict covariance
+  interval up to storage rounding, SO(3) covariance, first- and second-order
+  finite differences, joint inverse/logdet derivatives, and full analytical
+  readout. Whole-tree compilation and all 76 locally executable static,
+  environment, discovery, manifest, handoff, selection, and production-path
+  guards pass (one expected no-PyTorch loader skip). The new Torch tests and
+  one fresh 32-view A800 optimizer/asset gate remain server-pending.

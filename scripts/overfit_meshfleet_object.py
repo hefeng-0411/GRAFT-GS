@@ -29,6 +29,13 @@ from graft_gs.integration import (
     resolve_trellis_checkpoint,
     resolve_vggt_checkpoint,
 )
+from graft_gs.manifold.geometry import (
+    precision_to_bounded_covariance,
+    spd_inverse_logdet_cholesky,
+)
+
+
+NUMERICAL_CLOSURE_VERSION = "phase-b-rational-spd-v1"
 
 
 class RepeatedMapping:
@@ -38,6 +45,97 @@ class RepeatedMapping:
     def __iter__(self):
         while True:
             yield self.value
+
+
+def _validate_native_numerical_closure(device: torch.device) -> None:
+    """Fail in under a second before loading multi-gigabyte checkpoints."""
+
+    count = 112
+    precision_diagonal = torch.stack(
+        (
+            torch.logspace(-5.0, 1.0, count, device=device),
+            torch.logspace(1.0, 7.0, count, device=device),
+            torch.logspace(6.0, 12.0, count, device=device),
+        ),
+        dim=-1,
+    )
+    angle = torch.linspace(-0.8, 0.95, count, device=device)
+    cosine, sine = torch.cos(angle), torch.sin(angle)
+    zero, one = torch.zeros_like(angle), torch.ones_like(angle)
+    frame = torch.stack(
+        (
+            torch.stack((cosine, -sine, zero), dim=-1),
+            torch.stack((sine, cosine, zero), dim=-1),
+            torch.stack((zero, zero, one), dim=-1),
+        ),
+        dim=-2,
+    )
+    precision = (
+        frame
+        @ torch.diag_embed(precision_diagonal)
+        @ frame.transpose(-1, -2)
+    ).requires_grad_(True)
+    covariance = precision_to_bounded_covariance(
+        precision,
+        1.0e-6,
+        0.25,
+    )
+    covariance_cotangent = torch.linspace(
+        -6.0e-8,
+        6.0e-8,
+        count * 9,
+        device=device,
+    ).reshape(count, 3, 3)
+    precision_gradient = torch.autograd.grad(
+        covariance,
+        precision,
+        grad_outputs=covariance_cotangent,
+    )[0]
+
+    evidence_covariance = torch.diag_embed(
+        torch.stack(
+            (
+                torch.logspace(-6.0, -3.0, count, device=device),
+                torch.logspace(-4.0, -1.0, count, device=device),
+                torch.logspace(-2.0, 0.0, count, device=device),
+            ),
+            dim=-1,
+        )
+    ).requires_grad_(True)
+    evidence_precision, evidence_logdet = spd_inverse_logdet_cholesky(
+        evidence_covariance.to(dtype=torch.float64)
+    )
+    evidence_objective = (
+        1.0e-12 * evidence_precision.square().mean()
+        + 1.0e-6 * evidence_logdet.square().mean()
+    )
+    evidence_gradient = torch.autograd.grad(
+        evidence_objective,
+        evidence_covariance,
+    )[0]
+    values = (
+        covariance,
+        precision_gradient,
+        evidence_precision,
+        evidence_logdet,
+        evidence_gradient,
+    )
+    if not all(bool(torch.all(torch.isfinite(value))) for value in values):
+        raise FloatingPointError(
+            f"{NUMERICAL_CLOSURE_VERSION} failed before checkpoint loading"
+        )
+    eigenvalue = torch.linalg.eigvalsh(covariance.detach())
+    if bool(torch.any(eigenvalue < 1.0e-6 - 1.0e-8)) or bool(
+        torch.any(eigenvalue > 0.25 + 1.0e-6)
+    ):
+        raise FloatingPointError(
+            f"{NUMERICAL_CLOSURE_VERSION} violated covariance bounds"
+        )
+    if int(os.environ.get("RANK", "0")) == 0:
+        print(
+            "GRAFT_GS_NUMERICAL_PREFLIGHT="
+            f"{NUMERICAL_CLOSURE_VERSION}:passed"
+        )
 
 
 def main() -> None:
@@ -74,6 +172,7 @@ def main() -> None:
     if args.steps < 1 or args.evaluation_views < 2:
         raise ValueError("--steps must be positive and --evaluation-views at least two")
     device = bind_local_cuda_device(require_cuda=True)
+    _validate_native_numerical_closure(device)
     args.vggt_checkpoint = resolve_vggt_checkpoint(args.vggt_checkpoint)
 
     model_config, training_config, distributed_config, dataset_config = (

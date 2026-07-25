@@ -525,6 +525,9 @@ class PersistentOctreeAtlas(nn.Module):
     ) -> Tensor:
         """Weighted quadratic Monge-patch fit ``z=.5[x y]K[x y]^T``."""
 
+        # Local import avoids the atlas <-> topology/manifold module cycle.
+        from ..manifold.geometry import spd_inverse_cholesky
+
         groups = means.shape[0]
         result = positions.new_zeros((groups, 2, 2))
         eye3 = torch.eye(3, dtype=positions.dtype, device=positions.device)
@@ -543,7 +546,13 @@ class PersistentOctreeAtlas(nn.Module):
             weight = mass[mask].clamp_min(0)[:, None]
             lhs = design.transpose(0, 1) @ (weight * design)
             rhs = design.transpose(0, 1) @ (weight * z[:, None])
-            coeff = torch.linalg.solve(lhs + self.config.curvature_ridge * eye3, rhs).flatten()
+            normal_matrix = lhs + self.config.curvature_ridge * eye3
+            coeff = (
+                spd_inverse_cholesky(
+                    normal_matrix.to(dtype=torch.float64)
+                )
+                @ rhs.to(dtype=torch.float64)
+            ).to(dtype=positions.dtype).flatten()
             result[group] = torch.stack((coeff[[0, 1]], coeff[[1, 2]]))
         return result
 

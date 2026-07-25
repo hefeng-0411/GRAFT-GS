@@ -43,6 +43,10 @@ model:
   frame_relative_eigengap: 1.0e-4
   readout_metric_epsilon: 1.0e-10
   readout_metric_relative_eigengap: 1.0e-4
+  # Smooth metric-to-covariance feasibility interval. The rational map is
+  # inverse-like in its resolved interior and has bounded FP64 pullbacks.
+  minimum_evidence_variance: 1.0e-6
+  maximum_evidence_variance: 0.25
   encoder_layers: 4
   attention_heads: 4
   flow_layers: 8

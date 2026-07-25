@@ -21,6 +21,7 @@ from ..manifold.geometry import (
     product_metric_squared,
     retract,
     so3_log,
+    spd_inverse_logdet_cholesky,
     spd_parallel_transport,
 )
 from .supervision import derive_feasible_surface_target
@@ -1069,12 +1070,21 @@ def evidence_surface_calibration(
     eye = torch.eye(3, dtype=covariance.dtype, device=covariance.device)
     observation_covariance = 0.5 * (covariance + covariance.transpose(-1, -2))
     observation_covariance = observation_covariance + quantization_variance * eye
-    cholesky = torch.linalg.cholesky(observation_covariance)
-    whitened = torch.cholesky_solve(residual[..., None], cholesky)[..., 0]
-    mahalanobis = torch.sum(residual * whitened, dim=-1)
-    log_determinant = 2.0 * torch.log(
-        cholesky.diagonal(dim1=-2, dim2=-1)
-    ).sum(-1)
+    observation_precision, log_determinant = spd_inverse_logdet_cholesky(
+        observation_covariance.to(dtype=torch.float64)
+    )
+    observation_precision = observation_precision.to(
+        dtype=observation_covariance.dtype
+    )
+    log_determinant = log_determinant.to(
+        dtype=observation_covariance.dtype
+    )
+    mahalanobis = torch.einsum(
+        "ni,nij,nj->n",
+        residual,
+        observation_precision,
+        residual,
+    )
     nll = 0.5 * (mahalanobis + log_determinant + 3.0 * log(2.0 * pi))
     half_diagonal = positions.new_tensor(0.5 * (3.0**0.5) * cell_size)
     inlier_probability = torch.exp(

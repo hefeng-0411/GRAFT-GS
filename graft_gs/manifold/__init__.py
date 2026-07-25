@@ -4,8 +4,10 @@ from .geometry import (
     ManifoldState,
     ManifoldTangent,
     geodesic_interpolate,
+    precision_to_bounded_covariance,
     product_metric_squared,
     spd_inverse_cholesky,
+    spd_inverse_logdet_cholesky,
     spd_inverse_quadratic_trace,
     spectral_box_spd,
 )
@@ -23,8 +25,10 @@ __all__ = [
     "RiemannianVectorField",
     "SafeHeunIntegrator",
     "geodesic_interpolate",
+    "precision_to_bounded_covariance",
     "product_metric_squared",
     "spd_inverse_cholesky",
+    "spd_inverse_logdet_cholesky",
     "spd_inverse_quadratic_trace",
     "spectral_box_spd",
 ]

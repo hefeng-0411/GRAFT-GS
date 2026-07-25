@@ -336,3 +336,14 @@ checkpoints, data, or a compiled server dependency.
   pullback is implemented and locally syntax/static-validated, but its five
   Torch numerical tests and second 32-view production attempt are external
   pending work.
+## Immediate A800 numerical closure gate
+
+- Run the focused bounded-SPD/joint inverse-logdet/readout suite in
+  `docs/A800_VALIDATION_PROTOCOL.md`.
+- Then run exactly one 32-view, one-step Phase-B gate. It must print
+  `GRAFT_GS_NUMERICAL_PREFLIGHT=phase-b-rational-spd-v1:passed` before loading
+  external checkpoints and must complete the optimizer step, checkpoint, PLY,
+  and GLB path with finite diagnostics.
+- This remains externally blocked by the remote Torch 2.4/CUDA 11.8 A800
+  runtime. Local syntax/static success is not counted as numerical or training
+  validation.

@@ -74,7 +74,9 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("solve_in_float64", mapping)
         self.assertIn("row_log_mass = _segment_logsumexp", mapping)
         self.assertIn("storage_underflow_edges", mapping)
-        self.assertIn("torch.linalg.solve_triangular", mapping)
+        self.assertIn("spd_inverse_logdet_cholesky", mapping)
+        self.assertNotIn("torch.cholesky_inverse", mapping)
+        self.assertNotIn("torch.linalg.slogdet(covariance)", mapping)
         self.assertNotIn("precision = torch.linalg.inv(covariance)", mapping)
         tree = ast.parse(mapping)
         graph_builder = next(
@@ -431,6 +433,7 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         readout = source("graft_gs/readout/assets.py")
         pipeline = source("graft_gs/integration/pipeline.py")
         trainer = source("graft_gs/engine/trainer.py")
+        overfit = source("scripts/overfit_meshfleet_object.py")
         self.assertNotIn("torch.full_like(unique_codes, config.chart_radius_scale * side", atlas)
         self.assertIn("torch.ones_like(unique_codes, dtype=positions.dtype) * side", atlas)
         self.assertIn("relative_eigengap * spectral_scale", atlas)
@@ -441,7 +444,15 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("tangent_factor.square()", readout)
         self.assertNotIn("torch.linalg.eigh(first_form)", readout)
         self.assertNotIn("torch.linalg.inv(continuous_metric)", readout)
-        self.assertIn("spd_inverse_quadratic_trace(continuous_metric, normal)", readout)
+        self.assertNotIn(
+            "spd_inverse_quadratic_trace(continuous_metric, normal)",
+            readout,
+        )
+        self.assertIn(
+            "precision_to_bounded_covariance(",
+            readout,
+        )
+        self.assertIn('"analytical_readout.evidence_covariance"', readout)
         self.assertIn('"analytical_readout.continuous_metric"', readout)
         geometry = source("graft_gs/manifold/geometry.py")
         self.assertIn("class _SPDInverseCholesky", geometry)
@@ -450,9 +461,23 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
             geometry,
         )
         self.assertIn("class _SPDInverseQuadraticTrace", geometry)
-        self.assertIn("spd_inverse_cholesky(metric)", pipeline)
+        self.assertIn("def precision_to_bounded_covariance", geometry)
+        self.assertIn(
+            "precision_to_bounded_covariance(metric, 1.0e-6, 0.25)",
+            pipeline,
+        )
         self.assertIn('"state_initialization.riemannian_metric"', pipeline)
-        self.assertIn("spectral_box_spd(covariance_raw", pipeline)
+        self.assertIn('"state_initialization.bounded_covariance"', pipeline)
+        self.assertNotIn("spectral_box_spd(covariance_raw", pipeline)
+        self.assertIn(
+            'NUMERICAL_CLOSURE_VERSION = "phase-b-rational-spd-v1"',
+            overfit,
+        )
+        self.assertIn("_validate_native_numerical_closure(device)", overfit)
+        self.assertLess(
+            overfit.index("_validate_native_numerical_closure(device)"),
+            overfit.index("VGGTAdapter.from_pretrained("),
+        )
         self.assertIn("def _clip_grad_norm_high_precision", trainer)
         self.assertIn("non-finite training tensors before", trainer)
         self.assertNotIn("torch.nn.utils.clip_grad_norm_", trainer)

@@ -119,8 +119,10 @@ def spectral_box_spd(matrix: Tensor, lower: float, upper: float) -> Tensor:
     )
 
 
-def _spd_inverse_cholesky_value(matrix: Tensor) -> Tensor:
-    """Forward-only scale-normalized SPD inverse implementation."""
+def _spd_inverse_logdet_cholesky_value(
+    matrix: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Forward-only scale-normalized SPD inverse and log-determinant."""
 
     symmetric = 0.5 * (matrix + matrix.transpose(-1, -2))
     dimension = symmetric.shape[-1]
@@ -144,7 +146,21 @@ def _spd_inverse_cholesky_value(matrix: Tensor) -> Tensor:
     inverse = (
         inverse_factor.transpose(-1, -2) @ inverse_factor
     ) / scale[..., None, None]
-    return 0.5 * (inverse + inverse.transpose(-1, -2))
+    inverse = 0.5 * (inverse + inverse.transpose(-1, -2))
+    log_determinant = (
+        2.0
+        * torch.log(
+            factor.diagonal(dim1=-2, dim2=-1)
+        ).sum(-1)
+        + dimension * torch.log(scale)
+    )
+    return inverse, log_determinant
+
+
+def _spd_inverse_cholesky_value(matrix: Tensor) -> Tensor:
+    """Forward-only scale-normalized SPD inverse implementation."""
+
+    return _spd_inverse_logdet_cholesky_value(matrix)[0]
 
 
 class _SPDInverseCholesky(torch.autograd.Function):
@@ -188,6 +204,44 @@ class _SPDInverseCholesky(torch.autograd.Function):
         )
 
 
+class _SPDInverseLogdetCholesky(torch.autograd.Function):
+    """Joint SPD inverse/logdet with their exact matrix pullback."""
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        matrix: Tensor,
+    ) -> tuple[Tensor, Tensor]:
+        inverse, log_determinant = _spd_inverse_logdet_cholesky_value(
+            matrix
+        )
+        ctx.save_for_backward(inverse)
+        return inverse, log_determinant
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx,
+        inverse_gradient: Optional[Tensor],
+        logdet_gradient: Optional[Tensor],
+    ) -> tuple[Tensor]:
+        (inverse,) = ctx.saved_tensors
+        if inverse_gradient is None:
+            inverse_gradient = torch.zeros_like(inverse)
+        if logdet_gradient is None:
+            logdet_gradient = inverse.new_zeros(inverse.shape[:-2])
+        inverse_gradient = 0.5 * (
+            inverse_gradient + inverse_gradient.transpose(-1, -2)
+        )
+        matrix_gradient = (
+            -inverse @ inverse_gradient @ inverse
+            + logdet_gradient[..., None, None] * inverse
+        )
+        return (
+            0.5
+            * (matrix_gradient + matrix_gradient.transpose(-1, -2)),
+        )
+
+
 def spd_inverse_cholesky(matrix: Tensor) -> Tensor:
     r"""Invert an SPD field through a scale-normalized Cholesky factor.
 
@@ -206,6 +260,16 @@ def spd_inverse_cholesky(matrix: Tensor) -> Tensor:
     if matrix.ndim < 2 or matrix.shape[-1] != matrix.shape[-2]:
         raise ValueError("SPD inverse requires square matrices")
     return _SPDInverseCholesky.apply(matrix)
+
+
+def spd_inverse_logdet_cholesky(
+    matrix: Tensor,
+) -> tuple[Tensor, Tensor]:
+    """Return an SPD inverse and log-determinant with exact pullbacks."""
+
+    if matrix.ndim < 2 or matrix.shape[-1] != matrix.shape[-2]:
+        raise ValueError("SPD inverse/logdet requires square matrices")
+    return _SPDInverseLogdetCholesky.apply(matrix)
 
 
 class _SPDInverseQuadraticTrace(torch.autograd.Function):
@@ -293,6 +357,64 @@ def spd_inverse_quadratic_trace(
         vector,
     )
     return quadratic, inverse_trace
+
+
+def precision_to_bounded_covariance(
+    precision: Tensor,
+    lower: float,
+    upper: float,
+) -> Tensor:
+    r"""Map an SPD precision to a strictly bounded SPD covariance.
+
+    The rational spectral map
+
+    ``C(M) = lower*I + span*(I + span*M)^-1``,
+    ``span = upper-lower``,
+
+    sends every precision eigenvalue ``lambda>0`` to
+
+    ``lower + span/(1 + span*lambda) in (lower, upper)``.
+
+    It agrees asymptotically with ``M^-1`` whenever the inverse is inside the
+    admissible covariance range, saturates smoothly at both feasibility
+    boundaries, commutes with orthogonal frame changes, and has a bounded
+    Fréchet derivative.  This fused map avoids forming an unbounded inverse and
+    subsequently hoping a spectral box cancels its cotangent.
+
+    The tiny per-chart solve is evaluated in FP64 even for FP32 geometric
+    state.  Returned storage follows the input dtype; reverse mode passes
+    through the exact analytical inverse pullback above before casting back.
+    """
+
+    if precision.ndim < 2 or precision.shape[-1] != precision.shape[-2]:
+        raise ValueError("bounded covariance requires square precision matrices")
+    if not 0.0 < lower < upper:
+        raise ValueError("covariance bounds must satisfy 0 < lower < upper")
+    storage_dtype = precision.dtype
+    solve_dtype = (
+        torch.float64
+        if storage_dtype in {torch.float16, torch.bfloat16, torch.float32}
+        else storage_dtype
+    )
+    working = 0.5 * (
+        precision.to(dtype=solve_dtype)
+        + precision.transpose(-1, -2).to(dtype=solve_dtype)
+    )
+    dimension = working.shape[-1]
+    identity = torch.eye(
+        dimension,
+        dtype=working.dtype,
+        device=working.device,
+    )
+    span = working.new_tensor(upper - lower)
+    response = spd_inverse_cholesky(
+        identity + span * working
+    )
+    covariance = working.new_tensor(lower) * identity + span * response
+    covariance = 0.5 * (
+        covariance + covariance.transpose(-1, -2)
+    )
+    return covariance.to(dtype=storage_dtype)
 
 
 def spd_geodesic(start: Tensor, end: Tensor, time: Tensor | float) -> Tensor:
@@ -489,11 +611,13 @@ __all__ = [
     "geodesic_interpolate",
     "hat",
     "product_metric_squared",
+    "precision_to_bounded_covariance",
     "retract",
     "so3_exp",
     "so3_log",
     "spd_geodesic",
     "spd_inverse_cholesky",
+    "spd_inverse_logdet_cholesky",
     "spd_inverse_quadratic_trace",
     "spd_log",
     "spd_parallel_transport",

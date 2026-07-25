@@ -674,3 +674,31 @@ sweep's intentional OOM classifier was excluded from that contamination scan.
   112-chart FP32 cotangent reproduction and FP64 gradcheck, followed by one
   fresh 32-view optimizer/asset gate. No successful 32-view optimizer step is
   claimed.
+
+### Supplied analytical-pullback rerun and bounded-map repair
+
+- Executed remotely by the user: the analytical inverse-pullback revision
+  again failed the 32-view Phase-B backward at
+  `state_initialization.riemannian_metric`, with 1,008 non-finite entries and
+  maximum finite absolute cotangent `5.650222e-08`. It was not an OOM and no
+  external-adapter forward failure occurred.
+- Consequence: exact differentiation of an unconstrained inverse is
+  mathematically correct but insufficiently conditioned before a later
+  covariance box. The new production path fuses inversion and feasibility in
+  a bounded rational SPD map and removes the unbounded intermediate from both
+  state initialization and analytical readout.
+- Locally executed after the repair with bundled Python 3.12.13:
+  whole-tree `compileall` passed; `tests.test_scientific_trace_static` passed
+  `31/31`; the complete PyTorch-independent environment/discovery/manifest/
+  handoff/selection/production collection passed `76/76` in `6.319 s`, with
+  one expected no-PyTorch tensor-loader skip.
+- An independent NumPy evaluation of the 112-chart condition-spread field
+  measured covariance eigenvalues in
+  `[1.000001e-6, 0.2499993750065624]`, analytical derivative operator bound
+  `0.062499500001`, and SO(3)-conjugation maximum absolute discrepancy
+  `5.03e-12`. This validates the formula independently of the production Torch
+  implementation, but is not a Torch backward or CUDA result.
+- Server-pending: the focused rational-SPD/joint inverse-logdet/readout suite
+  and exactly one 32-view Phase-B optimizer/asset gate. No successful
+  post-rational-map optimizer step, checkpoint, render, PLY, GLB, throughput,
+  memory, or loss result is claimed.

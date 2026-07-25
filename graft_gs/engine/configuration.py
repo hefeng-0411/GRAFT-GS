@@ -138,6 +138,18 @@ def load_server_config(
                     base.readout.metric_relative_eigengap,
                 )
             ),
+            minimum_evidence_variance=float(
+                model.get(
+                    "minimum_evidence_variance",
+                    base.readout.minimum_evidence_variance,
+                )
+            ),
+            maximum_evidence_variance=float(
+                model.get(
+                    "maximum_evidence_variance",
+                    base.readout.maximum_evidence_variance,
+                )
+            ),
         ),
         attention=replace(
             base.attention,

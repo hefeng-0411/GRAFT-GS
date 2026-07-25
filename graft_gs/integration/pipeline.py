@@ -22,8 +22,7 @@ from ..manifold.barrier import BarrierConfig, BarrierProjector, FeasibilityRepor
 from ..manifold.flow import FlowConfig, RiemannianVectorField, SafeHeunIntegrator
 from ..manifold.geometry import (
     ManifoldState,
-    spd_inverse_cholesky,
-    spectral_box_spd,
+    precision_to_bounded_covariance,
 )
 from ..mapping.manifold_mapping import (
     EvidenceParticles,
@@ -850,14 +849,13 @@ class GraftGS(nn.Module):
             mapping.riemannian_metric[row],
             "state_initialization.riemannian_metric",
         )
-        # The chart writer guarantees SPD. Preserve that domain explicitly:
-        # an LU inverse ignores symmetry and its CUDA backward was the first
-        # failing 32-view production boundary.
-        covariance_raw = finite_gradient_identity(
-            spd_inverse_cholesky(metric),
-            "state_initialization.metric_inverse",
+        # Fuse precision inversion and the admissible covariance interval.
+        # Forming M^-1 before spectral boxing exposes an unbounded intermediate
+        # cotangent that overflowed on the real 112-chart FP32 scene.
+        covariance = finite_gradient_identity(
+            precision_to_bounded_covariance(metric, 1.0e-6, 0.25),
+            "state_initialization.bounded_covariance",
         )
-        covariance = spectral_box_spd(covariance_raw, 1.0e-6, 0.25)
         if occupancy_probability is None:
             occupancy = -torch.expm1(
                 -mapping.transported_mass[row]

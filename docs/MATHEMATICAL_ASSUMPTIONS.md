@@ -474,3 +474,18 @@
   backward. This cannot make a legitimately unbounded mathematical gradient
   finite; positive metric eigenvalues and the 32-view production backward
   remain executable validation requirements.
+## Bounded chart precision conversion
+
+- The transported chart metric supplied to
+  `precision_to_bounded_covariance` is symmetric positive definite. The chart
+  writer enforces a positive isotropic metric term; invalid upstream evidence
+  covariance remains a fail-closed invariant violation.
+- The configured limits satisfy `0 < lower < upper`. The returned eigenvalues
+  are analytically in `(lower, upper)`; FP32 storage checks permit only the
+  explicitly tested one-rounding envelope.
+- SO(3) covariance follows from rational functional calculus:
+  `C(RMR^T)=RC(M)R^T`. This is a hard algebraic property up to floating-point
+  roundoff, not a learned equivariance claim.
+- The map is an inverse approximation inside the admissible range, not an
+  equality to `M^-1` near saturation. Saturation is the intentional feasibility
+  model and is recorded as such in checkpoints/configuration.

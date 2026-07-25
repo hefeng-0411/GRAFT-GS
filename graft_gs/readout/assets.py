@@ -15,7 +15,11 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ..geometry.atlas import PersistentOctreeAtlas
-from ..manifold.geometry import ManifoldState, spd_inverse_quadratic_trace
+from ..manifold.geometry import (
+    ManifoldState,
+    precision_to_bounded_covariance,
+    spd_inverse_cholesky,
+)
 from ..mapping.manifold_mapping import MappingResult, finite_gradient_identity
 
 
@@ -36,6 +40,8 @@ class AnalyticalReadoutConfig:
     opacity_epsilon: float = 1.0e-8
     metric_epsilon: float = 1.0e-10
     metric_relative_eigengap: float = 1.0e-4
+    minimum_evidence_variance: float = 1.0e-6
+    maximum_evidence_variance: float = 0.25
     opacity_tile_size: int = 16
     maximum_tile_opacity: float = 0.995
 
@@ -60,6 +66,14 @@ class AnalyticalReadoutConfig:
             raise ValueError("analytical readout scales and regularizers must be positive")
         if not 0.0 < self.metric_relative_eigengap < 1.0:
             raise ValueError("metric_relative_eigengap must lie in (0,1)")
+        if not (
+            0.0
+            < self.minimum_evidence_variance
+            < self.maximum_evidence_variance
+        ):
+            raise ValueError(
+                "evidence-variance bounds must satisfy 0 < minimum < maximum"
+            )
 
 
 @dataclass
@@ -283,12 +297,24 @@ class AnalyticalSurfaceReadout(nn.Module):
                 continuous_metric,
                 "analytical_readout.continuous_metric",
             )
-            # Gaussian thickness needs only n^T M^-1 n and tr(M^-1).
-            # Evaluate those invariant contractions by SPD triangular solves;
-            # a full pivoted inverse is both unnecessary and less stable.
-            evidence_normal_variance, evidence_total_variance = (
-                spd_inverse_quadratic_trace(continuous_metric, normal)
+            evidence_covariance = finite_gradient_identity(
+                precision_to_bounded_covariance(
+                    continuous_metric,
+                    cfg.minimum_evidence_variance,
+                    cfg.maximum_evidence_variance,
+                ),
+                "analytical_readout.evidence_covariance",
             )
+            evidence_normal_variance = torch.einsum(
+                "ni,nij,nj->n",
+                normal,
+                evidence_covariance,
+                normal,
+            )
+            evidence_total_variance = evidence_covariance.diagonal(
+                dim1=-2,
+                dim2=-1,
+            ).sum(-1)
             state_covariance = state.covariance[local_chart]
             state_normal_variance = torch.einsum(
                 "ni,ij,nj->n",
@@ -445,8 +471,14 @@ class AnalyticalSurfaceReadout(nn.Module):
         gram = gram + cfg.color_ridge * eye
         rhs[:, 0] = rhs[:, 0] + cfg.color_prior_weight * (prior_color - 0.5) / 0.28209479177387814
         gram[:, 0, 0] = gram[:, 0, 0] + cfg.color_prior_weight
-        cholesky = torch.linalg.cholesky(gram)
-        return torch.cholesky_solve(rhs, cholesky)
+        # Ridge makes the normal matrix strictly SPD. Solve this small
+        # analytical system in FP64 with the explicit inverse-map pullback,
+        # avoiding another backend factorization backward in Phase B.
+        gram_inverse = spd_inverse_cholesky(
+            gram.to(dtype=torch.float64)
+        )
+        coefficients = gram_inverse @ rhs.to(dtype=torch.float64)
+        return coefficients.to(dtype=means.dtype)
 
     @staticmethod
     def _mesh_from_state(state: ManifoldState) -> MeshAsset:
