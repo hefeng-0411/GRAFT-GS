@@ -489,3 +489,16 @@
 - The map is an inverse approximation inside the admissible range, not an
   equality to `M^-1` near saturation. Saturation is the intentional feasibility
   model and is recorded as such in checkpoints/configuration.
+
+## Sparse feasibility dual norms
+
+- Sparse constraint rows have six local vertex slots. Unused slots are exact
+  zero covectors and carry no constraint derivative even when their integer
+  support index aliases vertex zero.
+- The spectral step bound uses
+  `sqrt(g^T G^-1 g + delta^2)` with a detached relative floor. This is an
+  upper bound on the exact dual norm, so it preserves the projected-gradient
+  step-size certificate. It is not used as a physical constraint margin.
+- The floor is proportional to the maximum squared dual norm in the current
+  sparse system and machine epsilon. It changes the bound only at storage-scale
+  zero while selecting the finite zero metric derivative for padded covectors.

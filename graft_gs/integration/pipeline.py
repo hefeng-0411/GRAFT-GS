@@ -639,6 +639,15 @@ class GraftGS(nn.Module):
             report = projector.report(state)
             if not report.feasible:
                 try:
+                    # Restoration is the only Phase-B consumer of the state's
+                    # position metric. Keep a dedicated exact-identity
+                    # cotangent boundary so any future QP regression is
+                    # attributed before it contaminates the shared mapping
+                    # metric.
+                    state.evidence_metric = finite_gradient_identity(
+                        state.evidence_metric,
+                        "feasibility_restoration.position_metric",
+                    )
                     state, restoration_report = projector.restore_feasible_embedding(state)
                     projector = BarrierProjector(state, self.config.barrier)
                     report = projector.report(state)

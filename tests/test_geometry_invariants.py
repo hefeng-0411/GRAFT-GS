@@ -897,7 +897,10 @@ class TopologyAndManifoldTest(unittest.TestCase):
             opacity_logit=torch.zeros(6, 1, dtype=dtype),
             appearance=torch.zeros(6, 48, dtype=dtype),
             latent=torch.zeros(6, 128, dtype=dtype),
-            evidence_metric=torch.eye(3, dtype=dtype).expand(6, -1, -1).clone(),
+            evidence_metric=torch.eye(3, dtype=dtype)
+            .expand(6, -1, -1)
+            .clone()
+            .requires_grad_(True),
             complex=complex_,
         )
         config = BarrierConfig(
@@ -992,6 +995,55 @@ class TopologyAndManifoldTest(unittest.TestCase):
         restored.position.square().sum().backward()
         self.assertIsNotNone(position.grad)
         self.assertTrue(torch.all(torch.isfinite(position.grad)))
+        self.assertIsNotNone(state.evidence_metric.grad)
+        self.assertTrue(torch.all(torch.isfinite(state.evidence_metric.grad)))
+
+    def test_sparse_gram_bound_zero_padding_has_finite_metric_gradient(self) -> None:
+        dtype = torch.float64
+        metric_inverse = (
+            0.25
+            * torch.eye(3, dtype=dtype)
+            .expand(8, -1, -1)
+            .clone()
+            .requires_grad_(True)
+        )
+        support = torch.tensor(
+            [
+                [0, 1, 2, 0, 0, 0],
+                [3, 4, 0, 0, 0, 0],
+                [2, 5, 7, 1, 6, 0],
+            ],
+            dtype=torch.int64,
+        )
+        gradient = torch.zeros(3, 6, 3, dtype=dtype)
+        gradient[0, :3] = torch.tensor(
+            [[1.0, -0.2, 0.1], [-0.4, 0.8, 0.3], [0.2, -0.6, 0.5]],
+            dtype=dtype,
+        )
+        gradient[1, :2] = torch.tensor(
+            [[0.3, -0.7, 0.2], [-0.3, 0.7, -0.2]],
+            dtype=dtype,
+        )
+        gradient[2] = torch.tensor(
+            [
+                [0.2, 0.1, -0.4],
+                [0.1, -0.5, 0.3],
+                [-0.3, 0.2, 0.4],
+                [0.4, -0.1, -0.2],
+                [-0.2, 0.3, 0.1],
+                [-0.2, 0.0, -0.2],
+            ],
+            dtype=dtype,
+        )
+        bound = BarrierProjector._sparse_gram_spectral_bound(
+            gradient,
+            support,
+            metric_inverse,
+            1.0e-8,
+        )
+        metric_gradient = torch.autograd.grad(bound, metric_inverse)[0]
+        self.assertTrue(torch.isfinite(bound))
+        self.assertTrue(torch.all(torch.isfinite(metric_gradient)))
 
     def test_triangle_collision_distance_detects_face_crossing(self) -> None:
         dtype = torch.float64

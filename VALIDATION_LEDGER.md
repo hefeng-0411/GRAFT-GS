@@ -702,3 +702,28 @@ sweep's intentional OOM classifier was excluded from that contamination scan.
   and exactly one 32-view Phase-B optimizer/asset gate. No successful
   post-rational-map optimizer step, checkpoint, render, PLY, GLB, throughput,
   memory, or loss result is claimed.
+
+### Supplied v1 rational-map gate and feasibility dual repair
+
+- Executed remotely by the user: the run printed
+  `GRAFT_GS_NUMERICAL_PREFLIGHT=phase-b-rational-spd-v1:passed`, proving the
+  deployed bounded-SPD forward/backward microproblem is finite. It then
+  completed TRELLIS sampling and the production forward but failed in backward
+  with all 1,008 state-position-metric cotangent entries non-finite and maximum
+  finite magnitude `5.604653e-08`. No OOM or external-model failure occurred.
+- Static production tracing found that infeasible selected strata enter
+  metric-minimal restoration. Its sparse Gram bound differentiated square
+  roots of exact zero dual norms in padded constraint slots. The regression
+  previously validated restored-position gradients but did not make the
+  evidence metric trainable.
+- Post-repair local execution: whole-tree `compileall` passed; the complete
+  PyTorch-independent collection passed `76/76` in `6.498 s` with one expected
+  no-PyTorch loader skip. Static guards require the conservative norm floor,
+  the v2 preflight, and the restoration-specific cotangent boundary.
+- An independent NumPy sparse-Gram calculation retained a valid infinity-norm
+  upper bound (`7.4280924 >= 6.0402289`) with a zero-padding norm floor of only
+  `2.19e-8`. This checks the safety inequality independently of the Torch
+  implementation; it is not a CUDA backward result.
+- Server-pending: zero-padding metric-gradient and full restoration
+  metric-gradient tests, then one fresh 32-view gate. No v2 optimizer-step or
+  asset result is claimed.

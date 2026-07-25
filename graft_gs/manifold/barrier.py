@@ -468,8 +468,28 @@ class BarrierProjector:
         weighted_local = torch.einsum(
             "jkab,jkb->jka", metric_inverse[support], gradient
         )
+        local_norm_squared = torch.sum(
+            gradient * weighted_local,
+            dim=-1,
+        ).clamp_min(0.0)
+        # Area, orientation, and vertex-pair rows are represented in the same
+        # fixed six-vertex sparse format as triangle-pair rows. Their unused
+        # slots therefore carry an exact zero covector.  Differentiating
+        # sqrt(q) at q=0 through those padded slots produces the indeterminate
+        # product 0 * infinity in Torch 2.4 and contaminated every chart-metric
+        # cotangent in the real 112-chart Phase-B restoration.
+        #
+        # sqrt(q + delta^2) is a conservative dual-norm upper bound, so the
+        # resulting projected-gradient step remains safe (only potentially
+        # smaller).  A detached relative floor keeps the mathematical units,
+        # bounds the derivative, and does not train through a batch maximum.
+        finfo = torch.finfo(local_norm_squared.dtype)
+        reference_squared = local_norm_squared.detach().amax().clamp_min(
+            finfo.tiny / finfo.eps
+        )
+        norm_floor_squared = finfo.eps * reference_squared
         local_norm = torch.sqrt(
-            torch.sum(gradient * weighted_local, dim=-1).clamp_min(0.0)
+            local_norm_squared + norm_floor_squared
         )
         incidence_norm = gradient.new_zeros(metric_inverse.shape[0])
         incidence_norm.index_add_(

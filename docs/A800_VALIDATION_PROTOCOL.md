@@ -660,8 +660,9 @@ Two subsequent 32-view runs narrowed the defect further. Replacing the backend
 factorization backward with the exact inverse pullback did not close it:
 `state_initialization.riemannian_metric` still received 1,008 non-finite
 values, most recently with maximum finite magnitude `5.650222e-08`.
-The remaining problem was therefore the unbounded inverse-before-box
-composition, not A800 memory or external checkpoint execution. Production now
+One identified instability was the unbounded inverse-before-box composition;
+neither that path nor the reported failure was A800 memory or external
+checkpoint execution. Production now
 uses a fused bounded rational precision-to-covariance map in state
 initialization and readout, plus a shared exact joint evidence
 inverse/log-determinant primitive. Validate the complete closure:
@@ -675,14 +676,23 @@ mkdir -p outputs/validation
   tests.test_geometry_invariants.TopologyAndManifoldTest.test_spd_inverse_analytical_pullback_passes_gradcheck \
   tests.test_geometry_invariants.TopologyAndManifoldTest.test_bounded_precision_covariance_closes_112_chart_backward \
   tests.test_geometry_invariants.TopologyAndManifoldTest.test_bounded_precision_covariance_is_so3_covariant \
+  tests.test_geometry_invariants.TopologyAndManifoldTest.test_sparse_gram_bound_zero_padding_has_finite_metric_gradient \
+  tests.test_geometry_invariants.TopologyAndManifoldTest.test_metric_minimal_restoration_enters_strict_feasible_set \
   tests.test_assets_and_vertical_slice.AnalyticalAssetTest.test_flat_chart_analytical_readout_backward_is_finite \
   tests.test_assets_and_vertical_slice.AnalyticalAssetTest.test_anisotropic_metric_readout_backward_is_finite \
   2>&1 | tee outputs/validation/bounded_spd_numerics.log
 ```
 
-All seven tests must pass. Then rerun only the unresolved 32-view boundary.
+All nine tests must pass. The supplied v1 rational-map gate subsequently
+proved the bounded covariance microproblem finite but exposed the remaining
+restoration branch: fixed-width sparse constraint rows contain exact
+zero-covector padding, whose literal dual-norm square root generated
+`0*infinity` in the metric backward. The two added tests cover the padding and
+the complete restoration metric gradient. Then rerun only the unresolved
+32-view boundary.
 The executable itself performs the same 112-chart CUDA stress before resolving
-or loading VGGT/TRELLIS; require its versioned pass marker:
+or loading VGGT/TRELLIS, including the padded sparse dual norm; require its
+versioned pass marker:
 
 ```bash
 set -euo pipefail
@@ -706,7 +716,7 @@ mkdir -p "$RUN_DIR"
   --output "$RUN_DIR" \
   2>&1 | tee "$RUN_DIR/run.log"
 
-grep -F "GRAFT_GS_NUMERICAL_PREFLIGHT=phase-b-rational-spd-v1:passed" \
+grep -F "GRAFT_GS_NUMERICAL_PREFLIGHT=phase-b-rational-spd-zero-dual-v2:passed" \
   "$RUN_DIR/run.log"
 test -f "$RUN_DIR/final.pt"
 test -f "$RUN_DIR/meshfleet_overfit.ply"

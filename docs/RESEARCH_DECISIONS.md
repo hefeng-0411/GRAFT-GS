@@ -95,6 +95,31 @@ This is a deliberate deviation from literal inverse-plus-projection, because
 it strengthens the feasibility and numerical invariants without weakening
 the probabilistic interpretation.
 
+## Zero-stratum dual norm in sparse feasibility QPs
+
+Problem: a single fixed-width sparse Jacobian stores face, vertex-pair, and
+triangle-pair constraints in six local slots. Padding is an exact zero
+covector. The literal dual norm `sqrt(g^T G^-1 g)` has an infinite scalar
+derivative at that representation zero, and Torch's composition returns NaN
+for its mathematically zero metric derivative.
+
+Candidates considered:
+
+- variable-width row storage: exact but complicates every sparse Gram kernel
+  and does not remove zero covectors caused by geometric symmetry;
+- masking after `sqrt`: rejected because autograd may still evaluate
+  `0*infinity` in the inactive branch;
+- a custom zero-subgradient square root: finite and exact, but it would no
+  longer be an upper bound at zero under roundoff;
+- conservative relative-floor norm: selected.
+
+The selected `sqrt(q+delta^2)` uses a detached
+`delta^2=eps*max(stopgrad(max q),tiny/eps)`. It upper-bounds every exact local
+dual norm and therefore retains the Gram row-sum spectral certificate; the
+projected-gradient step may only decrease. Its zero-covector metric derivative
+is finite and exactly zero because `dq/dG^-1=g g^T=0`. Complexity and memory
+remain `O(J)` and no constraint or gradient row is removed.
+
 ## Selected end-to-end factorization
 
 ```text

@@ -355,3 +355,13 @@ pre-feasibility derivative that failed on the real 112-chart A800 graph. It is
 inverse-like away from the active bounds but intentionally differs near them;
 therefore this is documented as a strengthened feasibility realization, not
 claimed as a literal algebraic implementation of an unconstrained inverse.
+
+## Conservative regularized sparse dual-norm bound
+
+The control-barrier/restoration spectral estimate evaluates a conservative
+relative-floor continuation of local metric dual norms. Literal `sqrt(q)` is
+nondifferentiable at the exact zero covectors introduced by the fixed-width
+sparse-row representation. Adding a detached storage-relative `delta^2`
+preserves the upper-bound proof and constraint set while selecting a finite
+zero-padding derivative. No feasibility margin, primal correction, loss, or
+nonzero covector is discarded.

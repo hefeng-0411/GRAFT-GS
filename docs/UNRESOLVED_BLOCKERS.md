@@ -341,7 +341,7 @@ checkpoints, data, or a compiled server dependency.
 - Run the focused bounded-SPD/joint inverse-logdet/readout suite in
   `docs/A800_VALIDATION_PROTOCOL.md`.
 - Then run exactly one 32-view, one-step Phase-B gate. It must print
-  `GRAFT_GS_NUMERICAL_PREFLIGHT=phase-b-rational-spd-v1:passed` before loading
+  `GRAFT_GS_NUMERICAL_PREFLIGHT=phase-b-rational-spd-zero-dual-v2:passed` before loading
   external checkpoints and must complete the optimizer step, checkpoint, PLY,
   and GLB path with finite diagnostics.
 - This remains externally blocked by the remote Torch 2.4/CUDA 11.8 A800

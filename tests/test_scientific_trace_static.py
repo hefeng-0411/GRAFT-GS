@@ -470,7 +470,13 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn('"state_initialization.bounded_covariance"', pipeline)
         self.assertNotIn("spectral_box_spd(covariance_raw", pipeline)
         self.assertIn(
-            'NUMERICAL_CLOSURE_VERSION = "phase-b-rational-spd-v1"',
+            'NUMERICAL_CLOSURE_VERSION = "phase-b-rational-spd-zero-dual-v2"',
+            overfit,
+        )
+        barrier = source("graft_gs/manifold/barrier.py")
+        self.assertIn("norm_floor_squared = finfo.eps * reference_squared", barrier)
+        self.assertIn(
+            "BarrierProjector._sparse_gram_spectral_bound(",
             overfit,
         )
         self.assertIn("_validate_native_numerical_closure(device)", overfit)
@@ -662,7 +668,9 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("def restore_feasible_embedding", barrier)
         self.assertIn("metric-minimal hard-constraint steps", barrier)
         self.assertIn("dual_check_interval", barrier)
+        self.assertIn("norm_floor_squared = finfo.eps * reference_squared", barrier)
         self.assertIn("diagnostic_minima = torch.stack", barrier)
+        self.assertIn('"feasibility_restoration.position_metric"', pipeline)
         self.assertIn("projector.restore_feasible_embedding(state)", pipeline)
         self.assertIn('barrier = data.get("barrier", {})', configuration)
         self.assertIn("restoration_relative_margin", config)

@@ -31,11 +31,13 @@ from graft_gs.integration import (
 )
 from graft_gs.manifold.geometry import (
     precision_to_bounded_covariance,
+    spd_inverse_cholesky,
     spd_inverse_logdet_cholesky,
 )
+from graft_gs.manifold.barrier import BarrierProjector
 
 
-NUMERICAL_CLOSURE_VERSION = "phase-b-rational-spd-v1"
+NUMERICAL_CLOSURE_VERSION = "phase-b-rational-spd-zero-dual-v2"
 
 
 class RepeatedMapping:
@@ -113,12 +115,68 @@ def _validate_native_numerical_closure(device: torch.device) -> None:
         evidence_objective,
         evidence_covariance,
     )[0]
+
+    # Feasibility QPs store all local constraints in six-vertex rows. Area,
+    # orientation, and vertex-pair rows contain exact zero-gradient padding.
+    # Exercise the metric derivative of the conservative spectral bound here:
+    # this is the branch that appears only when a selected topology requires
+    # embedding restoration and was absent from the v1 inverse-only preflight.
+    qp_metric = torch.diag_embed(
+        precision_diagonal
+    ).detach().requires_grad_(True)
+    qp_metric_inverse = spd_inverse_cholesky(
+        qp_metric.to(dtype=torch.float64)
+    )
+    qp_support = torch.tensor(
+        [
+            [0, 1, 2, 0, 0, 0],
+            [3, 4, 0, 0, 0, 0],
+            [2, 5, 7, 1, 6, 0],
+        ],
+        dtype=torch.int64,
+        device=device,
+    )
+    qp_gradient = torch.zeros(
+        3,
+        6,
+        3,
+        dtype=torch.float64,
+        device=device,
+    )
+    qp_gradient[0, :3] = qp_gradient.new_tensor(
+        [[1.0, -0.2, 0.1], [-0.4, 0.8, 0.3], [0.2, -0.6, 0.5]]
+    )
+    qp_gradient[1, :2] = qp_gradient.new_tensor(
+        [[0.3, -0.7, 0.2], [-0.3, 0.7, -0.2]]
+    )
+    qp_gradient[2] = qp_gradient.new_tensor(
+        [
+            [0.2, 0.1, -0.4],
+            [0.1, -0.5, 0.3],
+            [-0.3, 0.2, 0.4],
+            [0.4, -0.1, -0.2],
+            [-0.2, 0.3, 0.1],
+            [-0.2, 0.0, -0.2],
+        ]
+    )
+    qp_spectral_bound = BarrierProjector._sparse_gram_spectral_bound(
+        qp_gradient,
+        qp_support,
+        qp_metric_inverse,
+        1.0e-8,
+    )
+    qp_metric_gradient = torch.autograd.grad(
+        qp_spectral_bound,
+        qp_metric,
+    )[0]
     values = (
         covariance,
         precision_gradient,
         evidence_precision,
         evidence_logdet,
         evidence_gradient,
+        qp_spectral_bound,
+        qp_metric_gradient,
     )
     if not all(bool(torch.all(torch.isfinite(value))) for value in values):
         raise FloatingPointError(

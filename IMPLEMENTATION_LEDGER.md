@@ -1127,7 +1127,7 @@ The full conditional validity domain is maintained in
 - `scripts/overfit_meshfleet_object.py` now executes a 112-chart rotated,
   condition-spread CUDA forward/backward preflight before resolving or loading
   VGGT/TRELLIS checkpoints. A patched run must print
-  `GRAFT_GS_NUMERICAL_PREFLIGHT=phase-b-rational-spd-v1:passed`; otherwise
+  `GRAFT_GS_NUMERICAL_PREFLIGHT=phase-b-rational-spd-zero-dual-v2:passed`; otherwise
   training never begins.
 - Numerical tests cover the 112-chart FP32 cotangent, strict covariance
   interval up to storage rounding, SO(3) covariance, first- and second-order
@@ -1136,3 +1136,38 @@ The full conditional validity domain is maintained in
   environment, discovery, manifest, handoff, selection, and production-path
   guards pass (one expected no-PyTorch loader skip). The new Torch tests and
   one fresh 32-view A800 optimizer/asset gate remain server-pending.
+
+## 2026-07-25 zero-padded feasibility dual-norm repair
+
+- Requirement `A800-FEASIBILITY-METRIC-GRADIENT-10`: the supplied post-rational
+  32-view gate printed the v1 CUDA numerical-preflight marker, completed the
+  full forward path, and then again reported all 1,008
+  `state_initialization.riemannian_metric` cotangent entries non-finite
+  (`maximum_finite_abs=5.604653e-08`). This proves the bounded
+  precision-to-covariance operator itself is healthy and localizes the
+  surviving branch to the selected-stratum feasibility restoration, the only
+  other Phase-B consumer of `ManifoldState.evidence_metric`.
+- Root cause: sparse barrier rows share a fixed `[J,6,3]` representation.
+  Triangle rows use all six slots, while face and vertex-pair rows deliberately
+  pad unused slots with exact zero covectors. The Gram spectral bound evaluated
+  `sqrt(g^T G^-1 g)` on every slot. Torch 2.4 consequently differentiated
+  `sqrt(0)` at padding and formed the indeterminate product `0*infinity`,
+  contaminating the entire chart-metric cotangent. Existing restoration tests
+  asserted only the position gradient and could not detect it.
+- The local dual norm is now the conservative bound
+  `sqrt(q + delta^2)`, with detached, dtype-relative
+  `delta^2=eps*max(stopgrad(max q), tiny/eps)`. It remains greater than or
+  equal to the exact norm, so the spectral estimate and projected-gradient
+  safety are preserved; only the QP step can become infinitesimally smaller.
+  The derivative is finite at every padded zero without detaching or replacing
+  a training gradient.
+- The restoration regression now requires a finite evidence-metric gradient,
+  and a dedicated mixed two/three/six-vertex sparse-row test exercises zero
+  padding explicitly. The A800 preflight v2 evaluates the same metric
+  derivative before checkpoint loading, and a dedicated
+  `feasibility_restoration.position_metric` boundary attributes any remaining
+  QP failure.
+- Whole-tree compilation and all 76 locally executable static/environment/
+  dataset/manifest/selection/production guards pass (`6.498 s`, one expected
+  no-PyTorch loader skip). Torch restoration tests and one 32-view A800 gate
+  remain server-pending.
