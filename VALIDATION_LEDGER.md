@@ -631,3 +631,27 @@ sweep's intentional OOM classifier was excluded from that contamination scan.
   24-view one-step smoke and, only if it passes, one 32-view one-step smoke.
   No post-repair A800 optimizer step, throughput, memory, checkpoint, render,
   PLY, GLB, or training-quality result is claimed yet.
+
+## 2026-07-25 supplied posterior gate and SPD-native repair
+
+- Executed remotely by the user: all ten posterior/zero-stratum numerical
+  tests passed in `2.556 s`.
+- Executed remotely by the user: the 24-view Phase-B one-step gate passed and
+  produced the final/step checkpoints plus independently targeted PLY and GLB
+  artifacts. This is a real optimizer-step and asset-path pass, not a unit
+  shape test.
+- Executed remotely by the user: the 32-view gate failed in backward at
+  `chart_writer.riemannian_metric` with 1,008 non-finite values and maximum
+  finite absolute cotangent `6.424902e-08`. It did not report OOM. Because
+  `1008=112*3*3`, this localizes the remaining defect to the complete chart
+  metric field downstream of otherwise finite Gaussian boundaries.
+- Post-log local validation: bundled Python 3.12.13 whole-tree `compileall`
+  passed; `tests.test_scientific_trace_static` passed `31/31` in `0.193 s`.
+  The complete PyTorch-independent environment/discovery/manifest/handoff/
+  selection/static collection passed all `76/76` executable cases in
+  `7.687 s`, with one expected no-PyTorch loader skip when run without the
+  intentionally PyTorch-only `test_meshfleet_contract` module.
+- Server-pending: the new SPD inverse/contraction regression, flat-readout
+  retained-metric-gradient regression, anisotropic full-readout regression,
+  and one 32-view Phase-B optimizer/asset gate. No post-repair 32-view,
+  Phase-C/F, throughput, or quality pass is claimed.

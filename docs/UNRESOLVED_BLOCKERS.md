@@ -318,3 +318,16 @@ checkpoints, data, or a compiled server dependency.
   conservative training start; a new schema-v5 sweep is required before
   increasing it. Full Phase-D/F memory and numerical validation remain
   separate.
+
+## 2026-07-25 SPD metric A800 validation boundary
+
+- Resolved evidence: the ten posterior numerical tests and the real 24-view
+  Phase-B optimizer/asset gate pass on the A800.
+- External remaining gate: run the three SPD/readout regressions and only the
+  32-view one-step command in `A800_VALIDATION_PROTOCOL.md`. A pass must emit a
+  final checkpoint, PLY, GLB, finite metric gradients, and no
+  `state_initialization.*` or `analytical_readout.*` cotangent error.
+- Full Phase C/F execution is still required to validate the now-shared
+  SPD-native product-metric and barrier paths. No claim of universally zero
+  loss/error is supportable; exact finite/convergence/feasibility admission
+  remains mandatory.

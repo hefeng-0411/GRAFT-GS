@@ -5,6 +5,8 @@ from .geometry import (
     ManifoldTangent,
     geodesic_interpolate,
     product_metric_squared,
+    spd_inverse_cholesky,
+    spd_inverse_quadratic_trace,
     spectral_box_spd,
 )
 from .flow import FlowConfig, RiemannianFlowMatcher, RiemannianVectorField, SafeHeunIntegrator
@@ -22,5 +24,7 @@ __all__ = [
     "SafeHeunIntegrator",
     "geodesic_interpolate",
     "product_metric_squared",
+    "spd_inverse_cholesky",
+    "spd_inverse_quadratic_trace",
     "spectral_box_spd",
 ]

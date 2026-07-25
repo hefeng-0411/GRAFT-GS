@@ -119,6 +119,90 @@ def spectral_box_spd(matrix: Tensor, lower: float, upper: float) -> Tensor:
     )
 
 
+def spd_inverse_cholesky(matrix: Tensor) -> Tensor:
+    r"""Invert an SPD field through a scale-normalized Cholesky factor.
+
+    If ``M=s L L^T`` with a detached positive scalar scale ``s``, then
+
+    ``M^{-1}=s^{-1} L^{-T} L^{-1}``.
+
+    The detached normalization is algebraically cancelled in both the forward
+    value and its derivative, while keeping the Cholesky factor near unit
+    scale.  Triangular solves avoid the pivoted LU path used by
+    ``torch.linalg.inv`` and preserve matrix symmetry by construction.  This
+    routine deliberately does not add jitter: callers must provide an SPD
+    matrix and a failed Cholesky is a genuine invariant violation.
+    """
+
+    if matrix.ndim < 2 or matrix.shape[-1] != matrix.shape[-2]:
+        raise ValueError("SPD inverse requires square matrices")
+    symmetric = 0.5 * (matrix + matrix.transpose(-1, -2))
+    dimension = symmetric.shape[-1]
+    scale = (
+        symmetric.diagonal(dim1=-2, dim2=-1)
+        .abs()
+        .amax(dim=-1)
+        .detach()
+        .clamp_min(torch.finfo(symmetric.dtype).tiny)
+    )
+    normalized = symmetric / scale[..., None, None]
+    factor = torch.linalg.cholesky(normalized)
+    identity = torch.eye(
+        dimension, dtype=matrix.dtype, device=matrix.device
+    ).expand_as(symmetric)
+    inverse_factor = torch.linalg.solve_triangular(
+        factor,
+        identity,
+        upper=False,
+    )
+    inverse = (
+        inverse_factor.transpose(-1, -2) @ inverse_factor
+    ) / scale[..., None, None]
+    return 0.5 * (inverse + inverse.transpose(-1, -2))
+
+
+def spd_inverse_quadratic_trace(
+    matrix: Tensor,
+    vector: Tensor,
+) -> tuple[Tensor, Tensor]:
+    r"""Evaluate ``v^T M^{-1} v`` and ``tr(M^{-1})`` without forming an inverse.
+
+    For ``M=s L L^T``, the two requested contractions are
+
+    ``||L^{-1}v||^2/s`` and ``||L^{-1}||_F^2/s``.
+
+    The shared triangular solve is an exact SPD-native realization of the
+    uncertainty contractions used by analytical Gaussian readout.
+    """
+
+    if matrix.ndim < 2 or matrix.shape[-1] != matrix.shape[-2]:
+        raise ValueError("SPD contractions require square matrices")
+    if vector.shape != matrix.shape[:-1]:
+        raise ValueError("SPD contraction vector must have shape [...,D]")
+    symmetric = 0.5 * (matrix + matrix.transpose(-1, -2))
+    dimension = symmetric.shape[-1]
+    scale = (
+        symmetric.diagonal(dim1=-2, dim2=-1)
+        .abs()
+        .amax(dim=-1)
+        .detach()
+        .clamp_min(torch.finfo(symmetric.dtype).tiny)
+    )
+    factor = torch.linalg.cholesky(symmetric / scale[..., None, None])
+    identity = torch.eye(
+        dimension, dtype=matrix.dtype, device=matrix.device
+    ).expand_as(symmetric)
+    right_hand_side = torch.cat((vector[..., None], identity), dim=-1)
+    solved = torch.linalg.solve_triangular(
+        factor,
+        right_hand_side,
+        upper=False,
+    )
+    quadratic = solved[..., 0].square().sum(dim=-1) / scale
+    inverse_trace = solved[..., 1:].square().sum(dim=(-2, -1)) / scale
+    return quadratic, inverse_trace
+
+
 def spd_geodesic(start: Tensor, end: Tensor, time: Tensor | float) -> Tensor:
     start_sqrt = spd_power(start, 0.5)
     start_inverse_sqrt = spd_power(start, -0.5)
@@ -295,7 +379,7 @@ def product_metric_squared(
 ) -> Tensor:
     position = torch.einsum("vi,vij,vj->v", tangent.position, state.evidence_metric, tangent.position).sum()
     rotation = tangent.rotation_body.square().sum()
-    inverse = torch.linalg.inv(state.covariance)
+    inverse = spd_inverse_cholesky(state.covariance)
     covariance = torch.einsum("vij,vjk,vkl,vli->v", inverse, tangent.covariance, inverse, tangent.covariance).sum()
     return (
         position_weight * position
@@ -317,6 +401,8 @@ __all__ = [
     "so3_exp",
     "so3_log",
     "spd_geodesic",
+    "spd_inverse_cholesky",
+    "spd_inverse_quadratic_trace",
     "spd_log",
     "spd_parallel_transport",
     "spd_retract",

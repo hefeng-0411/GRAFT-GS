@@ -31,6 +31,8 @@ from graft_gs.manifold.geometry import (
     ManifoldTangent,
     geodesic_interpolate,
     retract,
+    spd_inverse_cholesky,
+    spd_inverse_quadratic_trace,
     spectral_box_spd,
     so3_exp,
     so3_log,
@@ -335,6 +337,58 @@ class TopologyAndManifoldTest(unittest.TestCase):
         self.assertTrue(bool(torch.all(eigenvalue <= 0.25 + 1.0e-12)))
         gradient = torch.autograd.grad(projected.square().sum(), matrix)[0]
         self.assertTrue(torch.all(torch.isfinite(gradient)))
+
+    def test_spd_cholesky_inverse_contractions_are_exact_and_finite(self) -> None:
+        angle = torch.tensor(0.41, dtype=torch.float64)
+        cosine, sine = torch.cos(angle), torch.sin(angle)
+        rotation = torch.stack(
+            (
+                torch.stack((cosine, -sine, angle.new_zeros(()))),
+                torch.stack((sine, cosine, angle.new_zeros(()))),
+                torch.tensor([0.0, 0.0, 1.0], dtype=torch.float64),
+            )
+        )
+        eigenvalue = torch.tensor(
+            [[1.0e-5, 2.0, 1.0e4], [3.0, 3.0, 3.0]],
+            dtype=torch.float64,
+        )
+        matrix = (
+            rotation
+            @ torch.diag_embed(eigenvalue)
+            @ rotation.transpose(-1, -2)
+        ).requires_grad_(True)
+        vector = torch.tensor(
+            [[0.3, -0.7, 0.2], [-0.4, 0.1, 0.9]],
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        inverse = spd_inverse_cholesky(matrix)
+        reference = torch.linalg.inv(matrix.detach())
+        torch.testing.assert_close(inverse.detach(), reference, atol=1.0e-7, rtol=1.0e-11)
+        quadratic, inverse_trace = spd_inverse_quadratic_trace(matrix, vector)
+        torch.testing.assert_close(
+            quadratic.detach(),
+            torch.einsum("bi,bij,bj->b", vector.detach(), reference, vector.detach()),
+            atol=1.0e-7,
+            rtol=1.0e-11,
+        )
+        torch.testing.assert_close(
+            inverse_trace.detach(),
+            reference.diagonal(dim1=-2, dim2=-1).sum(-1),
+            atol=1.0e-7,
+            rtol=1.0e-11,
+        )
+        objective = (
+            1.0e-10 * inverse.square().sum()
+            + 1.0e-5 * quadratic.sum()
+            + 1.0e-10 * inverse_trace.sum()
+        )
+        matrix_gradient, vector_gradient = torch.autograd.grad(
+            objective,
+            (matrix, vector),
+        )
+        self.assertTrue(torch.all(torch.isfinite(matrix_gradient)))
+        self.assertTrue(torch.all(torch.isfinite(vector_gradient)))
 
     def test_persistence_critical_proposal_thresholds(self) -> None:
         diagrams = {

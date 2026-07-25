@@ -456,3 +456,19 @@
   chart/evidence or connection edge. Its forward perturbation is confined to a
   neighborhood proportional to `sqrt(machine_epsilon)` times that edge's
   support/cutoff. The A800 equivariance and finite-gradient tests are required.
+
+## SPD metric solve assumptions (2026-07-25)
+
+- Chart-written, partition-of-unity, state-covariance, and evidence metrics
+  entering `spd_inverse_cholesky` are symmetric positive definite. The mapping
+  metric has an explicit positive identity term; positive partition weights
+  preserve SPD. The solver adds no jitter and treats Cholesky failure as an
+  invariant violation.
+- Scalar normalization uses the maximum absolute diagonal, detached from the
+  graph. For fixed positive `s`, differentiating
+  `s^-1 (M/s)^-1` gives exactly the derivative of `M^-1`; the detach therefore
+  removes no mathematical matrix derivative.
+- Cholesky/triangular solves improve factorization stability but cannot make a
+  legitimately unbounded inverse-metric gradient finite. Finite cotangents,
+  positive metric eigenvalues, and the 32-view production backward remain
+  executable validation requirements.

@@ -20,7 +20,11 @@ from ..equivariant.gsta import (
 from ..geometry.atlas import AtlasConfig, PersistentOctreeAtlas
 from ..manifold.barrier import BarrierConfig, BarrierProjector, FeasibilityReport
 from ..manifold.flow import FlowConfig, RiemannianVectorField, SafeHeunIntegrator
-from ..manifold.geometry import ManifoldState, spectral_box_spd
+from ..manifold.geometry import (
+    ManifoldState,
+    spd_inverse_cholesky,
+    spectral_box_spd,
+)
 from ..mapping.manifold_mapping import (
     EvidenceParticles,
     GeometricEvidenceBuilder,
@@ -842,8 +846,17 @@ class GraftGS(nn.Module):
         row = torch.tensor([mapping_lookup[int(node)] for node in complex_.atlas_node_index.tolist()], dtype=torch.int64, device=mapping.latent.device)
         position = mapping.transported_centers[row]
         rotation = atlas.chart_frames[complex_.atlas_node_index]
-        metric = mapping.riemannian_metric[row]
-        covariance_raw = torch.linalg.inv(metric)
+        metric = finite_gradient_identity(
+            mapping.riemannian_metric[row],
+            "state_initialization.riemannian_metric",
+        )
+        # The chart writer guarantees SPD. Preserve that domain explicitly:
+        # an LU inverse ignores symmetry and its CUDA backward was the first
+        # failing 32-view production boundary.
+        covariance_raw = finite_gradient_identity(
+            spd_inverse_cholesky(metric),
+            "state_initialization.metric_inverse",
+        )
         covariance = spectral_box_spd(covariance_raw, 1.0e-6, 0.25)
         if occupancy_probability is None:
             occupancy = -torch.expm1(

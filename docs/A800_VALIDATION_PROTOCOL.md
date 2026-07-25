@@ -649,44 +649,57 @@ mkdir -p outputs/validation
   2>&1 | tee outputs/validation/posterior_measure_numerics.log
 ```
 
-All ten tests must pass. Then cross the first real failure boundary with one
-training step and the minimum valid two-view terminal asset check:
+All ten tests must pass. The supplied A800 run passed all ten in 2.556 seconds,
+and the subsequent 24-view gate completed an optimizer step, final checkpoint,
+PLY, and GLB. The 32-view gate then localized its failure to the full
+`[112,3,3]` chart-metric cotangent. Do not repeat the passed 24-view run.
+
+Validate the SPD-native repair with the three regressions that were absent
+from the earlier suite:
+
+```bash
+"$GRAFT_GS_PYTHON" -m unittest -v \
+  tests.test_geometry_invariants.TopologyAndManifoldTest.test_spd_cholesky_inverse_contractions_are_exact_and_finite \
+  tests.test_assets_and_vertical_slice.AnalyticalAssetTest.test_flat_chart_analytical_readout_backward_is_finite \
+  tests.test_assets_and_vertical_slice.AnalyticalAssetTest.test_anisotropic_metric_readout_backward_is_finite \
+  2>&1 | tee outputs/validation/spd_metric_readout_numerics.log
+```
+
+Then rerun only the unresolved 32-view boundary:
 
 ```bash
 RUN_TAG=$(date -u +%Y%m%dT%H%M%SZ)
-for TOTAL_VIEWS in 24 32; do
-  RUN_DIR="outputs/posterior_gate/${GRAFT_GS_TRAIN_OBJECT_ID}/${RUN_TAG}/views-${TOTAL_VIEWS}"
-  mkdir -p "$RUN_DIR"
-  "$GRAFT_GS_PYTHON" -m torch.distributed.run \
-    --standalone --nnodes=1 \
-    --nproc-per-node="$GRAFT_GS_NPROC_PER_NODE" \
-    scripts/overfit_meshfleet_object.py \
-    "$GRAFT_GS_MESHFLEET_ROOT" "$GRAFT_GS_MESHFLEET_MANIFEST" \
-    --split train --object-id "$GRAFT_GS_TRAIN_OBJECT_ID" \
-    --config configs/graft_gs_a800_native.yaml \
-    --vggt-checkpoint "$VGGT_CHECKPOINT" \
-    --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
-    --maximum-views "$TOTAL_VIEWS" \
-    --evaluation-views 2 \
-    --steps 1 \
-    --minimum-relative-improvement -1 \
-    --output "$RUN_DIR" \
-    2>&1 | tee "$RUN_DIR/run.log" || exit 1
-done
+TOTAL_VIEWS=32
+RUN_DIR="outputs/spd_metric_gate/${GRAFT_GS_TRAIN_OBJECT_ID}/${RUN_TAG}/views-${TOTAL_VIEWS}"
+mkdir -p "$RUN_DIR"
+"$GRAFT_GS_PYTHON" -m torch.distributed.run \
+  --standalone --nnodes=1 \
+  --nproc-per-node="$GRAFT_GS_NPROC_PER_NODE" \
+  scripts/overfit_meshfleet_object.py \
+  "$GRAFT_GS_MESHFLEET_ROOT" "$GRAFT_GS_MESHFLEET_MANIFEST" \
+  --split train --object-id "$GRAFT_GS_TRAIN_OBJECT_ID" \
+  --config configs/graft_gs_a800_native.yaml \
+  --vggt-checkpoint "$VGGT_CHECKPOINT" \
+  --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
+  --maximum-views "$TOTAL_VIEWS" \
+  --evaluation-views 2 \
+  --steps 1 \
+  --minimum-relative-improvement -1 \
+  --output "$RUN_DIR" \
+  2>&1 | tee "$RUN_DIR/run.log"
 ```
 
-The loop deliberately stops if 24 fails, so 32 does not consume another long
-run after an unresolved first boundary. `--maximum-views` fixes the global
-same-object evidence count even when `CUDA_VISIBLE_DEVICES` exposes a dynamic
-number of ranks; `--views-per-rank` would multiply the numerical problem by
-`WORLD_SIZE` and would not reproduce the one-A800 boundary. A pass requires
+`--maximum-views` fixes the global same-object evidence count even when
+`CUDA_VISIBLE_DEVICES` exposes a dynamic number of ranks; `--views-per-rank`
+would multiply the numerical problem by `WORLD_SIZE` and would not reproduce
+the one-A800 boundary. A pass requires
 one finite optimizer step, a committed checkpoint, finite FP64/log-UOT
 diagnostics, positive feasibility margins,
 `evaluation_execution_stage=atlas_autoencoding`, and silence from every named
-`chart_writer.*`, `transport_attention.*`, and `analytical_readout.*`
-cotangent boundary.
+`chart_writer.*`, `transport_attention.*`, `state_initialization.*`, and
+`analytical_readout.*` cotangent boundary.
 
-After both pass, start production with the configured 24-view object-level
+After the 32-view repair gate passes, start production with the configured 24-view object-level
 Phase-B path. The previously selected 16 views/rank remains the conservative
 fallback if training must begin before a fresh performance sweep; it is not a
 reason to reduce precision or losses. Run the full schema-v5 sweep later only

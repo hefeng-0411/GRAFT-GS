@@ -129,6 +129,7 @@ class AnalyticalAssetTest(unittest.TestCase):
 
     def test_flat_chart_analytical_readout_backward_is_finite(self) -> None:
         atlas, mapping, selection = _fixture()
+        mapping.riemannian_metric.retain_grad()
         state = GraftGS._state_from_mapping(atlas, mapping, selection)
         curvature = torch.zeros_like(atlas.curvature, requires_grad=True)
         atlas.curvature = curvature
@@ -143,6 +144,36 @@ class AnalyticalAssetTest(unittest.TestCase):
         self.assertTrue(torch.all(torch.isfinite(curvature.grad)))
         self.assertIsNotNone(mapping.evidence.positions.grad)
         self.assertTrue(torch.all(torch.isfinite(mapping.evidence.positions.grad)))
+        self.assertIsNotNone(mapping.riemannian_metric.grad)
+        self.assertTrue(torch.all(torch.isfinite(mapping.riemannian_metric.grad)))
+        self.assertGreater(float(mapping.riemannian_metric.grad.abs().sum()), 0.0)
+
+    def test_anisotropic_metric_readout_backward_is_finite(self) -> None:
+        atlas, mapping, selection = _fixture()
+        count = mapping.riemannian_metric.shape[0]
+        diagonal = torch.stack(
+            (
+                torch.logspace(-5.0, -3.0, count, dtype=torch.float64),
+                torch.logspace(0.0, 2.0, count, dtype=torch.float64),
+                torch.logspace(2.0, 4.0, count, dtype=torch.float64),
+            ),
+            dim=-1,
+        )
+        mapping.riemannian_metric = torch.diag_embed(diagonal).requires_grad_(
+            True
+        )
+        state = GraftGS._state_from_mapping(atlas, mapping, selection)
+        gaussians, _ = AnalyticalSurfaceReadout().double()(atlas, state, mapping)
+        objective = (
+            gaussians.covariance.square().sum()
+            + gaussians.scales.square().sum()
+            + gaussians.opacity.square().sum()
+        )
+        objective.backward()
+        gradient = mapping.riemannian_metric.grad
+        self.assertIsNotNone(gradient)
+        self.assertTrue(torch.all(torch.isfinite(gradient)))
+        self.assertGreater(float(gradient.abs().sum()), 0.0)
 
     def test_camera_batch_rejects_non_opencv_or_non_so3_frames(self) -> None:
         extrinsic = torch.eye(4, dtype=torch.float64)[:3][None]

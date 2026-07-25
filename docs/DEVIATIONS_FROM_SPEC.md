@@ -334,3 +334,8 @@
   are evaluated directly without an intermediate Euclidean norm. These are
   explicit numerical-domain strengthenings; no arbitrary direction, mass
   floor, detached tensor, or fabricated observation is introduced.
+- SPD uncertainty is evaluated with Cholesky/triangular solves instead of the
+  document's abstract inverse notation. Analytical readout computes only the
+  required normal quadratic form and inverse trace. This is algebraically
+  exact, preserves the full anisotropic metric, and does not introduce jitter,
+  diagonalization, learned covariance, or a stopped gradient.

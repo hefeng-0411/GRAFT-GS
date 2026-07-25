@@ -11,7 +11,12 @@ import torch.nn.functional as F
 from scipy.spatial import cKDTree
 from torch import Tensor
 
-from .geometry import ManifoldState, ManifoldTangent, retract
+from .geometry import (
+    ManifoldState,
+    ManifoldTangent,
+    retract,
+    spd_inverse_cholesky,
+)
 
 
 def _point_segment_distance_squared(point: Tensor, start: Tensor, end: Tensor) -> Tensor:
@@ -673,7 +678,7 @@ class BarrierProjector:
             )
             active_support = constraint_support[active]
             linear = normalized[active]
-            metric_inverse = torch.linalg.inv(metric)
+            metric_inverse = spd_inverse_cholesky(metric)
             _, correction, last_dual_residual = self._solve_sparse_dual_qp(
                 jacobian,
                 active_support,
@@ -764,7 +769,7 @@ class BarrierProjector:
             constraint = self.position_constraints(position, diagnostics=True)
             if constraint.numel() == 0:
                 return position.new_tensor(torch.inf)
-            metric_inverse = torch.linalg.inv(
+            metric_inverse = spd_inverse_cholesky(
                 state.evidence_metric.detach().to(dtype=torch.float64)
             )
             margins: List[Tensor] = []
@@ -857,7 +862,7 @@ class BarrierProjector:
         a = gradient[active]
         active_support = support[active]
         h = constraints[active]
-        metric_inverse = torch.linalg.inv(state.evidence_metric)
+        metric_inverse = spd_inverse_cholesky(state.evidence_metric)
         linear = (
             torch.sum(a * tangent.position[active_support], dim=(-2, -1))
             + self.config.decay_rate * h

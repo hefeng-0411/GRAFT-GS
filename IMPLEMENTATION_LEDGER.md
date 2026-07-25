@@ -1044,3 +1044,37 @@ The full conditional validity domain is maintained in
   manifest/production/selection guards passed (`76/76`, one expected
   PyTorch-dependent loader skip). The new mathematical gradient tests and
   first-failing 24/32-view backward gates are server-pending.
+
+## 2026-07-25 SPD-native metric-readout repair
+
+- Requirement `A800-SPD-METRIC-BACKWARD-08`: the supplied post-posterior A800
+  gate passed all ten focused numerical tests in 2.556 seconds. Its 24-view
+  production Phase-B step completed and emitted `final.pt`,
+  `step-00000001.pt`, PLY, GLB, and metrics. The 32-view step did not OOM; it
+  failed because all 1,008 entries of a `[112,3,3]` chart-metric cotangent
+  became non-finite downstream of the chart writer.
+- Root cause boundary: production formed a generic LU inverse of the selected
+  node metric for initial covariance and another generic inverse of the
+  partition-of-unity metric for every analytical Gaussian. The prior flat
+  readout regression did not retain/check the chart-metric gradient and did
+  not exercise a high-condition 3D metric field.
+- `spd_inverse_cholesky` now evaluates an SPD inverse as
+  `s^-1 L^-T L^-1` with a detached, algebraically cancelled scale and
+  triangular solves. `spd_inverse_quadratic_trace` computes only
+  `n^T M^-1 n` and `tr(M^-1)` for analytical uncertainty, so readout never
+  materializes its former per-Gaussian inverse. No jitter, NaN replacement,
+  detach of geometric state, loss removal, or precision reduction is used.
+- The same SPD primitive replaces generic evidence/covariance inverses in
+  state initialization, the product-manifold metric, and barrier restoration,
+  boundary certification, and velocity projection. Named cotangent boundaries
+  distinguish state initialization, inverse boxing, readout node metrics, and
+  continuous interpolated metrics.
+- Numerical regressions now cover inverse/contraction agreement, repeated and
+  condition-spread spectra, finite matrix/vector gradients, retained metric
+  gradients in the flat full readout, and a full anisotropic metric readout.
+  Production files: `graft_gs/manifold/geometry.py`,
+  `graft_gs/manifold/barrier.py`, `graft_gs/manifold/__init__.py`,
+  `graft_gs/integration/pipeline.py`, and `graft_gs/readout/assets.py`.
+  Local whole-tree compilation and the 31-test production static suite pass.
+  The three new Torch tests and unresolved 32-view A800 gate remain
+  server-pending.

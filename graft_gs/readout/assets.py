@@ -15,7 +15,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ..geometry.atlas import PersistentOctreeAtlas
-from ..manifold.geometry import ManifoldState
+from ..manifold.geometry import ManifoldState, spd_inverse_quadratic_trace
 from ..mapping.manifold_mapping import MappingResult, finite_gradient_identity
 
 
@@ -221,6 +221,10 @@ class AnalyticalSurfaceReadout(nn.Module):
         appearance_plan = finite_gradient_identity(
             mapping.plan, "analytical_readout.appearance_plan"
         )
+        node_metric = finite_gradient_identity(
+            mapping.riemannian_metric,
+            "analytical_readout.node_metric",
+        )
         for local_chart, global_node in enumerate(state.complex.atlas_node_index.tolist()):
             mapping_index = node_to_mapping[global_node]
             radius = atlas.chart_radii[global_node]
@@ -272,19 +276,33 @@ class AnalyticalSurfaceReadout(nn.Module):
             )
             continuous_metric = atlas.partition_of_unity_metric(
                 means,
-                mapping.riemannian_metric,
+                node_metric,
                 node_index=mapping.graph.atlas_node_index,
             )
-            evidence_uncertainty = torch.linalg.inv(continuous_metric)
-            uncertainty = 0.5 * (
-                state.covariance[local_chart][None] + evidence_uncertainty
+            continuous_metric = finite_gradient_identity(
+                continuous_metric,
+                "analytical_readout.continuous_metric",
             )
-            normal_variance = torch.einsum(
-                "ni,nij,nj->n", normal, uncertainty, normal
+            # Gaussian thickness needs only n^T M^-1 n and tr(M^-1).
+            # Evaluate those invariant contractions by SPD triangular solves;
+            # a full pivoted inverse is both unnecessary and less stable.
+            evidence_normal_variance, evidence_total_variance = (
+                spd_inverse_quadratic_trace(continuous_metric, normal)
             )
-            total_variance = uncertainty.diagonal(
-                dim1=-2, dim2=-1
-            ).sum(-1).clamp_min(cfg.opacity_epsilon)
+            state_covariance = state.covariance[local_chart]
+            state_normal_variance = torch.einsum(
+                "ni,ij,nj->n",
+                normal,
+                state_covariance,
+                normal,
+            )
+            state_total_variance = state_covariance.diagonal().sum()
+            normal_variance = 0.5 * (
+                state_normal_variance + evidence_normal_variance
+            )
+            total_variance = (
+                0.5 * (state_total_variance + evidence_total_variance)
+            ).clamp_min(cfg.opacity_epsilon)
             relative_normal_uncertainty = (normal_variance / total_variance).clamp(0.0, 1.0)
             # The uncertainty ratio may be exactly zero after a valid
             # projection/clamp.  Use a zero-preserving Charbonnier square root
