@@ -241,7 +241,8 @@ checkpoints, data, or a compiled server dependency.
   object-dependent atlas/UOT growth.
 ## 2026-07-24 allocator/error-certificate server validation
 
-- A fresh schema-v3 A800 sweep is required. Existing schema-v2 reports lack
+- This historical boundary is superseded by the schema-v4 section below.
+  At this point a fresh schema-v3 A800 sweep was required. Existing schema-v2 reports lack
   ending allocator/driver telemetry and FP64-referenced transport storage-error
   mass, so they are intentionally inadmissible.
 - The vpr-48 run returned code 1 after 83.29 seconds but the supplied attachment
@@ -249,10 +250,36 @@ checkpoints, data, or a compiled server dependency.
   external until that log is supplied or the fresh sweep reproduces it.
 - The vpr-64 OOM remains a measured upper-bound failure, not a reason to weaken
   precision or supervision. Re-evaluate it only after vpr-48 and the new
-  allocator lifetime telemetry are understood; the sweep stops after the first
-  recognized OOM by default.
+  allocator lifetime telemetry are understood; the then-current sweep stopped
+  after the first recognized OOM by default.
 - Required server evidence: all nine focused numerical/allocator tests, per-rank
   cache-release bytes, peak allocated/active/reserved memory, ending
   allocated/reserved/driver-free memory, UOT storage relative-L1 and discarded
   mass, full child logs, and selector schema v3. No corrected memory budget or
   throughput is claimed before those artifacts exist.
+
+## 2026-07-25 source-offload and schema-v4 rerun boundary
+
+- The latest supplied schema-v3 reports are pre-repair evidence. They prove
+  healthy FP64/log-domain transport storage but fail memory admission, and
+  vpr-32 fails backward at cuBLAS handle creation with virtually no driver
+  headroom. They cannot select a production view budget.
+- Deploy source-rank-only TRELLIS ownership, exact host offload, the
+  16-conditioning-view hidden-prior cap, stage telemetry, and exhaustive sweep
+  together. Existing v3 reports intentionally lack the v4 offload,
+  conditioning, lifetime-peak, and stage-memory certificates.
+- Run the focused Torch/CUDA tests in `A800_VALIDATION_PROTOCOL.md`, then use a
+  fresh timestamped root. `initial_cuda_memory.json` must show every logical
+  device at or above 95% free before checkpoint loading. If it fails, select a
+  different idle `CUDA_VISIBLE_DEVICES`; do not lower training precision or
+  the admission thresholds.
+- A successful report must show source-rank pipeline offload, a positive frozen
+  prior peak, selected conditioning views no greater than 16, all required
+  stage records, converged UOT, positive feasibility margins, and at least 5%
+  ending driver-visible headroom. On failure, retain every
+  `GRAFT_GS_CUDA_FAILURE_DIAGNOSTICS=` line.
+- The conditioning cap requires a server ablation against uncapped TRELLIS on
+  a representative validation subset. Reconstruction/topology quality, not
+  VRAM occupancy alone, determines whether 16 remains the production value.
+- No post-repair A800 optimizer step, throughput, memory reduction, selected
+  view budget, or quality improvement has yet been demonstrated.

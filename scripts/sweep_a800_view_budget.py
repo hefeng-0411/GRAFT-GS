@@ -1,10 +1,12 @@
 """Run a fail-closed A800 same-object view-budget sweep.
 
-The shell protocol used to continue through every larger candidate after a
-CUDA OOM and could mix stale metric files from incompatible renderer policies.
-This driver creates a fresh directory per candidate, streams exact child logs,
-stops the monotone memory sweep after an OOM, and invokes the scientific
-selector even when all completed candidates are rejected.
+Each candidate receives a fresh directory and an independent process group so
+that CUDA allocator state and stale reports cannot cross candidate boundaries.
+The sweep is exhaustive by default: atlas size, topology proposals, visible
+surface support, renderer workspaces, and upstream activations are
+data-dependent, so memory is not guaranteed to be monotone in the requested
+number of views. An explicit diagnostic flag can stop after the first
+allocation failure when wall-clock cost matters more than coverage.
 """
 
 from __future__ import annotations
@@ -48,19 +50,39 @@ def log_reports_oom(text: str) -> bool:
     return any(marker in normalized for marker in OOM_MARKERS)
 
 
-def visible_process_count(python: str) -> int:
+def visible_cuda_inventory(python: str) -> list[dict[str, object]]:
     configured = os.environ.get("GRAFT_GS_NPROC_PER_NODE")
     completed = subprocess.run(
         [
             python,
             "-c",
-            "import torch; print(torch.cuda.device_count())",
+            (
+                "import json, torch\n"
+                "rows=[]\n"
+                "for i in range(torch.cuda.device_count()):\n"
+                " free,total=torch.cuda.mem_get_info(i)\n"
+                " rows.append({'logical_device':i,"
+                "'name':torch.cuda.get_device_name(i),"
+                "'free_bytes':int(free),'total_bytes':int(total),"
+                "'free_fraction':float(free/total)})\n"
+                "print(json.dumps(rows,sort_keys=True))"
+            ),
         ],
         check=True,
         capture_output=True,
         text=True,
     )
-    visible = int(completed.stdout.strip())
+    try:
+        inventory = json.loads(completed.stdout.strip())
+    except json.JSONDecodeError as error:
+        raise RuntimeError(
+            "visible CUDA memory probe did not emit valid JSON"
+        ) from error
+    if not isinstance(inventory, list) or any(
+        not isinstance(row, dict) for row in inventory
+    ):
+        raise RuntimeError("visible CUDA memory probe emitted an invalid record")
+    visible = len(inventory)
     if visible < 1:
         raise RuntimeError("no CUDA device is visible to the pinned interpreter")
     if configured is not None and int(configured) != visible:
@@ -68,7 +90,34 @@ def visible_process_count(python: str) -> int:
             "GRAFT_GS_NPROC_PER_NODE does not match the CUDA_VISIBLE_DEVICES "
             f"projection: configured={configured}, visible={visible}"
         )
-    return visible
+    for index, row in enumerate(inventory):
+        if (
+            row.get("logical_device") != index
+            or not isinstance(row.get("name"), str)
+            or not isinstance(row.get("free_bytes"), int)
+            or isinstance(row.get("free_bytes"), bool)
+            or not isinstance(row.get("total_bytes"), int)
+            or isinstance(row.get("total_bytes"), bool)
+            or not isinstance(row.get("free_fraction"), (int, float))
+            or isinstance(row.get("free_fraction"), bool)
+            or int(row["total_bytes"]) <= 0
+            or int(row["free_bytes"]) < 0
+            or int(row["free_bytes"]) > int(row["total_bytes"])
+            or not 0 <= float(row["free_fraction"]) <= 1
+            or abs(
+                float(row["free_fraction"])
+                - int(row["free_bytes"]) / int(row["total_bytes"])
+            )
+            > 1.0e-9
+        ):
+            raise RuntimeError("visible CUDA memory probe row is malformed")
+    return inventory
+
+
+def visible_process_count(python: str) -> int:
+    """Compatibility wrapper used by external launch tooling."""
+
+    return len(visible_cuda_inventory(python))
 
 
 def build_overfit_command(
@@ -155,7 +204,7 @@ def main() -> None:
         "--views-per-rank",
         type=int,
         nargs="+",
-        default=(16, 24, 32, 48, 64),
+        default=(8, 12, 16, 24, 32, 48, 64),
     )
     parser.add_argument("--evaluation-views", type=int, default=24)
     parser.add_argument("--steps", type=int, default=3)
@@ -164,6 +213,15 @@ def main() -> None:
     parser.add_argument("--maximum-reserved-fraction", type=float, default=0.85)
     parser.add_argument("--maximum-allocated-fraction", type=float, default=0.90)
     parser.add_argument("--minimum-driver-free-fraction", type=float, default=0.05)
+    parser.add_argument(
+        "--minimum-initial-driver-free-fraction",
+        type=float,
+        default=0.95,
+        help=(
+            "Reject a CUDA_VISIBLE_DEVICES selection that is already occupied "
+            "before checkpoints are loaded."
+        ),
+    )
     parser.add_argument("--maximum-storage-relative-l1-error", type=float, default=1.0e-6)
     parser.add_argument(
         "--maximum-zero-marginal-mass-fraction", type=float, default=1.0e-12
@@ -184,7 +242,15 @@ def main() -> None:
     parser.add_argument(
         "--continue-after-oom",
         action="store_true",
-        help="Diagnostic override; larger candidates are normally skipped after OOM",
+        help=argparse.SUPPRESS,
+    )
+    parser.add_argument(
+        "--stop-after-oom",
+        action="store_true",
+        help=(
+            "Diagnostic time-saving mode. Stop after the first CUDA allocation "
+            "failure even though memory demand is not guaranteed to be monotone."
+        ),
     )
     args = parser.parse_args()
     if (
@@ -206,6 +272,7 @@ def main() -> None:
             raise ValueError(f"{name.replace('_', '-')} must lie in (0,1)")
     for name in (
         "minimum_driver_free_fraction",
+        "minimum_initial_driver_free_fraction",
         "maximum_storage_relative_l1_error",
         "maximum_zero_marginal_mass_fraction",
     ):
@@ -221,7 +288,34 @@ def main() -> None:
                 f"sweep output must be fresh to prevent stale report mixing: {args.output}"
             )
     args.output.mkdir(parents=True, exist_ok=True)
-    nproc_per_node = visible_process_count(args.python)
+    initial_cuda_inventory = visible_cuda_inventory(args.python)
+    nproc_per_node = len(initial_cuda_inventory)
+    initial_memory_path = args.output / "initial_cuda_memory.json"
+    initial_memory_path.write_text(
+        json.dumps(
+            {
+                "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                "minimum_initial_driver_free_fraction": (
+                    args.minimum_initial_driver_free_fraction
+                ),
+                "devices": initial_cuda_inventory,
+            },
+            indent=2,
+            sort_keys=True,
+        ),
+        encoding="utf8",
+    )
+    occupied = [
+        row
+        for row in initial_cuda_inventory
+        if float(row["free_fraction"])
+        < args.minimum_initial_driver_free_fraction
+    ]
+    if occupied:
+        raise RuntimeError(
+            "CUDA_VISIBLE_DEVICES contains a non-idle device before the sweep; "
+            f"inspect {initial_memory_path}: {occupied}"
+        )
 
     runs: list[dict[str, object]] = []
     metrics_paths: list[Path] = []
@@ -260,16 +354,20 @@ def main() -> None:
         )
         if completed:
             metrics_paths.append(metrics)
-        if oom and not args.continue_after_oom:
+        if oom and args.stop_after_oom:
             break
 
     summary_path = args.output / "sweep_summary.json"
     summary_path.write_text(
         json.dumps(
             {
-                "schema": "graft-gs-a800-sweep-v2",
+                "schema": "graft-gs-a800-sweep-v3",
                 "nproc_per_node": nproc_per_node,
                 "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+                "initial_cuda_memory": initial_cuda_inventory,
+                "minimum_initial_driver_free_fraction": (
+                    args.minimum_initial_driver_free_fraction
+                ),
                 "candidates": list(candidates),
                 "runs": runs,
             },

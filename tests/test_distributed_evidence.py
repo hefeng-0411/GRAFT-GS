@@ -547,24 +547,29 @@ class DistributedEvidenceTest(unittest.TestCase):
         for value in gathered[1:]:
             torch.testing.assert_close(value, gathered[0], atol=0.0, rtol=0.0)
 
-    def test_trellis_conditioning_uses_all_view_shards(self) -> None:
+    def test_trellis_conditioning_inverts_rank_strided_view_shards(self) -> None:
         context = DistributedContext.initialize()
-        local = torch.full(
-            (context.rank + 1, 3, 2, 2),
-            float(context.rank),
+        total = 2 * context.world_size + 1
+        local_index = torch.arange(
+            context.rank,
+            total,
+            context.world_size,
             device=context.device,
+            dtype=torch.float32,
         )
+        local = local_index[:, None, None, None].expand(-1, 3, 2, 2)
         combined = AtlasDDPSynchronizer(context).aggregate_prior_images(local)
-        self.assertEqual(
-            combined.shape[0], context.world_size * (context.world_size + 1) // 2
+        self.assertEqual(combined.shape[0], total)
+        torch.testing.assert_close(
+            combined[:, 0, 0, 0],
+            torch.arange(
+                total,
+                device=context.device,
+                dtype=torch.float32,
+            ),
+            atol=0.0,
+            rtol=0.0,
         )
-        cursor = 0
-        for rank in range(context.world_size):
-            torch.testing.assert_close(
-                combined[cursor : cursor + rank + 1],
-                torch.full_like(combined[cursor : cursor + rank + 1], float(rank)),
-            )
-            cursor += rank + 1
 
 
 if __name__ == "__main__":

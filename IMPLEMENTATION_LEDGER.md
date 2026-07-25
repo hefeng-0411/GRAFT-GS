@@ -875,9 +875,9 @@ The full conditional validity domain is maintained in
   candidate” is no longer an opaque terminal message.
 - New `sweep_a800_view_budget.py` eliminates shell-redirection/quoting defects,
   binds the dynamic visible GPU count to `CUDA_VISIBLE_DEVICES`, requires a
-  fresh root, retains exact child commands/logs, stops larger monotone
-  candidates after CUDA OOM, writes `sweep_summary.json`, and invokes the
-  scientific selector over completed reports only.
+  fresh root, retains exact child commands/logs, and invokes the scientific
+  selector over completed reports only. Its original monotone-OOM stop policy
+  is superseded by the 2026-07-25 exhaustive non-monotone repair below.
 - The A800 regression compares checkpointed and uncheckpointed CUDA forward
   color/alpha/depth/normal at `1e-6` and Gaussian-state gradients at
   `2e-5 + 2e-4 relative`; no local CUDA pass is claimed.
@@ -931,3 +931,39 @@ The full conditional validity domain is maintained in
   `graft_gs/engine/configuration.py`, all TRELLIS-backed entry points,
   `scripts/select_a800_view_budget.py`,
   `scripts/sweep_a800_view_budget.py`, and the A800 YAML/protocol.
+
+## 2026-07-25 source-prior lifetime and non-monotone A800 sweep repair
+
+- Requirement `A800-FROZEN-PRIOR-RESIDENCY-05`: the supplied schema-v3 sweep
+  completed 16 and 24 views/rank but left only `0.061%`--`0.18%`
+  driver-visible memory free. The 32-view candidate then failed in backward
+  while cuBLAS created its handle. Transport remained numerically healthy:
+  relative-L1 storage error was approximately `2.2e-8`, zero marginal mass was
+  exactly zero, and discarded underflow mass was approximately `2e-43`.
+- Same-object DDP now constructs the full TRELLIS checkpoint only on the
+  designated source rank. Other ranks retain the analytical probability/mass
+  operations through a sampler-inert proxy and receive the typed structure
+  measure by broadcast. After each source cache miss, exact frozen weights move
+  to CPU and inactive CUDA allocator blocks are released before VGGT builds the
+  differentiable graph.
+- All observed views remain in VGGT evidence and all direct/derived
+  supervision. Only the frozen hidden-surface prior is capped to 16
+  deterministic endpoint-covering conditioning views in the A800 config.
+  The distributed gather exactly inverts the rank-strided view partition before
+  selection, so coverage follows original camera order rather than rank blocks.
+  Available and selected counts are serialized.
+- The view-budget path records per-stage allocated, reserved, driver-free, and
+  non-allocator-visible CUDA memory, emits a rank-local JSON certificate on
+  allocation failure without entering a collective, and separates the frozen
+  prior peak from the differentiable graph peak.
+- The sweep now rejects a preoccupied scheduler-visible device before loading
+  checkpoints, evaluates every candidate by default because object-dependent
+  atlas/render memory is not monotone in view count, and offers
+  `--stop-after-oom` only as an explicit diagnostic shortcut. Selector schema
+  v4 and sweep schema v3 reject stale reports lacking the new certificates.
+- Production files: `graft_gs/integration/trellis_prior.py`,
+  `graft_gs/integration/pipeline.py`, `graft_gs/engine/trainer.py`,
+  `graft_gs/engine/configuration.py`, all TRELLIS-backed production entry
+  points, `scripts/overfit_meshfleet_object.py`,
+  `scripts/select_a800_view_budget.py`,
+  `scripts/sweep_a800_view_budget.py`, A800 config, tests, and ledgers.

@@ -84,3 +84,16 @@ VGGT multiscale geometry taps + heads
 The defining architectural boundary is between discrete topology inference and
 continuous manifold refinement.  Neither a topology loss nor a continuous flow
 is allowed to silently cross that boundary.
+
+## 2026-07-25 frozen-prior residency and conditioning decision
+
+| Problem | Candidates considered | Selected method | Rejected alternatives and reason |
+|---|---|---|---|
+| Frozen TRELLIS residency in same-object DDP | Full checkpoint per rank; rank-zero sampling with all ranks retaining weights; CPU offload between misses; quantize prior weights; remove prior | One source rank owns and samples the exact released checkpoint, broadcasts the typed sparse measure, moves exact weights to host after a miss, and releases only inactive CUDA blocks | Per-rank checkpoints are redundant because the prior is `no_grad` and synchronized. Retaining source weights overlaps an unrelated differentiable lifetime. Quantization changes the posterior before equivalence. Removing the prior violates hidden-surface support. |
+| TRELLIS multi-image growth | Condition on every view; random subset; feature clustering; deterministic coverage cap | Deterministic endpoint-covering cap of 16 A800 conditioning views for the hidden prior only; every view remains in VGGT evidence and losses | All-view prior conditioning consumes workspace without adding observed geometry. Random subsets break exact resume. Feature clustering adds another large upstream pass and selection instability. The cap is configurable and its counts are serialized. |
+| A800 budget search after allocation failure | Assume monotone view-memory and stop; continue every candidate; binary search | Exhaustive fresh-process candidates by default, with explicit optional early stop | Atlas cardinality, topology, visibility, and native raster workspaces are data-dependent; the supplied 16-view run had a larger live peak than 24 views, invalidating monotone search and binary-search assumptions. |
+| Near-zero driver headroom | Raise thresholds; reserve dummy VRAM; reduce numerical precision; classify allocator and non-allocator usage | Fail-closed initial occupancy gate plus per-stage allocated/reserved/driver/non-allocator telemetry; preserve BF16/FP32/FP64 policy | Threshold relaxation converts a measured cuBLAS allocation failure into silent risk. Dummy occupancy reduces useful work. Lower precision can alter topology and analytical geometry. |
+
+The selected design changes execution lifetime and prior conditioning cost, not
+the sparse UOT objective, topology energy, manifold metric, barrier margins,
+analytical readout, supervision set, or output geometry.

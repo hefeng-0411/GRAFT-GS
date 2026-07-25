@@ -590,7 +590,7 @@ class AtlasDDPSynchronizer:
         return not self.context.distributed or self.context.rank == self.source_rank
 
     def aggregate_prior_images(self, images: Tensor) -> Tensor:
-        """Gather disjoint same-object view shards for TRELLIS conditioning."""
+        """Gather and invert the deterministic rank-strided view partition."""
 
         if not self.context.distributed:
             return images
@@ -602,6 +602,14 @@ class AtlasDDPSynchronizer:
         counts_tensor = [torch.empty_like(local_count) for _ in range(self.context.world_size)]
         dist.all_gather(counts_tensor, local_count)
         counts = [int(value.item()) for value in counts_tensor]
+        if max(counts) - min(counts) > 1 or counts != sorted(
+            counts,
+            reverse=True,
+        ):
+            raise RuntimeError(
+                "same-object TRELLIS view counts do not match the rank-strided "
+                "partition contract"
+            )
         maximum = max(counts)
         padded = torch.cat(
             (
@@ -612,10 +620,16 @@ class AtlasDDPSynchronizer:
         )
         gathered = [torch.empty_like(padded) for _ in range(self.context.world_size)]
         dist.all_gather(gathered, padded)
-        return torch.cat(
-            [rank_images[:count] for rank_images, count in zip(gathered, counts)],
-            dim=0,
-        )
+        # _shard_object_views assigns original indices rank, rank+W, ...
+        # Re-interleave those shards so a deterministic coverage subset follows
+        # the producer's original camera ordering rather than DDP rank blocks.
+        ordered = [
+            gathered[rank][local_index : local_index + 1]
+            for local_index in range(maximum)
+            for rank in range(self.context.world_size)
+            if local_index < counts[rank]
+        ]
+        return torch.cat(ordered, dim=0)
 
     def synchronize_atlas(self, atlas: PersistentOctreeAtlas) -> PersistentOctreeAtlas:
         """Select one source-exact nonlinear atlas and preserve global gradients.
@@ -1226,15 +1240,31 @@ class GraftGSTrainer:
                 {"total": total, **terms},
             )
             purification_metrics: dict[str, float] = {}
-            if self.gradient_purifier is not None:
-                purification_metrics = self._backward_with_gradient_purification(
-                    total,
-                    terms,
-                    output,
-                    loss_batch,
+            self.module._record_cuda_memory_stage(
+                "trainer/before_backward",
+                self.context.device,
+            )
+            try:
+                if self.gradient_purifier is not None:
+                    purification_metrics = self._backward_with_gradient_purification(
+                        total,
+                        terms,
+                        output,
+                        loss_batch,
+                    )
+                else:
+                    (total / self.config.gradient_accumulation_steps).backward()
+            except RuntimeError as error:
+                self.module._record_cuda_memory_stage(
+                    "trainer/backward_failure",
+                    self.context.device,
                 )
-            else:
-                (total / self.config.gradient_accumulation_steps).backward()
+                self._emit_cuda_failure_diagnostics(error)
+                raise
+            self.module._record_cuda_memory_stage(
+                "trainer/after_backward",
+                self.context.device,
+            )
         for adversary in scale_adversaries:
             adversary.reset_adversary()
         gradient_norm = 0.0
@@ -1302,6 +1332,14 @@ class GraftGSTrainer:
             device_memory = torch.cuda.get_device_properties(
                 self.context.device
             ).total_memory
+            ending_non_allocator_cuda_memory = max(
+                int(
+                    device_memory
+                    - ending_driver_free_memory
+                    - ending_reserved_memory
+                ),
+                0,
+            )
         else:
             peak_memory = 0
             peak_reserved_memory = 0
@@ -1310,6 +1348,7 @@ class GraftGSTrainer:
             ending_reserved_memory = 0
             ending_inactive_reserved_memory = 0
             ending_driver_free_memory = 0
+            ending_non_allocator_cuda_memory = 0
             device_memory = 0
         metrics = {name: float(value.detach().cpu()) for name, value in terms.items()}
         if output.scenes:
@@ -1356,6 +1395,9 @@ class GraftGSTrainer:
                 ending_inactive_reserved_memory
             ),
             ending_driver_free_memory_bytes=float(ending_driver_free_memory),
+            ending_non_allocator_cuda_memory_bytes=float(
+                ending_non_allocator_cuda_memory
+            ),
             device_memory_bytes=float(device_memory),
             peak_allocated_fraction=(
                 float(peak_memory / device_memory) if device_memory else 0.0
@@ -1386,6 +1428,11 @@ class GraftGSTrainer:
                 if device_memory
                 else 0.0
             ),
+            ending_non_allocator_cuda_fraction=(
+                float(ending_non_allocator_cuda_memory / device_memory)
+                if device_memory
+                else 0.0
+            ),
             local_scenes=float(images.shape[0]),
             local_views=float(images.shape[0] * images.shape[1]),
             local_views_per_second=float(
@@ -1396,8 +1443,22 @@ class GraftGSTrainer:
         metrics.update(scale_adversary_metrics)
         trellis_prior = getattr(self.module, "trellis_prior", None)
         cache_release = getattr(trellis_prior, "last_cuda_cache_release", None)
+        pipeline_offload = getattr(
+            trellis_prior,
+            "last_cuda_pipeline_offload",
+            None,
+        )
+        conditioning_views = getattr(
+            trellis_prior,
+            "last_conditioning_view_count",
+            None,
+        )
         if not isinstance(cache_release, Mapping):
             cache_release = {}
+        if not isinstance(pipeline_offload, Mapping):
+            pipeline_offload = {}
+        if not isinstance(conditioning_views, Mapping):
+            conditioning_views = {}
         metrics.update(
             trellis_cache_release_performed=float(
                 bool(cache_release.get("performed", False))
@@ -1408,10 +1469,69 @@ class GraftGSTrainer:
             trellis_cache_reserved_after_bytes=float(
                 cache_release.get("reserved_after_bytes", 0)
             ),
+            trellis_pipeline_offload_performed=float(
+                bool(pipeline_offload.get("performed", False))
+            ),
+            trellis_pipeline_released_allocated_bytes=float(
+                pipeline_offload.get("released_allocated_bytes", 0)
+            ),
+            trellis_pipeline_peak_allocated_before_bytes=float(
+                pipeline_offload.get("peak_allocated_before_bytes", 0)
+            ),
+            trellis_pipeline_allocated_after_bytes=float(
+                pipeline_offload.get("allocated_after_bytes", 0)
+            ),
+            trellis_conditioning_views_available=float(
+                conditioning_views.get("available", 0)
+            ),
+            trellis_conditioning_views_selected=float(
+                conditioning_views.get("selected", 0)
+            ),
         )
         if should_step and self.global_step % self.config.log_every == 0:
             self._log(metrics)
         return metrics
+
+    def _emit_cuda_failure_diagnostics(self, error: RuntimeError) -> None:
+        if self.context.device.type != "cuda":
+            return
+        normalized = str(error).lower()
+        allocation_failure = any(
+            marker in normalized
+            for marker in (
+                "out of memory",
+                "alloc_failed",
+                "memoryallocation",
+                "cudamalloc",
+            )
+        )
+        if not allocation_failure:
+            return
+        free, total = torch.cuda.mem_get_info(self.context.device)
+        payload = {
+            "rank": self.context.rank,
+            "error": str(error),
+            "allocated_bytes": int(
+                torch.cuda.memory_allocated(self.context.device)
+            ),
+            "reserved_bytes": int(
+                torch.cuda.memory_reserved(self.context.device)
+            ),
+            "peak_allocated_bytes": int(
+                torch.cuda.max_memory_allocated(self.context.device)
+            ),
+            "peak_reserved_bytes": int(
+                torch.cuda.max_memory_reserved(self.context.device)
+            ),
+            "driver_free_bytes": int(free),
+            "device_bytes": int(total),
+            "stages": self.module.last_cuda_memory_stages,
+        }
+        print(
+            "GRAFT_GS_CUDA_FAILURE_DIAGNOSTICS="
+            + json.dumps(payload, sort_keys=True),
+            flush=True,
+        )
 
     def _capture_forward_rng(self) -> dict[str, Tensor]:
         state = {"cpu": torch.get_rng_state()}

@@ -115,19 +115,24 @@ mkdir -p outputs/validation
   tests.test_geometry_invariants.TopologyAndManifoldTest.test_large_persistence_matching_is_linear_memory_symmetric_and_differentiable \
   tests.test_meshfleet_contract.MeshFleetAuditTest.test_nonmanifold_mesh_still_derives_depth_and_normals \
   tests.test_assets_and_vertical_slice.AnalyticalAssetTest.test_cuda_view_checkpoint_matches_forward_and_gradients \
+  tests.test_external_adapters.TrellisAdapterBoundaryTest.test_hidden_prior_view_cap_is_deterministic_and_endpoint_covering \
+  tests.test_external_adapters.TrellisAdapterBoundaryTest.test_frozen_pipeline_offload_releases_live_cuda_weight_allocation \
   tests.test_external_adapters.TrellisAdapterBoundaryTest.test_frozen_sampler_releases_only_inactive_cuda_allocator_blocks \
   tests.test_external_adapters.TrellisAdapterBoundaryTest.test_cache_release_rejects_a_live_allocation_lifetime_change \
   2>&1 | tee outputs/validation/concurrency_numerics.log
 ```
 
-All nine must pass. The underflow regression is deliberately disconnected and
+All eleven must pass. The underflow regression is deliberately disconnected and
 contains a positive exact UOT component near `exp(-196)`: FP32 may store that
 entry as zero, but the FP64/log-domain fixed point and implicit conditional
 probabilities must remain finite. It also bounds the discarded mass and total
 relative L1 storage error against the FP64 plan; the number of underflowed
 edges is diagnostic only. The two allocator tests establish that the frozen
 TRELLIS lifetime boundary returns inactive cached blocks without changing one
-live allocated byte. The topology regression requires a valid,
+live allocated byte. The source-offload test additionally requires the frozen
+checkpoint's live allocation to leave CUDA, and the conditioning test proves
+the prior-only cap is deterministic and endpoint-covering. The topology
+regression requires a valid,
 orientable all-support filtration stratum when every ordinary fixed threshold
 would remove the overlap triangles. The persistence regression patches
 `torch.cdist` to fail and then exercises a 600-by-600 diagram through the
@@ -154,23 +159,28 @@ SWEEP_ROOT="outputs/concurrency/${GRAFT_GS_TRAIN_OBJECT_ID}/checkpoint-${RUN_TAG
   --config configs/graft_gs_a800_native.yaml \
   --vggt-checkpoint "$VGGT_CHECKPOINT" \
   --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
-  --views-per-rank 16 24 32 48 64 \
+  --views-per-rank 8 12 16 24 32 48 64 \
   --evaluation-views 24 \
   --steps 3 \
   --minimum-relative-improvement -1 \
   --maximum-reserved-fraction 0.85 \
   --maximum-allocated-fraction 0.90 \
   --minimum-driver-free-fraction 0.05 \
+  --minimum-initial-driver-free-fraction 0.95 \
   --maximum-storage-relative-l1-error 1e-6 \
   --maximum-zero-marginal-mass-fraction 1e-12 \
   --throughput-fraction 0.97 \
-  --output "$SWEEP_ROOT"
+  --output "$SWEEP_ROOT" \
+  2>&1 | tee "$SWEEP_ROOT.log"
 ```
 
 The driver uses the pinned interpreter without shell interpolation, requires a
-fresh root, retains every exact child command/log, and stops monotonically
-larger candidates after a real CUDA OOM. `--continue-after-oom` exists only for
-diagnosing a suspected non-monotone external failure.
+fresh root, writes `initial_cuda_memory.json`, rejects a preoccupied visible
+GPU before loading checkpoints, and retains every exact child command/log.
+It evaluates every requested candidate by default because atlas/topology/
+visibility memory is object-dependent and measured peaks are non-monotone.
+`--stop-after-oom` is an explicit time-saving diagnostic mode, not the
+scientific selection default.
 
 In a second terminal, verify that each PID appears on one GPU only:
 
@@ -186,9 +196,11 @@ telemetry, stale reports without the CUDA view-checkpoint certificate, more
 than `1e-6` FP32 plan relative-L1 error, more than `1e-12` discarded
 zero-marginal mass, a live allocated/active peak above 90%, a post-step
 allocator reservation above 85%, or less than 5% driver-visible headroom.
-Historical `peak_reserved` remains in the report but is not a live-memory gate:
-the caching allocator can retain dead upstream workspaces. The source rank
-must explicitly certify the frozen-TRELLIS cache release. When none pass,
+Historical frozen-prior peak is serialized separately from the differentiable
+graph peak. The source rank must explicitly certify checkpoint host offload,
+inactive-cache release, and positive available/selected conditioning counts.
+Every rank must provide per-stage PyTorch and non-allocator-visible CUDA
+telemetry. When none pass,
 `selection.json` is still written with every rejection reason before the
 driver fails:
 
@@ -208,8 +220,9 @@ full training because flow, rendering, and refined atlases have higher peaks.
 Every admitted report must record `internal_solve_dtype=float64`, the minimum
 log-plan value, COO cardinalities, exact storage-zero counts, their FP64 mass
 fractions, total storage relative-L1 error, peak allocated/active/reserved
-bytes, ending allocated/reserved bytes, driver-free bytes, and the source-rank
-TRELLIS cache-release certificate.
+bytes, ending allocated/reserved bytes, driver-free bytes, source-rank TRELLIS
+offload/cache-release/conditioning certificates, and CUDA stage memory. Retain
+every `GRAFT_GS_CUDA_FAILURE_DIAGNOSTICS=` JSON line from a failed candidate.
 
 For corpus training, use ordinary object-level DDP (omit
 `--same-object-view-shards`). Every visible GPU receives a different complete

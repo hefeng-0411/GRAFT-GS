@@ -537,6 +537,36 @@ sweep's intentional OOM classifier was excluded from that contamination scan.
 - Local Torch-backed execution is unavailable (`ModuleNotFoundError: torch`
   in the bundled drafting runtime). The TRELLIS mocked allocator tests, UOT
   numerical mass certificate, sparse/dense agreement, finite difference,
-  renderer checkpoint equivalence, and fresh schema-v3 A800 sweep are
-  server-ready but unexecuted. Exact commands are recorded in
+  renderer checkpoint equivalence, and the then-current schema-v3 A800 sweep
+  were server-ready but unexecuted. Schema v3 is now supplied pre-repair
+  evidence and is superseded by the schema-v4 protocol. Exact commands are recorded in
   `docs/A800_VALIDATION_PROTOCOL.md`.
+
+## 2026-07-25 supplied allocator-v3 evidence and local repair validation
+
+- Supplied A800 evidence is retained as pre-repair:
+  - vpr-16 completed in `5086.15 s`, aggregate throughput
+    `0.02601445 views/s`, maximum live fraction `0.97679883`, and minimum
+    ending driver-free fraction `0.00102959`;
+  - vpr-24 completed in `5210.57 s`, aggregate throughput
+    `0.03848936 views/s`, maximum live fraction `0.93910657`, and minimum
+    ending driver-free fraction `0.00061098`;
+  - vpr-32 failed after `1687.96 s` at
+    `CUBLAS_STATUS_ALLOC_FAILED` during backward;
+  - vpr-48 and vpr-64 were not executed because the old sweep stopped at the
+    first recognized allocation failure.
+- The decrease from the 16-view live peak to the 24-view live peak disproves
+  the prior monotone-memory assumption. No view budget is selected from these
+  stale reports.
+- Locally executed with bundled Python 3.12.13: whole-tree `compileall` passed.
+  Environment, manifest, server-handoff, concurrency-selection, and scientific
+  production static suites passed `65/65` in `6.188 s`; the earlier focused
+  concurrency/production suites passed `41/41`.
+- The unrelated default Windows `python` resolves to Simcenter Python 3.6.8
+  and cannot parse `from __future__ import annotations`; those failures are an
+  interpreter mismatch, not repository failures.
+- Local Torch execution remains unavailable in the bundled drafting runtime.
+  The conditioning-subset numerical test, mocked live-weight offload test, real
+  checkpoint residency, stage traces, cuBLAS-headroom repair, and schema-v4
+  exhaustive sweep are server-ready but unexecuted. No post-repair A800 memory,
+  throughput, optimizer-step, or quality claim is made.

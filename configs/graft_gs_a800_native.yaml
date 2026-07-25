@@ -107,9 +107,16 @@ trellis_prior:
   strength: 0.35
   minimum_probability: 0.0
   uncertainty_discount: 0.5
-  # Release only inactive allocator blocks after the frozen source-rank
-  # diffusion sampler. Live TRELLIS weights and sparse priors remain resident.
+  # All views remain in VGGT evidence. Bound only the frozen hidden-surface
+  # prior's multi-image workspace with deterministic endpoint coverage.
+  maximum_conditioning_views: 16
+  # Release inactive allocator blocks after the frozen source-rank sampler.
+  # This operation never changes live tensor accounting.
   release_cuda_cache_after_sampling: true
+  # TRELLIS is frozen and is used before the differentiable GRAFT-GS graph.
+  # Keep its exact weights in host memory between cache misses so they do not
+  # permanently overlap VGGT/atlas/render activations on the A800.
+  offload_cuda_pipeline_after_sampling: true
 training:
   phases: [A, B, C, D, E, F]
   learning_rate: 1.0e-4

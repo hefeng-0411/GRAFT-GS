@@ -291,3 +291,21 @@
   certifies underflow mass and relative L1 cast error against the FP64
   log-domain plan. It neither floors masses nor silently calls FP32 storage
   exact.
+48. **Frozen hidden-prior residency is source-only and lifetime-separated.**
+  The Markdown requires TRELLIS as uncertain hidden support but does not
+  require its checkpoint on every DDP rank or concurrently with the
+  differentiable model. Same-object DDP now samples one exact posterior,
+  broadcasts its typed sparse measure, and keeps exact weights on host between
+  cache misses. This is an execution-memory strengthening, not feature fusion,
+  distillation, or a second decoder.
+49. **A800 TRELLIS conditioning uses a deterministic configurable coverage
+  cap.** Every view still contributes to VGGT geometric evidence and training
+  supervision. The cap applies only to the frozen hidden-surface prior, whose
+  all-view workspace caused unrelated training headroom loss. The posterior
+  approximation and selected/available counts are explicit and require a
+  quality ablation against uncapped conditioning.
+50. **Concurrency sweeps do not assume monotone object-dependent memory.**
+  The previous early-stop policy was contradicted by measured live peaks.
+  Fresh processes now evaluate all requested candidates unless the operator
+  explicitly selects a diagnostic early stop. Admission remains fail-closed
+  on numerical, feasibility, driver-headroom, and allocator-state certificates.

@@ -68,6 +68,29 @@ def audit_report(
     if not isinstance(rank_rows, list) or len(rank_rows) != world_size:
         reasons.append("rank_performance does not contain exactly one row per rank")
         rank_rows = []
+    prior_policy = report.get("trellis_prior")
+    configured_prior_view_cap = 0
+    if not isinstance(prior_policy, Mapping):
+        reasons.append("TRELLIS memory policy certificate is missing")
+    else:
+        configured_cap = prior_policy.get("maximum_conditioning_views")
+        if (
+            not isinstance(configured_cap, int)
+            or isinstance(configured_cap, bool)
+            or configured_cap < 1
+        ):
+            reasons.append("TRELLIS conditioning-view cap is invalid")
+        else:
+            configured_prior_view_cap = configured_cap
+        if prior_policy.get("enabled") is not True:
+            reasons.append("view-budget run did not enable the TRELLIS prior")
+        if world_size > 1 and prior_policy.get("source_rank_only") is not True:
+            reasons.append("same-object DDP TRELLIS ownership is not source-only")
+        if (
+            prior_policy.get("offload_cuda_pipeline_after_sampling")
+            is not True
+        ):
+            reasons.append("TRELLIS CUDA pipeline offload policy was not active")
 
     ranks: list[int] = []
     local_views: list[int] = []
@@ -77,6 +100,7 @@ def audit_report(
     peak_active: list[float] = []
     ending_reserved: list[float] = []
     ending_driver_free: list[float] = []
+    conditioning_views: list[int] = []
     for row in rank_rows:
         if not isinstance(row, Mapping):
             reasons.append("rank_performance contains a malformed row")
@@ -91,12 +115,70 @@ def audit_report(
             ending_reserved_fraction = float(row["ending_reserved_fraction"])
             ending_driver_free_fraction = float(row["ending_driver_free_fraction"])
             cache_release_value = float(row["trellis_cache_release_performed"])
+            pipeline_offload_value = float(
+                row["trellis_pipeline_offload_performed"]
+            )
+            pipeline_prior_peak = float(
+                row["trellis_pipeline_peak_allocated_before_bytes"]
+            )
+            available_prior_view_value = float(
+                row["trellis_conditioning_views_available"]
+            )
+            selected_prior_view_value = float(
+                row["trellis_conditioning_views_selected"]
+            )
+            if (
+                not isfinite(pipeline_prior_peak)
+                or pipeline_prior_peak < 0
+                or not isfinite(available_prior_view_value)
+                or not available_prior_view_value.is_integer()
+                or not isfinite(selected_prior_view_value)
+                or not selected_prior_view_value.is_integer()
+            ):
+                raise ValueError("TRELLIS lifetime telemetry is invalid")
+            available_prior_views = int(available_prior_view_value)
+            selected_prior_views = int(selected_prior_view_value)
             if cache_release_value not in (0.0, 1.0):
                 raise ValueError("cache-release flag is not Boolean")
+            if pipeline_offload_value not in (0.0, 1.0):
+                raise ValueError("pipeline-offload flag is not Boolean")
             cache_release_performed = bool(cache_release_value)
+            pipeline_offload_performed = bool(pipeline_offload_value)
         except (KeyError, TypeError, ValueError):
             reasons.append("rank_performance row lacks numeric telemetry")
             continue
+        stage_memory = row.get("cuda_stage_memory")
+        if not isinstance(stage_memory, Mapping):
+            reasons.append(f"rank {rank} lacks CUDA stage-memory telemetry")
+        else:
+            for stage in (
+                "input",
+                "trellis_prefetch",
+                "vggt_geometry",
+                "evidence_lift",
+                "trainer/before_backward",
+                "trainer/after_backward",
+            ):
+                stage_value = stage_memory.get(stage)
+                if not isinstance(stage_value, Mapping):
+                    reasons.append(
+                        f"rank {rank} lacks CUDA memory stage {stage}"
+                    )
+                    continue
+                for field in (
+                    "allocated_fraction",
+                    "reserved_fraction",
+                    "driver_free_fraction",
+                    "non_allocator_used_fraction",
+                ):
+                    value = stage_value.get(field)
+                    if (
+                        not _finite_number(value)
+                        or not 0 <= float(value) <= 1
+                    ):
+                        reasons.append(
+                            f"rank {rank} stage {stage} has invalid {field}"
+                        )
         if views < 2:
             reasons.append(f"rank {rank} has fewer than two useful views")
         if not isfinite(views_per_second) or views_per_second <= 0:
@@ -134,6 +216,29 @@ def audit_report(
                 "rank 0 did not certify release of inactive frozen-TRELLIS "
                 "allocator blocks"
             )
+        if rank == 0 and not pipeline_offload_performed:
+            reasons.append(
+                "rank 0 did not certify offload of frozen TRELLIS checkpoint "
+                "weights before the differentiable GRAFT-GS graph"
+            )
+        if rank == 0:
+            if pipeline_prior_peak <= 0:
+                reasons.append(
+                    "rank 0 lacks the frozen TRELLIS lifetime peak certificate"
+                )
+            if (
+                available_prior_views < 1
+                or selected_prior_views < 1
+                or selected_prior_views > available_prior_views
+                or (
+                    configured_prior_view_cap > 0
+                    and selected_prior_views > configured_prior_view_cap
+                )
+            ):
+                reasons.append(
+                    "rank 0 TRELLIS conditioning-view counts are invalid"
+                )
+            conditioning_views.append(selected_prior_views)
         ranks.append(rank)
         local_views.append(views)
         throughput.append(views_per_second)
@@ -329,6 +434,9 @@ def audit_report(
         "minimum_ending_driver_free_fraction": (
             min(ending_driver_free) if ending_driver_free else float("-inf")
         ),
+        "maximum_trellis_conditioning_views": (
+            max(conditioning_views) if conditioning_views else 0
+        ),
         "transport_storage_underflow_edge_fraction": underflow_edge_fraction,
         "transport_storage_underflow_mass_fraction": underflow_mass_fraction,
         "transport_storage_relative_l1_error": storage_relative_l1_error,
@@ -445,7 +553,7 @@ def main() -> None:
         selected = None
         selection_error = str(error)
     output = {
-        "schema": "graft-gs-a800-view-selection-v3",
+        "schema": "graft-gs-a800-view-selection-v4",
         "maximum_reserved_fraction": args.maximum_reserved_fraction,
         "maximum_allocated_fraction": args.maximum_allocated_fraction,
         "minimum_driver_free_fraction": args.minimum_driver_free_fraction,

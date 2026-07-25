@@ -240,6 +240,27 @@ def load_trellis_prior_config(path: str | Path) -> dict[str, object]:
         raise TypeError(
             "trellis_prior.release_cuda_cache_after_sampling must be Boolean"
         )
+    offload_cuda_pipeline_after_sampling = value.get(
+        "offload_cuda_pipeline_after_sampling",
+        True,
+    )
+    if not isinstance(offload_cuda_pipeline_after_sampling, bool):
+        raise TypeError(
+            "trellis_prior.offload_cuda_pipeline_after_sampling must be Boolean"
+        )
+    maximum_conditioning_views = value.get("maximum_conditioning_views")
+    if (
+        maximum_conditioning_views is not None
+        and (
+            isinstance(maximum_conditioning_views, bool)
+            or not isinstance(maximum_conditioning_views, int)
+            or maximum_conditioning_views < 1
+        )
+    ):
+        raise ValueError(
+            "trellis_prior.maximum_conditioning_views must be a positive "
+            "integer or null"
+        )
     config: dict[str, object] = {
         "enabled_after_phase_a": bool(value.get("enabled_after_phase_a", False)),
         "samples": int(value.get("samples", 8)),
@@ -247,7 +268,11 @@ def load_trellis_prior_config(path: str | Path) -> dict[str, object]:
         "strength": float(value.get("strength", 0.35)),
         "minimum_probability": float(value.get("minimum_probability", 0.0)),
         "uncertainty_discount": float(value.get("uncertainty_discount", 0.5)),
+        "maximum_conditioning_views": maximum_conditioning_views,
         "release_cuda_cache_after_sampling": release_cuda_cache_after_sampling,
+        "offload_cuda_pipeline_after_sampling": (
+            offload_cuda_pipeline_after_sampling
+        ),
     }
     if int(config["samples"]) < 1 or int(config["sampler_steps"]) < 1:
         raise ValueError("TRELLIS prior samples/steps must be positive")

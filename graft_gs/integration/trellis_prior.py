@@ -147,7 +147,9 @@ class TrellisPriorAdapter:
         minimum_probability: float = 0.0,
         uncertainty_discount: float = 0.5,
         cache_entries: int = 64,
+        maximum_conditioning_views: Optional[int] = None,
         release_cuda_cache_after_sampling: bool = True,
+        offload_cuda_pipeline_after_sampling: bool = True,
     ) -> None:
         if samples < 1 or sampler_steps < 1:
             raise ValueError("TRELLIS prior samples and sampler steps must be positive")
@@ -155,8 +157,22 @@ class TrellisPriorAdapter:
             raise ValueError("TRELLIS prior strength/threshold are outside their domains")
         if cache_entries < 0:
             raise ValueError("TRELLIS prior cache_entries must be non-negative")
+        if (
+            maximum_conditioning_views is not None
+            and (
+                isinstance(maximum_conditioning_views, bool)
+                or not isinstance(maximum_conditioning_views, int)
+                or maximum_conditioning_views < 1
+            )
+        ):
+            raise ValueError(
+                "TRELLIS maximum_conditioning_views must be a positive integer "
+                "or None"
+            )
         if not isinstance(release_cuda_cache_after_sampling, bool):
             raise TypeError("release_cuda_cache_after_sampling must be Boolean")
+        if not isinstance(offload_cuda_pipeline_after_sampling, bool):
+            raise TypeError("offload_cuda_pipeline_after_sampling must be Boolean")
         self.pipeline = pipeline
         if pipeline is not None:
             self._validate_upstream_contract(pipeline)
@@ -166,7 +182,12 @@ class TrellisPriorAdapter:
         self.minimum_probability = minimum_probability
         self.uncertainty_discount = uncertainty_discount
         self.cache_entries = cache_entries
+        self.maximum_conditioning_views = maximum_conditioning_views
         self.release_cuda_cache_after_sampling = release_cuda_cache_after_sampling
+        self.offload_cuda_pipeline_after_sampling = (
+            offload_cuda_pipeline_after_sampling
+        )
+        self._pipeline_device: Optional[torch.device] = None
         self._sample_cache: OrderedDict[str, TrellisStructurePrior] = OrderedDict()
         self.last_cuda_cache_release: dict[str, int | bool] = {
             "performed": False,
@@ -175,6 +196,17 @@ class TrellisPriorAdapter:
             "allocated_after_bytes": 0,
             "reserved_after_bytes": 0,
             "released_reserved_bytes": 0,
+        }
+        self.last_cuda_pipeline_offload: dict[str, int | bool] = {
+            "performed": False,
+            "allocated_before_bytes": 0,
+            "peak_allocated_before_bytes": 0,
+            "allocated_after_bytes": 0,
+            "released_allocated_bytes": 0,
+        }
+        self.last_conditioning_view_count: dict[str, int] = {
+            "available": 0,
+            "selected": 0,
         }
 
     @staticmethod
@@ -226,14 +258,23 @@ class TrellisPriorAdapter:
         minimum_probability: float = 0.0,
         uncertainty_discount: float = 0.5,
         cache_entries: int = 64,
+        maximum_conditioning_views: Optional[int] = None,
         release_cuda_cache_after_sampling: bool = True,
+        offload_cuda_pipeline_after_sampling: bool = True,
         device: Optional[torch.device | str] = None,
     ) -> "TrellisPriorAdapter":
         checkpoint = resolve_trellis_checkpoint(checkpoint)
         module = import_external_module("trellis.pipelines")
         pipeline_class = getattr(module, "TrellisImageTo3DPipeline")
         pipeline = pipeline_class.from_pretrained(checkpoint)
-        pipeline.to(torch.device("cuda") if device is None else torch.device(device))
+        target_device = torch.device("cuda") if device is None else torch.device(device)
+        initial_device = (
+            torch.device("cpu")
+            if offload_cuda_pipeline_after_sampling
+            and target_device.type == "cuda"
+            else target_device
+        )
+        pipeline.to(initial_device)
         adapter = cls(
             pipeline,
             samples,
@@ -242,8 +283,11 @@ class TrellisPriorAdapter:
             minimum_probability,
             uncertainty_discount,
             cache_entries,
+            maximum_conditioning_views,
             release_cuda_cache_after_sampling,
+            offload_cuda_pipeline_after_sampling,
         )
+        adapter._pipeline_device = initial_device
         adapter.upstream_provenance = external_module_provenance(module, checkpoint)
         return adapter
 
@@ -259,6 +303,12 @@ class TrellisPriorAdapter:
             raise ValueError("TRELLIS image conditioning contains non-finite values")
         if bool(torch.any(scene_images < 0)) or bool(torch.any(scene_images > 1)):
             raise ValueError("TRELLIS tensor inputs must use the released [0,1] RGB contract")
+        available_views = int(scene_images.shape[0])
+        scene_images = self._select_conditioning_views(scene_images)
+        self.last_conditioning_view_count = {
+            "available": available_views,
+            "selected": int(scene_images.shape[0]),
+        }
         cache_key = self._sample_cache_key(scene_images, seed)
         if cache_key is not None and cache_key in self._sample_cache:
             cached = self._sample_cache.pop(cache_key)
@@ -267,6 +317,12 @@ class TrellisPriorAdapter:
                 [value.to(device=scene_images.device).clone() for value in cached.coordinates],
                 cached.resolution,
             )
+        if self.pipeline is None:
+            raise RuntimeError(
+                "this synchronized TRELLIS proxy cannot sample; only the "
+                "designated distributed source rank may own the checkpoint"
+            )
+        self._ensure_pipeline_device(scene_images.device)
         condition = self.pipeline.get_cond(scene_images)
         if not isinstance(condition, dict) or not {"cond", "neg_cond"} <= set(condition):
             raise TypeError("TRELLIS get_cond must return cond and neg_cond tensors")
@@ -356,8 +412,90 @@ class TrellisPriorAdapter:
         del condition
         if "coordinates" in locals():
             del coordinates
+        self._offload_cuda_pipeline(scene_images.device)
         self._release_inactive_cuda_cache(scene_images.device)
         return prior
+
+    def _select_conditioning_views(self, scene_images: Tensor) -> Tensor:
+        """Select a deterministic coverage subset for the frozen shape prior.
+
+        Every input view still enters VGGT and the calibrated geometric
+        evidence measure. TRELLIS is not observed evidence: it supplies a
+        stochastic hidden-surface prior whose multi-image conditioning
+        workspace grows with view count. Uniform endpoint-preserving sampling
+        bounds that prior-only workspace without changing RGB supervision,
+        cameras, transport mass, or any differentiable GRAFT-GS state.
+        """
+
+        maximum = self.maximum_conditioning_views
+        count = int(scene_images.shape[0])
+        if maximum is None or count <= maximum:
+            return scene_images
+        if maximum == 1:
+            index = torch.tensor(
+                [count // 2],
+                dtype=torch.int64,
+                device=scene_images.device,
+            )
+        else:
+            numerator = torch.arange(
+                maximum,
+                dtype=torch.int64,
+                device=scene_images.device,
+            ) * (count - 1)
+            index = torch.div(
+                numerator,
+                maximum - 1,
+                rounding_mode="floor",
+            )
+        if int(torch.unique(index).numel()) != maximum:
+            raise RuntimeError("TRELLIS conditioning subset contains duplicates")
+        return scene_images.index_select(0, index)
+
+    def _ensure_pipeline_device(self, device: torch.device) -> None:
+        if self.pipeline is None:
+            raise RuntimeError("TRELLIS sampling pipeline is unavailable")
+        device = torch.device(device)
+        if self._pipeline_device == device:
+            return
+        self.pipeline.to(device)
+        self._pipeline_device = device
+
+    def _offload_cuda_pipeline(self, sampling_device: torch.device) -> None:
+        if (
+            self.pipeline is None
+            or not self.offload_cuda_pipeline_after_sampling
+            or sampling_device.type != "cuda"
+            or not torch.cuda.is_available()
+        ):
+            self.last_cuda_pipeline_offload = {
+                "performed": False,
+                "allocated_before_bytes": 0,
+                "peak_allocated_before_bytes": 0,
+                "allocated_after_bytes": 0,
+                "released_allocated_bytes": 0,
+            }
+            return
+        torch.cuda.synchronize(sampling_device)
+        allocated_before = int(torch.cuda.memory_allocated(sampling_device))
+        peak_allocated_before = int(
+            torch.cuda.max_memory_allocated(sampling_device)
+        )
+        self.pipeline.to(torch.device("cpu"))
+        self._pipeline_device = torch.device("cpu")
+        torch.cuda.synchronize(sampling_device)
+        allocated_after = int(torch.cuda.memory_allocated(sampling_device))
+        if allocated_after > allocated_before:
+            raise RuntimeError(
+                "offloading TRELLIS increased live CUDA allocation accounting"
+            )
+        self.last_cuda_pipeline_offload = {
+            "performed": True,
+            "allocated_before_bytes": allocated_before,
+            "peak_allocated_before_bytes": peak_allocated_before,
+            "allocated_after_bytes": allocated_after,
+            "released_allocated_bytes": allocated_before - allocated_after,
+        }
 
     def _release_inactive_cuda_cache(self, device: torch.device) -> None:
         if (

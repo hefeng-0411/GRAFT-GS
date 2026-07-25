@@ -45,11 +45,15 @@ class _MockTrellisPipeline:
         self.injection_count = 0
         self.active_injections = 0
         self.sample_count = 0
+        self.device_moves: list[torch.device] = []
+        self.conditioning_view_count = 0
 
     def to(self, device):
+        self.device_moves.append(torch.device(device))
         return self
 
     def get_cond(self, images: torch.Tensor) -> dict[str, torch.Tensor]:
+        self.conditioning_view_count = int(images.shape[0])
         return {
             "cond": torch.ones(images.shape[0], 1, 2),
             "neg_cond": torch.zeros(images.shape[0], 1, 2),
@@ -140,6 +144,85 @@ class _MockDecodedGridTrellisPipeline:
 
 
 class TrellisAdapterBoundaryTest(unittest.TestCase):
+    def test_hidden_prior_view_cap_is_deterministic_and_endpoint_covering(self) -> None:
+        pipeline = _MockTrellisPipeline()
+        adapter = TrellisPriorAdapter(
+            pipeline,
+            samples=1,
+            sampler_steps=1,
+            maximum_conditioning_views=4,
+        )
+        images = torch.arange(10, dtype=torch.float32).reshape(10, 1, 1, 1)
+        images = images.expand(-1, 3, 1, 1)
+        selected = adapter._select_conditioning_views(images)
+        torch.testing.assert_close(
+            selected[:, 0, 0, 0],
+            torch.tensor([0.0, 3.0, 6.0, 9.0]),
+            atol=0.0,
+            rtol=0.0,
+        )
+        self.assertEqual(adapter._select_conditioning_views(selected).shape[0], 4)
+        adapter.sample(torch.zeros(10, 3, 2, 2), seed=11)
+        self.assertEqual(pipeline.conditioning_view_count, 4)
+        self.assertEqual(
+            adapter.last_conditioning_view_count,
+            {"available": 10, "selected": 4},
+        )
+
+    def test_hidden_prior_view_cap_rejects_invalid_domains(self) -> None:
+        for value in (0, -1, True, 1.5, "16"):
+            with self.subTest(value=value), self.assertRaises(ValueError):
+                TrellisPriorAdapter(
+                    _MockTrellisPipeline(),
+                    maximum_conditioning_views=value,  # type: ignore[arg-type]
+                )
+
+    def test_frozen_pipeline_offload_releases_live_cuda_weight_allocation(self) -> None:
+        pipeline = _MockTrellisPipeline()
+        adapter = TrellisPriorAdapter(
+            pipeline,
+            samples=1,
+            sampler_steps=1,
+            offload_cuda_pipeline_after_sampling=True,
+        )
+        adapter._pipeline_device = torch.device("cuda", 0)
+        with (
+            mock.patch.object(torch.cuda, "is_available", return_value=True),
+            mock.patch.object(torch.cuda, "synchronize"),
+            mock.patch.object(
+                torch.cuda,
+                "memory_allocated",
+                side_effect=(45_000, 13_000),
+            ),
+            mock.patch.object(
+                torch.cuda,
+                "max_memory_allocated",
+                return_value=72_000,
+            ),
+        ):
+            adapter._offload_cuda_pipeline(torch.device("cuda", 0))
+        self.assertEqual(pipeline.device_moves[-1], torch.device("cpu"))
+        self.assertEqual(adapter._pipeline_device, torch.device("cpu"))
+        self.assertEqual(
+            adapter.last_cuda_pipeline_offload["released_allocated_bytes"],
+            32_000,
+        )
+        self.assertEqual(
+            adapter.last_cuda_pipeline_offload[
+                "peak_allocated_before_bytes"
+            ],
+            72_000,
+        )
+
+    def test_synchronized_proxy_cannot_execute_upstream_sampler(self) -> None:
+        adapter = TrellisPriorAdapter(
+            pipeline=None,
+            samples=1,
+            sampler_steps=1,
+        )
+        with self.assertRaisesRegex(RuntimeError, "designated distributed source"):
+            adapter.sample(torch.zeros(1, 3, 4, 4))
+
     def test_frozen_sampler_releases_only_inactive_cuda_allocator_blocks(self) -> None:
         adapter = TrellisPriorAdapter(
             _MockTrellisPipeline(),

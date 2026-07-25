@@ -151,6 +151,9 @@ class GraftGS(nn.Module):
         else:
             raise ValueError("renderer_backend must be 'cuda' or 'reference'")
         self.trellis_prior = trellis_prior
+        self.cuda_memory_stage_trace_enabled = False
+        self.reset_cuda_peak_after_frozen_prior = False
+        self.last_cuda_memory_stages: dict[str, dict[str, int | float]] = {}
 
     def forward(
         self,
@@ -180,6 +183,8 @@ class GraftGS(nn.Module):
             images = images.unsqueeze(0)
         if images.ndim != 5:
             raise ValueError("images must have shape [B,K,3,H,W]")
+        self.last_cuda_memory_stages = {}
+        self._record_cuda_memory_stage("input", images.device)
         precomputed_prior_measures: Optional[list[TrellisPriorMeasure]] = None
         if atlas_root_bounds is not None:
             atlas_root_bounds = atlas_root_bounds.to(
@@ -212,8 +217,18 @@ class GraftGS(nn.Module):
                                 int(trellis_prior_seed) + batch_index,
                             )
                         )
+                self._record_cuda_memory_stage("trellis_prefetch", images.device)
+                if (
+                    self.reset_cuda_peak_after_frozen_prior
+                    and images.device.type == "cuda"
+                ):
+                    # View-budget certification measures the differentiable
+                    # graph separately from the completed frozen prior
+                    # lifetime. The adapter records that prior peak first.
+                    torch.cuda.reset_peak_memory_stats(images.device)
         with record_function("graft_gs/vggt_geometry"):
             vggt_output = self.vggt(images)
+        self._record_cuda_memory_stage("vggt_geometry", images.device)
         if robustness is not None:
             vggt_output = self._perturb_geometry(vggt_output, robustness)
         camera_alignment = None
@@ -235,6 +250,7 @@ class GraftGS(nn.Module):
                 vggt_output.patch_features,
                 valid_mask=valid_mask,
             )
+        self._record_cuda_memory_stage("evidence_lift", images.device)
         if execution_stage == "evidence_calibration":
             if distributed_synchronizer is not None and hasattr(
                 distributed_synchronizer, "aggregate_evidence"
@@ -320,6 +336,10 @@ class GraftGS(nn.Module):
                 )
             if distributed_synchronizer is not None:
                 atlas = distributed_synchronizer.synchronize_atlas(atlas)
+            self._record_cuda_memory_stage(
+                f"scene_{batch_index}/atlas",
+                images.device,
+            )
             with record_function("graft_gs/sparse_uot_mapping"):
                 mapping = self._map_with_feature_fixed_point(atlas, evidence)
             for _ in range(self.config.refinement_rounds):
@@ -355,6 +375,10 @@ class GraftGS(nn.Module):
                     atlas = distributed_synchronizer.synchronize_atlas(atlas)
                 with record_function("graft_gs/sparse_uot_remap"):
                     mapping = self._map_with_feature_fixed_point(atlas, evidence)
+            self._record_cuda_memory_stage(
+                f"scene_{batch_index}/transport",
+                images.device,
+            )
             if distributed_synchronizer is not None and not getattr(
                 distributed_synchronizer, "maps_global_evidence", False
             ):
@@ -375,6 +399,10 @@ class GraftGS(nn.Module):
                     if encoder_activations is not None:
                         encoder_activations.append(fields)
                 mapping.latent = fields.pack()
+            self._record_cuda_memory_stage(
+                f"scene_{batch_index}/attention",
+                images.device,
+            )
             area = torch.pi * atlas.chart_radii[mapping.graph.atlas_node_index].square()
             observed_occupancy = -torch.expm1(-mapping.transported_mass / area.clamp_min(1.0e-8))
             occupancy = observed_occupancy
@@ -398,6 +426,10 @@ class GraftGS(nn.Module):
                 topology, initial, projector, initial_report = self._select_feasible_stratum(
                     atlas, mapping, topology, occupancy
                 )
+            self._record_cuda_memory_stage(
+                f"scene_{batch_index}/topology",
+                images.device,
+            )
             feasibility_reports = [initial_report]
             run_continuous_flow = self.config.run_flow and execution_stage in {
                 "flow_pretraining",
@@ -411,11 +443,19 @@ class GraftGS(nn.Module):
                 feasibility_reports.extend(integration_reports)
             else:
                 final = initial
+            self._record_cuda_memory_stage(
+                f"scene_{batch_index}/flow",
+                images.device,
+            )
             gaussians: Optional[GaussianAsset] = None
             mesh: Optional[MeshAsset] = None
             if execution_stage != "flow_pretraining":
                 with record_function("graft_gs/analytical_readout"):
                     gaussians, mesh = self.readout(atlas, final, mapping)
+            self._record_cuda_memory_stage(
+                f"scene_{batch_index}/readout",
+                images.device,
+            )
             render = None
             render_cameras = None
             if render_input_views:
@@ -448,6 +488,10 @@ class GraftGS(nn.Module):
                 render_cameras = camera
                 with record_function("graft_gs/gaussian_render"):
                     render = self.renderer(gaussians, camera)
+                self._record_cuda_memory_stage(
+                    f"scene_{batch_index}/render",
+                    images.device,
+                )
             scenes.append(
                 SceneOutput(
                     evidence=evidence,
@@ -491,6 +535,28 @@ class GraftGS(nn.Module):
             evidence_particles=particles,
             execution_stage=execution_stage,
         )
+
+    def _record_cuda_memory_stage(
+        self,
+        name: str,
+        device: torch.device,
+    ) -> None:
+        if not self.cuda_memory_stage_trace_enabled or device.type != "cuda":
+            return
+        free, total = torch.cuda.mem_get_info(device)
+        allocated = int(torch.cuda.memory_allocated(device))
+        reserved = int(torch.cuda.memory_reserved(device))
+        non_allocator_used = max(int(total - free - reserved), 0)
+        self.last_cuda_memory_stages[name] = {
+            "allocated_bytes": allocated,
+            "reserved_bytes": reserved,
+            "driver_free_bytes": int(free),
+            "non_allocator_used_bytes": non_allocator_used,
+            "allocated_fraction": float(allocated / total),
+            "reserved_fraction": float(reserved / total),
+            "driver_free_fraction": float(free / total),
+            "non_allocator_used_fraction": float(non_allocator_used / total),
+        }
 
     def _trellis_prior_measure(
         self,

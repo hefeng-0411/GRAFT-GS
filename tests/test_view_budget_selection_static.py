@@ -3,8 +3,11 @@
 from __future__ import annotations
 
 import importlib.util
+import os
 from pathlib import Path
+from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -26,6 +29,12 @@ def report(views: int, throughput: float, reserved: float) -> dict[str, object]:
     return {
         "world_size": 2,
         "losses": [2.0, 1.9],
+        "trellis_prior": {
+            "enabled": True,
+            "source_rank_only": True,
+            "offload_cuda_pipeline_after_sampling": True,
+            "maximum_conditioning_views": 16,
+        },
         "rank_performance": [
             {
                 "rank": rank,
@@ -37,6 +46,34 @@ def report(views: int, throughput: float, reserved: float) -> dict[str, object]:
                 "ending_reserved_fraction": reserved,
                 "ending_driver_free_fraction": 1.0 - reserved,
                 "trellis_cache_release_performed": 1.0 if rank == 0 else 0.0,
+                "trellis_pipeline_offload_performed": (
+                    1.0 if rank == 0 else 0.0
+                ),
+                "trellis_pipeline_peak_allocated_before_bytes": (
+                    1_000_000.0 if rank == 0 else 0.0
+                ),
+                "trellis_conditioning_views_available": (
+                    float(2 * views) if rank == 0 else 0.0
+                ),
+                "trellis_conditioning_views_selected": (
+                    float(min(16, 2 * views)) if rank == 0 else 0.0
+                ),
+                "cuda_stage_memory": {
+                    stage: {
+                        "allocated_fraction": max(reserved - 0.10, 0.0),
+                        "reserved_fraction": reserved,
+                        "driver_free_fraction": 1.0 - reserved,
+                        "non_allocator_used_fraction": 0.0,
+                    }
+                    for stage in (
+                        "input",
+                        "trellis_prefetch",
+                        "vggt_geometry",
+                        "evidence_lift",
+                        "trainer/before_backward",
+                        "trainer/after_backward",
+                    )
+                },
             }
             for rank in range(2)
         ],
@@ -77,7 +114,39 @@ def report(views: int, throughput: float, reserved: float) -> dict[str, object]:
 
 
 class ViewBudgetSelectionTest(unittest.TestCase):
-    def test_sweep_command_is_complete_and_oom_stops_larger_candidates(self) -> None:
+    def test_visible_cuda_inventory_is_json_typed_and_rank_checked(self) -> None:
+        payload = (
+            '[{"free_bytes": 79000000000, "free_fraction": 0.9875, '
+            '"logical_device": 0, "name": "NVIDIA A800", '
+            '"total_bytes": 80000000000}]'
+        )
+        with (
+            mock.patch.object(
+                SWEEP.subprocess,
+                "run",
+                return_value=SimpleNamespace(stdout=payload),
+            ),
+            mock.patch.dict(os.environ, {}, clear=True),
+        ):
+            inventory = SWEEP.visible_cuda_inventory("/pinned/python")
+        self.assertEqual(len(inventory), 1)
+        self.assertEqual(inventory[0]["logical_device"], 0)
+        with (
+            mock.patch.object(
+                SWEEP.subprocess,
+                "run",
+                return_value=SimpleNamespace(stdout=payload),
+            ),
+            mock.patch.dict(
+                os.environ,
+                {"GRAFT_GS_NPROC_PER_NODE": "2"},
+                clear=True,
+            ),
+            self.assertRaisesRegex(RuntimeError, "does not match"),
+        ):
+            SWEEP.visible_cuda_inventory("/pinned/python")
+
+    def test_sweep_command_is_complete_and_oom_detection_is_fail_closed(self) -> None:
         candidates = SWEEP.validate_candidates((16, 24, 32, 48, 64))
         self.assertEqual(candidates, (16, 24, 32, 48, 64))
         with self.assertRaisesRegex(ValueError, "strictly increasing"):
@@ -114,6 +183,11 @@ class ViewBudgetSelectionTest(unittest.TestCase):
             "--output",
         ):
             self.assertIn(option, command)
+        source = (ROOT / "scripts" / "sweep_a800_view_budget.py").read_text(
+            encoding="utf8"
+        )
+        self.assertIn("if oom and args.stop_after_oom:", source)
+        self.assertNotIn("if oom and not args.continue_after_oom:", source)
 
     def test_empty_constraint_family_positive_infinity_is_admissible(self) -> None:
         value = report(16, 10.0, 0.3)
@@ -185,6 +259,27 @@ class ViewBudgetSelectionTest(unittest.TestCase):
             candidate["reasons"],
         )
 
+    def test_rejects_missing_or_violated_trellis_memory_policy(self) -> None:
+        missing = report(16, 10.0, 0.3)
+        missing.pop("trellis_prior")
+        candidate = MODULE.audit_report(missing, 0.85)
+        self.assertFalse(candidate["admissible"])
+        self.assertTrue(
+            any("memory policy" in reason for reason in candidate["reasons"])
+        )
+        exceeded = report(16, 10.0, 0.3)
+        exceeded["rank_performance"][0][
+            "trellis_conditioning_views_selected"
+        ] = 17.0
+        candidate = MODULE.audit_report(exceeded, 0.85)
+        self.assertFalse(candidate["admissible"])
+        self.assertTrue(
+            any(
+                "conditioning-view counts" in reason
+                for reason in candidate["reasons"]
+            )
+        )
+
     def test_historical_peak_reserved_is_diagnostic_after_cache_release(self) -> None:
         value = report(24, 10.0, 0.4)
         value["rank_performance"][0]["peak_reserved_fraction"] = 0.99
@@ -197,6 +292,7 @@ class ViewBudgetSelectionTest(unittest.TestCase):
         invalid["rank_performance"][0]["peak_allocated_fraction"] = 0.95
         invalid["rank_performance"][0]["peak_active_fraction"] = 0.96
         invalid["rank_performance"][0]["trellis_cache_release_performed"] = 0.0
+        invalid["rank_performance"][0]["trellis_pipeline_offload_performed"] = 0.0
         candidate = MODULE.audit_report(
             invalid,
             0.85,
@@ -209,6 +305,9 @@ class ViewBudgetSelectionTest(unittest.TestCase):
         )
         self.assertTrue(
             any("live peak fraction" in reason for reason in candidate["reasons"])
+        )
+        self.assertTrue(
+            any("offload of frozen TRELLIS" in reason for reason in candidate["reasons"])
         )
 
     def test_rejects_stale_report_without_scalable_persistence_certificate(self) -> None:

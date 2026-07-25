@@ -90,6 +90,10 @@ def main() -> None:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size < 1:
         raise ValueError("WORLD_SIZE must be positive")
+    rank = int(os.environ.get("RANK", "0"))
+    synchronize_object_atlas = args.same_object_view_shards or bool(
+        distributed_config.get("synchronize_object_atlas", False)
+    )
     if args.minimum_global_object_batch is not None:
         if args.same_object_view_shards:
             raise ValueError(
@@ -136,22 +140,35 @@ def main() -> None:
     use_prior = bool(prior_config["enabled_after_phase_a"]) and phase is not TrainingPhase.EVIDENCE_CALIBRATION
     if use_prior:
         args.trellis_checkpoint = resolve_trellis_checkpoint(args.trellis_checkpoint)
-    prior = (
-        TrellisPriorAdapter.from_pretrained(
+    prior_kwargs = {
+        "samples": int(prior_config["samples"]),
+        "sampler_steps": int(prior_config["sampler_steps"]),
+        "strength": float(prior_config["strength"]),
+        "minimum_probability": float(prior_config["minimum_probability"]),
+        "uncertainty_discount": float(prior_config["uncertainty_discount"]),
+        "maximum_conditioning_views": prior_config[
+            "maximum_conditioning_views"
+        ],
+        "release_cuda_cache_after_sampling": bool(
+            prior_config["release_cuda_cache_after_sampling"]
+        ),
+        "offload_cuda_pipeline_after_sampling": bool(
+            prior_config["offload_cuda_pipeline_after_sampling"]
+        ),
+    }
+    owns_trellis_sampling = (
+        not synchronize_object_atlas or world_size == 1 or rank == 0
+    )
+    if use_prior and owns_trellis_sampling:
+        prior = TrellisPriorAdapter.from_pretrained(
             args.trellis_checkpoint,
-            samples=int(prior_config["samples"]),
-            sampler_steps=int(prior_config["sampler_steps"]),
-            strength=float(prior_config["strength"]),
-            minimum_probability=float(prior_config["minimum_probability"]),
-            uncertainty_discount=float(prior_config["uncertainty_discount"]),
-            release_cuda_cache_after_sampling=bool(
-                prior_config["release_cuda_cache_after_sampling"]
-            ),
+            **prior_kwargs,
             device=local_device,
         )
-        if use_prior
-        else None
-    )
+    elif use_prior:
+        prior = TrellisPriorAdapter(pipeline=None, **prior_kwargs)
+    else:
+        prior = None
     adapter = VGGTAdapter.from_pretrained(
         args.vggt_checkpoint,
         feature_dim=model_config.feature_dim,
@@ -266,8 +283,7 @@ def main() -> None:
                 training_config.get("topology_hardening_temperature", 0.1)
             ),
             output_directory=args.output,
-            synchronize_object_atlas=args.same_object_view_shards
-            or bool(distributed_config.get("synchronize_object_atlas", False)),
+            synchronize_object_atlas=synchronize_object_atlas,
             dataset_manifest=str(args.manifest.resolve()) if args.manifest is not None else None,
             dataset_manifest_sha256=manifest_digest,
             dataset_object_id_catalog=(

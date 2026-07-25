@@ -157,22 +157,37 @@ def main() -> None:
     if len(candidates) != 1:
         raise ValueError("select exactly one usable record with --object-id")
     sample = meshfleet_single_object_collate([dataset[candidates[0]]])
-    prior = (
-        TrellisPriorAdapter.from_pretrained(
+    prior_kwargs = {
+        "samples": int(prior_config["samples"]),
+        "sampler_steps": int(prior_config["sampler_steps"]),
+        "strength": float(prior_config["strength"]),
+        "minimum_probability": float(prior_config["minimum_probability"]),
+        "uncertainty_discount": float(prior_config["uncertainty_discount"]),
+        "maximum_conditioning_views": prior_config[
+            "maximum_conditioning_views"
+        ],
+        "release_cuda_cache_after_sampling": bool(
+            prior_config["release_cuda_cache_after_sampling"]
+        ),
+        "offload_cuda_pipeline_after_sampling": bool(
+            prior_config["offload_cuda_pipeline_after_sampling"]
+        ),
+    }
+    rank = int(os.environ.get("RANK", "0"))
+    owns_trellis_sampling = world_size == 1 or rank == 0
+    if use_prior and owns_trellis_sampling:
+        prior = TrellisPriorAdapter.from_pretrained(
             args.trellis_checkpoint,
-            samples=int(prior_config["samples"]),
-            sampler_steps=int(prior_config["sampler_steps"]),
-            strength=float(prior_config["strength"]),
-            minimum_probability=float(prior_config["minimum_probability"]),
-            uncertainty_discount=float(prior_config["uncertainty_discount"]),
-            release_cuda_cache_after_sampling=bool(
-                prior_config["release_cuda_cache_after_sampling"]
-            ),
+            **prior_kwargs,
             device=device,
         )
-        if use_prior
-        else None
-    )
+    elif use_prior:
+        # Same-object DDP broadcasts one frozen posterior measure. Non-source
+        # ranks need the analytical prior logic but must not load several
+        # gigabytes of checkpoint weights they are forbidden to execute.
+        prior = TrellisPriorAdapter(pipeline=None, **prior_kwargs)
+    else:
+        prior = None
     model = GraftGS(
         VGGTAdapter.from_pretrained(
             args.vggt_checkpoint,
@@ -182,6 +197,8 @@ def main() -> None:
         model_config,
         prior,
     )
+    model.cuda_memory_stage_trace_enabled = True
+    model.reset_cuda_peak_after_frozen_prior = True
     trainer = GraftGSTrainer(
         model,
         TrainerConfig(
@@ -268,6 +285,7 @@ def main() -> None:
         "ending_reserved_memory_bytes",
         "ending_inactive_reserved_memory_bytes",
         "ending_driver_free_memory_bytes",
+        "ending_non_allocator_cuda_memory_bytes",
         "device_memory_bytes",
         "peak_allocated_fraction",
         "peak_reserved_fraction",
@@ -276,9 +294,16 @@ def main() -> None:
         "ending_reserved_fraction",
         "ending_inactive_reserved_fraction",
         "ending_driver_free_fraction",
+        "ending_non_allocator_cuda_fraction",
         "trellis_cache_release_performed",
         "trellis_cache_released_reserved_bytes",
         "trellis_cache_reserved_after_bytes",
+        "trellis_pipeline_offload_performed",
+        "trellis_pipeline_released_allocated_bytes",
+        "trellis_pipeline_peak_allocated_before_bytes",
+        "trellis_pipeline_allocated_after_bytes",
+        "trellis_conditioning_views_available",
+        "trellis_conditioning_views_selected",
         "local_views",
         "local_views_per_second",
         "seconds",
@@ -296,6 +321,14 @@ def main() -> None:
         dist.all_gather(gathered_performance, local_performance)
     else:
         gathered_performance = [local_performance]
+    local_stage_memory = trainer.module.last_cuda_memory_stages
+    if trainer.context.distributed:
+        gathered_stage_memory: list[object] = [
+            None for _ in range(trainer.context.world_size)
+        ]
+        dist.all_gather_object(gathered_stage_memory, local_stage_memory)
+    else:
+        gathered_stage_memory = [local_stage_memory]
     rank_performance = [
         {
             "rank": rank,
@@ -304,6 +337,7 @@ def main() -> None:
                 name: float(value)
                 for name, value in zip(performance_fields, rank_value.cpu().tolist())
             },
+            "cuda_stage_memory": gathered_stage_memory[rank],
         }
         for rank, rank_value in enumerate(gathered_performance)
     ]
@@ -364,6 +398,16 @@ def main() -> None:
         "rendering": {
             "backend": trainer.module.config.renderer_backend,
             "checkpoint_views": trainer.config.renderer_checkpoint_views,
+        },
+        "trellis_prior": {
+            "enabled": use_prior,
+            "source_rank_only": bool(use_prior and trainer.context.world_size > 1),
+            "offload_cuda_pipeline_after_sampling": bool(
+                prior_config["offload_cuda_pipeline_after_sampling"]
+            ),
+            "maximum_conditioning_views": prior_config[
+                "maximum_conditioning_views"
+            ],
         },
         "transport": {
             "iterations": transport.iterations,

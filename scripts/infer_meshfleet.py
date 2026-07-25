@@ -144,8 +144,14 @@ def main() -> None:
             strength=float(prior_config["strength"]),
             minimum_probability=float(prior_config["minimum_probability"]),
             uncertainty_discount=float(prior_config["uncertainty_discount"]),
+            maximum_conditioning_views=prior_config[
+                "maximum_conditioning_views"
+            ],
             release_cuda_cache_after_sampling=bool(
                 prior_config["release_cuda_cache_after_sampling"]
+            ),
+            offload_cuda_pipeline_after_sampling=bool(
+                prior_config["offload_cuda_pipeline_after_sampling"]
             ),
             device=device,
         )

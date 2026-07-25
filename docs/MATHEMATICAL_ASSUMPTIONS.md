@@ -394,3 +394,24 @@
   are measured in `Gamma_64`. Many zero stored edges are permissible only when
   these quantities remain below explicit tolerances. This certificate does
   not assert that every individual edge remains representable in FP32.
+- TRELLIS is a frozen stochastic hidden-surface prior, not an observed
+  likelihood term. Its conditioning-view cap therefore changes the prior
+  approximation but does not remove any RGB, camera, depth, normal, surface,
+  or VGGT evidence term. The selected deterministic view order is assumed to
+  provide reasonable coverage of the producer's ordered multiview set; its
+  effect on posterior calibration must be ablated on the A800 corpus.
+- Host offload assumes the released TRELLIS pipeline's `.to(device)` operation
+  preserves parameter/buffer values exactly and that no hidden CUDA tensor is
+  required after sparse coordinates and the typed prior measure are
+  materialized. Runtime allocation accounting, exact cache identity, and
+  repeated-sample equality are the executable checks of this assumption.
+- `device_total - driver_free - torch_reserved` is reported as
+  non-allocator-visible usage. It may include CUDA contexts, native extension
+  allocations, or other processes; it is a diagnostic decomposition, not an
+  ownership proof. Initial free-memory preflight is required to exclude known
+  preexisting contention.
+- Differentiable-graph peak reset in the view-budget harness is valid only
+  after source-only TRELLIS sampling, host offload, typed prior broadcast, and
+  inactive-cache release have completed. The frozen prior peak is retained in
+  separate telemetry; neither value is represented as an end-to-end global
+  maximum.
