@@ -1078,3 +1078,21 @@ The full conditional validity domain is maintained in
   Local whole-tree compilation and the 31-test production static suite pass.
   The three new Torch tests and unresolved 32-view A800 gate remain
   server-pending.
+
+### Torch 2.4 analytical-pullback follow-up
+
+- The first deployed Cholesky repair moved the named failure from the shared
+  chart-writer boundary to `state_initialization.riemannian_metric`.
+  `state_initialization.metric_inverse` did not fire, proving that the
+  downstream spectral-box cotangent was finite and that the composed
+  Cholesky/triangular-solve backward alone created all 1,008 non-finite values.
+- `_SPDInverseCholesky` now uses the Cholesky/triangular solve only for the
+  forward SPD value and implements the exact Fréchet pullback
+  `-M^-1 sym(G) M^-1`. `_SPDInverseQuadraticTrace` applies the same pullback to
+  the normal quadratic and trace cotangents. This is the exact derivative, not
+  clipping, sanitization, a straight-through estimator, or a detached metric.
+- New tests reproduce the real `[112,3,3]` FP32 shape and approximately
+  `6e-8` output-cotangent scale, compare the pullback to its closed form, and
+  gradcheck both inverse and contraction operators in FP64. Local compilation
+  and all 76 executable static/environment/data/selection guards pass; Torch
+  numerical and 32-view production reruns remain server-pending.

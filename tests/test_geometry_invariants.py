@@ -390,6 +390,106 @@ class TopologyAndManifoldTest(unittest.TestCase):
         self.assertTrue(torch.all(torch.isfinite(matrix_gradient)))
         self.assertTrue(torch.all(torch.isfinite(vector_gradient)))
 
+    def test_spd_inverse_float32_112_chart_cotangent_is_finite(self) -> None:
+        count = 112
+        angle = torch.linspace(-0.7, 0.9, count, dtype=torch.float32)
+        cosine, sine = torch.cos(angle), torch.sin(angle)
+        zero, one = torch.zeros_like(angle), torch.ones_like(angle)
+        rotation = torch.stack(
+            (
+                torch.stack((cosine, -sine, zero), dim=-1),
+                torch.stack((sine, cosine, zero), dim=-1),
+                torch.stack((zero, zero, one), dim=-1),
+            ),
+            dim=-2,
+        )
+        eigenvalue = torch.stack(
+            (
+                torch.logspace(-5.0, -3.0, count, dtype=torch.float32),
+                torch.logspace(-1.0, 1.0, count, dtype=torch.float32),
+                torch.logspace(2.0, 4.0, count, dtype=torch.float32),
+            ),
+            dim=-1,
+        )
+        metric = (
+            rotation
+            @ torch.diag_embed(eigenvalue)
+            @ rotation.transpose(-1, -2)
+        ).requires_grad_(True)
+        inverse = spd_inverse_cholesky(metric)
+        output_cotangent = torch.linspace(
+            -6.0e-8,
+            6.0e-8,
+            count * 9,
+            dtype=torch.float32,
+        ).reshape(count, 3, 3)
+        gradient = torch.autograd.grad(
+            inverse,
+            metric,
+            grad_outputs=output_cotangent,
+        )[0]
+        expected = -inverse.detach() @ (
+            0.5
+            * (
+                output_cotangent
+                + output_cotangent.transpose(-1, -2)
+            )
+        ) @ inverse.detach()
+        self.assertTrue(torch.all(torch.isfinite(gradient)))
+        torch.testing.assert_close(gradient, expected, atol=2.0e-5, rtol=2.0e-5)
+
+    def test_spd_inverse_analytical_pullback_passes_gradcheck(self) -> None:
+        matrix = torch.tensor(
+            [
+                [2.0, 0.2, -0.1],
+                [0.2, 1.5, 0.15],
+                [-0.1, 0.15, 1.2],
+            ],
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        vector = torch.tensor(
+            [0.3, -0.4, 0.8],
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        self.assertTrue(
+            torch.autograd.gradcheck(
+                spd_inverse_cholesky,
+                (matrix,),
+                eps=1.0e-6,
+                atol=1.0e-6,
+                rtol=1.0e-5,
+            )
+        )
+        self.assertTrue(
+            torch.autograd.gradcheck(
+                spd_inverse_quadratic_trace,
+                (matrix, vector),
+                eps=1.0e-6,
+                atol=1.0e-6,
+                rtol=1.0e-5,
+            )
+        )
+        self.assertTrue(
+            torch.autograd.gradgradcheck(
+                spd_inverse_cholesky,
+                (matrix,),
+                eps=1.0e-6,
+                atol=2.0e-6,
+                rtol=2.0e-5,
+            )
+        )
+        self.assertTrue(
+            torch.autograd.gradgradcheck(
+                spd_inverse_quadratic_trace,
+                (matrix, vector),
+                eps=1.0e-6,
+                atol=2.0e-6,
+                rtol=2.0e-5,
+            )
+        )
+
     def test_persistence_critical_proposal_thresholds(self) -> None:
         diagrams = {
             0: torch.tensor([[0.1, 0.9]], dtype=torch.float64),

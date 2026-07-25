@@ -331,3 +331,8 @@ checkpoints, data, or a compiled server dependency.
   SPD-native product-metric and barrier paths. No claim of universally zero
   loss/error is supportable; exact finite/convergence/feasibility admission
   remains mandatory.
+- The first Cholesky deployment did not pass 32 views: it localized the
+  remaining failure to Torch's factorization backward. The analytical
+  pullback is implemented and locally syntax/static-validated, but its five
+  Torch numerical tests and second 32-view production attempt are external
+  pending work.

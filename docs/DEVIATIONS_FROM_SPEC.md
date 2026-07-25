@@ -339,3 +339,9 @@
   required normal quadratic form and inverse trace. This is algebraically
   exact, preserves the full anisotropic metric, and does not introduce jitter,
   diagonalization, learned covariance, or a stopped gradient.
+- Reverse-mode differentiation of that SPD inverse uses its closed-form
+  Fréchet pullback rather than Torch 2.4's composed factorization backward.
+  The first deployed Cholesky repair demonstrated non-finite backend
+  cotangents despite finite mathematical inputs. The replacement is an exact
+  derivative and is validated against finite differences/gradcheck; it is not
+  a custom approximation.

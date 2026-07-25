@@ -655,3 +655,22 @@ sweep's intentional OOM classifier was excluded from that contamination scan.
   retained-metric-gradient regression, anisotropic full-readout regression,
   and one 32-view Phase-B optimizer/asset gate. No post-repair 32-view,
   Phase-C/F, throughput, or quality pass is claimed.
+
+### Supplied first SPD-repair 32-view result
+
+- Executed remotely: the 32-view Phase-B backward again failed without OOM,
+  now at the newly inserted `state_initialization.riemannian_metric` boundary.
+  It reported 1,008 non-finite entries and maximum finite absolute cotangent
+  `5.653241e-08`.
+- Scientific localization: the adjacent
+  `state_initialization.metric_inverse` boundary remained silent. Therefore
+  spectral boxing and all losses supplied a finite inverse-matrix cotangent;
+  the Torch 2.4 composed Cholesky/triangular-solve backward generated the
+  invalid metric cotangent.
+- Post-follow-up local validation: whole-tree compilation passed and the
+  complete PyTorch-independent collection passed `76/76` in `6.572 s` with
+  one expected no-PyTorch loader skip.
+- Server-pending: five focused SPD/readout tests, including the exact
+  112-chart FP32 cotangent reproduction and FP64 gradcheck, followed by one
+  fresh 32-view optimizer/asset gate. No successful 32-view optimizer step is
+  claimed.

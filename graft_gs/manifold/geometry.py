@@ -119,23 +119,9 @@ def spectral_box_spd(matrix: Tensor, lower: float, upper: float) -> Tensor:
     )
 
 
-def spd_inverse_cholesky(matrix: Tensor) -> Tensor:
-    r"""Invert an SPD field through a scale-normalized Cholesky factor.
+def _spd_inverse_cholesky_value(matrix: Tensor) -> Tensor:
+    """Forward-only scale-normalized SPD inverse implementation."""
 
-    If ``M=s L L^T`` with a detached positive scalar scale ``s``, then
-
-    ``M^{-1}=s^{-1} L^{-T} L^{-1}``.
-
-    The detached normalization is algebraically cancelled in both the forward
-    value and its derivative, while keeping the Cholesky factor near unit
-    scale.  Triangular solves avoid the pivoted LU path used by
-    ``torch.linalg.inv`` and preserve matrix symmetry by construction.  This
-    routine deliberately does not add jitter: callers must provide an SPD
-    matrix and a failed Cholesky is a genuine invariant violation.
-    """
-
-    if matrix.ndim < 2 or matrix.shape[-1] != matrix.shape[-2]:
-        raise ValueError("SPD inverse requires square matrices")
     symmetric = 0.5 * (matrix + matrix.transpose(-1, -2))
     dimension = symmetric.shape[-1]
     scale = (
@@ -161,45 +147,151 @@ def spd_inverse_cholesky(matrix: Tensor) -> Tensor:
     return 0.5 * (inverse + inverse.transpose(-1, -2))
 
 
+class _SPDInverseCholesky(torch.autograd.Function):
+    """SPD inverse with the exact inverse-map pullback.
+
+    Torch 2.4's composed Cholesky/triangular-solve backward produced a
+    non-finite cotangent for a real 112-chart FP32 batch despite finite inputs,
+    output, and output cotangent.  The Fréchet derivative of the inverse is
+    available analytically and avoids differentiating the factorization:
+
+    ``D(M^-1)[H] = -M^-1 H M^-1``.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        matrix: Tensor,
+    ) -> Tensor:
+        inverse = _spd_inverse_cholesky_value(matrix)
+        # Saving the returned output, rather than an unrelated detached
+        # intermediate, also leaves the analytical pullback differentiable for
+        # higher-order consumers.
+        ctx.save_for_backward(inverse)
+        return inverse
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx,
+        gradient: Optional[Tensor],
+    ) -> tuple[Optional[Tensor]]:
+        if gradient is None:
+            return (None,)
+        (inverse,) = ctx.saved_tensors
+        symmetric_gradient = 0.5 * (
+            gradient + gradient.transpose(-1, -2)
+        )
+        matrix_gradient = -inverse @ symmetric_gradient @ inverse
+        return (
+            0.5
+            * (matrix_gradient + matrix_gradient.transpose(-1, -2)),
+        )
+
+
+def spd_inverse_cholesky(matrix: Tensor) -> Tensor:
+    r"""Invert an SPD field through a scale-normalized Cholesky factor.
+
+    If ``M=s L L^T`` with a detached positive scalar scale ``s``, then
+
+    ``M^{-1}=s^{-1} L^{-T} L^{-1}``.
+
+    The detached normalization is algebraically cancelled in both the forward
+    value and its derivative, while keeping the Cholesky factor near unit
+    scale.  Triangular solves avoid the pivoted LU path used by
+    ``torch.linalg.inv`` and preserve matrix symmetry by construction.  This
+    routine deliberately does not add jitter: callers must provide an SPD
+    matrix and a failed Cholesky is a genuine invariant violation.
+    """
+
+    if matrix.ndim < 2 or matrix.shape[-1] != matrix.shape[-2]:
+        raise ValueError("SPD inverse requires square matrices")
+    return _SPDInverseCholesky.apply(matrix)
+
+
+class _SPDInverseQuadraticTrace(torch.autograd.Function):
+    """Exact pullback for inverse quadratic-form and trace contractions."""
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        matrix: Tensor,
+        vector: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        inverse = _spd_inverse_cholesky_value(matrix)
+        solution = torch.einsum("...ij,...j->...i", inverse, vector)
+        quadratic = torch.sum(vector * solution, dim=-1)
+        inverse_trace = inverse.diagonal(dim1=-2, dim2=-1).sum(-1)
+        ctx.save_for_backward(inverse, vector)
+        # Returning the inverse as an auxiliary differentiable output lets the
+        # backward use an output connected to this custom operation; the public
+        # wrapper discards it.
+        return quadratic, inverse_trace, inverse
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx,
+        quadratic_gradient: Optional[Tensor],
+        trace_gradient: Optional[Tensor],
+        inverse_gradient: Optional[Tensor],
+    ) -> tuple[Tensor, Tensor]:
+        inverse, vector = ctx.saved_tensors
+        leading_shape = inverse.shape[:-2]
+        if quadratic_gradient is None:
+            quadratic_gradient = inverse.new_zeros(leading_shape)
+        if trace_gradient is None:
+            trace_gradient = inverse.new_zeros(leading_shape)
+        if inverse_gradient is None:
+            inverse_gradient = torch.zeros_like(inverse)
+        identity = torch.eye(
+            inverse.shape[-1],
+            dtype=inverse.dtype,
+            device=inverse.device,
+        ).expand_as(inverse)
+        vector_outer = vector[..., :, None] * vector[..., None, :]
+        inverse_cotangent = (
+            inverse_gradient
+            + quadratic_gradient[..., None, None] * vector_outer
+            + trace_gradient[..., None, None] * identity
+        )
+        inverse_cotangent = 0.5 * (
+            inverse_cotangent + inverse_cotangent.transpose(-1, -2)
+        )
+        matrix_gradient = -inverse @ inverse_cotangent @ inverse
+        solution = torch.einsum("...ij,...j->...i", inverse, vector)
+        vector_gradient = (
+            2.0 * quadratic_gradient[..., None] * solution
+        )
+        return (
+            0.5
+            * (matrix_gradient + matrix_gradient.transpose(-1, -2)),
+            vector_gradient,
+        )
+
+
 def spd_inverse_quadratic_trace(
     matrix: Tensor,
     vector: Tensor,
 ) -> tuple[Tensor, Tensor]:
-    r"""Evaluate ``v^T M^{-1} v`` and ``tr(M^{-1})`` without forming an inverse.
+    r"""Evaluate ``v^T M^{-1} v`` and ``tr(M^{-1})`` on the SPD domain.
 
     For ``M=s L L^T``, the two requested contractions are
 
     ``||L^{-1}v||^2/s`` and ``||L^{-1}||_F^2/s``.
 
-    The shared triangular solve is an exact SPD-native realization of the
-    uncertainty contractions used by analytical Gaussian readout.
+    The forward factorization is scale normalized and the reverse pass uses
+    the exact inverse-map pullback, rather than differentiating the
+    factorization. This is the SPD-native realization used by analytical
+    Gaussian readout.
     """
 
     if matrix.ndim < 2 or matrix.shape[-1] != matrix.shape[-2]:
         raise ValueError("SPD contractions require square matrices")
     if vector.shape != matrix.shape[:-1]:
         raise ValueError("SPD contraction vector must have shape [...,D]")
-    symmetric = 0.5 * (matrix + matrix.transpose(-1, -2))
-    dimension = symmetric.shape[-1]
-    scale = (
-        symmetric.diagonal(dim1=-2, dim2=-1)
-        .abs()
-        .amax(dim=-1)
-        .detach()
-        .clamp_min(torch.finfo(symmetric.dtype).tiny)
+    quadratic, inverse_trace, _ = _SPDInverseQuadraticTrace.apply(
+        matrix,
+        vector,
     )
-    factor = torch.linalg.cholesky(symmetric / scale[..., None, None])
-    identity = torch.eye(
-        dimension, dtype=matrix.dtype, device=matrix.device
-    ).expand_as(symmetric)
-    right_hand_side = torch.cat((vector[..., None], identity), dim=-1)
-    solved = torch.linalg.solve_triangular(
-        factor,
-        right_hand_side,
-        upper=False,
-    )
-    quadratic = solved[..., 0].square().sum(dim=-1) / scale
-    inverse_trace = solved[..., 1:].square().sum(dim=(-2, -1)) / scale
     return quadratic, inverse_trace
 
 

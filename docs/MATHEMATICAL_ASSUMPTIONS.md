@@ -468,7 +468,9 @@
   graph. For fixed positive `s`, differentiating
   `s^-1 (M/s)^-1` gives exactly the derivative of `M^-1`; the detach therefore
   removes no mathematical matrix derivative.
-- Cholesky/triangular solves improve factorization stability but cannot make a
-  legitimately unbounded inverse-metric gradient finite. Finite cotangents,
-  positive metric eigenvalues, and the 32-view production backward remain
-  executable validation requirements.
+- Cholesky/triangular solves compute the forward inverse. Its reverse-mode
+  derivative is the exact symmetric Fréchet pullback
+  `-M^-1 sym(G) M^-1`, avoiding dependence on the Torch factorization
+  backward. This cannot make a legitimately unbounded mathematical gradient
+  finite; positive metric eigenvalues and the 32-view production backward
+  remain executable validation requirements.

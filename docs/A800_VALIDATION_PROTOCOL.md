@@ -654,15 +654,22 @@ and the subsequent 24-view gate completed an optimizer step, final checkpoint,
 PLY, and GLB. The 32-view gate then localized its failure to the full
 `[112,3,3]` chart-metric cotangent. Do not repeat the passed 24-view run.
 
-Validate the SPD-native repair with the three regressions that were absent
-from the earlier suite:
+The first post-Cholesky 32-view run narrowed the defect further:
+`state_initialization.metric_inverse` received a finite cotangent, while the
+composed Torch 2.4 factorization backward delivered 1,008 non-finite values to
+`state_initialization.riemannian_metric`. The production inverse now uses the
+exact analytical inverse-map pullback instead of differentiating the
+factorization. Validate it with the focused regressions:
 
 ```bash
+mkdir -p outputs/validation
 "$GRAFT_GS_PYTHON" -m unittest -v \
   tests.test_geometry_invariants.TopologyAndManifoldTest.test_spd_cholesky_inverse_contractions_are_exact_and_finite \
+  tests.test_geometry_invariants.TopologyAndManifoldTest.test_spd_inverse_float32_112_chart_cotangent_is_finite \
+  tests.test_geometry_invariants.TopologyAndManifoldTest.test_spd_inverse_analytical_pullback_passes_gradcheck \
   tests.test_assets_and_vertical_slice.AnalyticalAssetTest.test_flat_chart_analytical_readout_backward_is_finite \
   tests.test_assets_and_vertical_slice.AnalyticalAssetTest.test_anisotropic_metric_readout_backward_is_finite \
-  2>&1 | tee outputs/validation/spd_metric_readout_numerics.log
+  2>&1 | tee outputs/validation/spd_analytical_pullback_numerics.log
 ```
 
 Then rerun only the unresolved 32-view boundary:

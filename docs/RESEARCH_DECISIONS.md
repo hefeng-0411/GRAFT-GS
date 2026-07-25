@@ -143,12 +143,13 @@ analytical readout, supervision set, or output geometry.
 
 | Problem | Candidates considered | Selected method | Rejected alternatives and reason |
 |---|---|---|---|
-| Invert the chart-written SPD metric during state initialization | Pivoted generic inverse; eigen inverse; Cholesky inverse; scale-normalized triangular factors | Detached-scale-normalized Cholesky followed by triangular solve and `L^-T L^-1` | Generic LU ignores the known SPD domain and produced the high-view failure boundary. Eigen inversion introduces an unnecessary eigenvector derivative at repeated spectra. Jitter changes the declared metric and can hide an invariant violation. |
-| Propagate evidence uncertainty into analytical Gaussian thickness | Materialize `M^-1`; diagonal approximation; stop-gradient uncertainty; learn thickness; exact contractions | Compute `n^T M^-1 n=||L^-1 n||^2` and `tr(M^-1)=||L^-1||_F^2` directly from one factor/solve | A full inverse is unused except for these contractions. A diagonal approximation breaks SE(3) covariance. Detaching removes calibration gradients. Learned thickness violates analytical readout. |
+| Invert the chart-written SPD metric during state initialization | Pivoted generic inverse; eigen inverse; composed Cholesky autograd; scale-normalized forward with analytical inverse pullback | Detached-scale-normalized Cholesky/triangular forward and exact `-M^-1 sym(G) M^-1` backward | Generic LU ignores the known SPD domain. The first Cholesky repair proved that Torch 2.4's composed factorization backward can still return NaNs for a finite real 112-chart cotangent. Eigen inversion introduces an unnecessary eigenvector derivative. Jitter changes the metric. |
+| Propagate evidence uncertainty into analytical Gaussian thickness | Materialize a generic inverse; diagonal approximation; stop-gradient uncertainty; learn thickness; exact contractions | Evaluate the exact normal quadratic and inverse trace with the same analytical inverse-map pullback | A diagonal approximation breaks SE(3) covariance. Detaching removes calibration gradients. Learned thickness violates analytical readout. The custom pullback is the exact Fréchet derivative, not an estimator. |
 | Reuse across manifold/barrier paths | Repair Phase B only; retain LU elsewhere; use the same SPD primitive | Use the same factorization for covariance product metrics and evidence-metric barrier duals | Leaving Phase C/F on the invalidated numerical family would defer the same defect. Complexity remains constant per 3x3 node and hard constraints are unchanged. |
 
-The selected operations are exact for SPD inputs, preserve first-order
-differentiability, and fail if Cholesky detects a true SPD invariant violation.
+The selected operations are exact for SPD inputs, use an explicit
+first-derivative formula (with FP64 gradcheck coverage), and fail if Cholesky
+detects a true SPD invariant violation.
 The scale is detached because it cancels algebraically; this removes a
 nonsmooth max-scale derivative without changing the derivative with respect to
 the matrix.

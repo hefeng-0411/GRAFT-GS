@@ -443,6 +443,13 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertNotIn("torch.linalg.inv(continuous_metric)", readout)
         self.assertIn("spd_inverse_quadratic_trace(continuous_metric, normal)", readout)
         self.assertIn('"analytical_readout.continuous_metric"', readout)
+        geometry = source("graft_gs/manifold/geometry.py")
+        self.assertIn("class _SPDInverseCholesky", geometry)
+        self.assertIn(
+            "matrix_gradient = -inverse @ symmetric_gradient @ inverse",
+            geometry,
+        )
+        self.assertIn("class _SPDInverseQuadraticTrace", geometry)
         self.assertIn("spd_inverse_cholesky(metric)", pipeline)
         self.assertIn('"state_initialization.riemannian_metric"', pipeline)
         self.assertIn("spectral_box_spd(covariance_raw", pipeline)
