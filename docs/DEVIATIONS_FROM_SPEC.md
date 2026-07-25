@@ -309,3 +309,18 @@
   Fresh processes now evaluate all requested candidates unless the operator
   explicitly selects a diagnostic early stop. Admission remains fail-closed
   on numerical, feasibility, driver-headroom, and allocator-state certificates.
+# 2026-07-25 numerical boundary deviations
+
+- The specification's reliability geometric mean is evaluated exactly away
+  from zero but receives an endpoint-preserving Charbonnier continuation at
+  the zero-mass stratum. This is required because the literal derivative is
+  singular and produced a real A800 backward failure. The forward endpoints,
+  monotonic uncertainty ordering, gauge invariance, and SE(3) invariance are
+  preserved.
+- The barrier QP mathematics is unchanged, but its Jacobian/Gram representation
+  is sparse and matrix-free rather than dense. This strengthens scalability;
+  it does not weaken hard nonlinear backtracking or FP64 recertification.
+- The Phase-B concurrency executable no longer runs continuous flow during its
+  final export measurement. It still performs topology selection, analytical
+  readout, rendering, and shared-atlas asset export. Full flow validation
+  belongs to Phase C/D and must be measured separately.

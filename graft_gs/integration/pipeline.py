@@ -732,8 +732,24 @@ class GraftGS(nn.Module):
         edge_ot_cost = 0.5 * (
             node_cost[edge_source] + node_cost[edge_target]
         )
-        edge_uncertainty = 1.0 - torch.sqrt(
-            (reliability[edge_source] * reliability[edge_target]).clamp_min(0.0)
+        reliability_product = (
+            reliability[edge_source] * reliability[edge_target]
+        ).clamp(0.0, 1.0)
+        # The raw geometric mean sqrt(r_i r_j) has an undefined composed
+        # derivative at zero: d sqrt(x)/dx is infinite while d(r_i r_j) can be
+        # zero, producing NaN in otherwise valid empty-observation charts.
+        # This endpoint-preserving Charbonnier continuation maps 0 -> 0 and
+        # 1 -> 1 while bounding the derivative by O(1/sqrt(machine epsilon)).
+        smooth = reliability_product.new_tensor(
+            torch.finfo(reliability_product.dtype).eps**0.5
+        )
+        normalizer = torch.sqrt(1.0 + smooth.square()) - smooth
+        geometric_reliability = (
+            torch.sqrt(reliability_product + smooth.square()) - smooth
+        ) / normalizer
+        edge_uncertainty = 1.0 - geometric_reliability.clamp(
+            0.0,
+            1.0,
         )
         return edge_ot_cost, edge_uncertainty
 

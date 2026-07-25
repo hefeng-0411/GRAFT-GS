@@ -283,3 +283,18 @@ checkpoints, data, or a compiled server dependency.
   VRAM occupancy alone, determines whether 16 remains the production value.
 - No post-repair A800 optimizer step, throughput, memory reduction, selected
   view budget, or quality improvement has yet been demonstrated.
+# 2026-07-25 server-only validation after offload-v4 repair
+
+- External: the local drafting interpreter has no PyTorch/CUDA/TRELLIS/VGGT,
+  so the new sparse-vs-dense barrier equivalence, zero-reliability backward,
+  implicit-UOT cotangent gate, and offline DINOv2 cache tests have not executed
+  here. Run the focused command in `A800_VALIDATION_PROTOCOL.md`.
+- External: rerun a fresh view sweep; schema-v5 intentionally rejects all old
+  reports that lack `evaluation_execution_stage=atlas_autoencoding`. Verify
+  vpr-8 backward, vpr-12 offline construction, and vpr-24 terminal export.
+- External: Phase-C/D full-flow profiling must demonstrate linear barrier
+  memory and positive recertified margins on a real refined atlas. A Phase-B
+  sweep no longer executes flow and therefore cannot validate this requirement.
+- No claim of zero loss or universally error-free training is supportable.
+  Admission remains fail-closed on finite gradients, converged UOT, positive
+  feasibility margins, deterministic assets, and explicit A800 memory limits.

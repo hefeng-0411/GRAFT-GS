@@ -364,8 +364,11 @@ def main() -> None:
         1, evaluation_index
     )
     evaluation_intrinsics = sample["intrinsics"].index_select(1, evaluation_index)
-    # Full GRAFT-GS evaluation includes barrier JVP/Jacobian checks. Keep the
-    # ordinary graph disabled while allowing those local certified derivatives.
+    # This executable trains Phase B.  Its terminal quality/memory measurement
+    # must use the same phase boundary: executing Phase-D flow here both
+    # invalidates the concurrency comparison and retains a barrier graph that
+    # Phase B never trained.  Analytical readout/rendering remain active at the
+    # atlas-autoencoding stage.
     with torch.no_grad():
         output = trainer.module(
             evaluation_images.to(device),
@@ -374,6 +377,7 @@ def main() -> None:
             ground_truth_extrinsics=evaluation_extrinsics.to(device),
             ground_truth_intrinsics=evaluation_intrinsics.to(device),
             atlas_root_bounds=sample["atlas_root_bounds"].to(device),
+            execution_stage="atlas_autoencoding",
             trellis_prior_seed=trainer._trellis_prior_seed(sample),
         )
     scene = output.scenes[0]
@@ -389,6 +393,7 @@ def main() -> None:
         "world_size": trainer.context.world_size,
         "global_training_views": maximum_views,
         "evaluation_views": evaluation_view_count,
+        "evaluation_execution_stage": output.execution_stage,
         "rank_performance": rank_performance,
         "mesh_supervision": {
             "derive_depth_normals": trainer.config.derive_mesh_depth_normals,

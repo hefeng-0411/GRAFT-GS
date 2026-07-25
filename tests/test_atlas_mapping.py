@@ -418,6 +418,32 @@ class PersistentAtlasTest(unittest.TestCase):
             float(operator.cost_model.raw_lambda_visibility.grad.abs()), 0.0
         )
 
+    def test_attention_uncertainty_has_finite_zero_reliability_gradient(self) -> None:
+        evidence = _surface_evidence()
+        atlas = PersistentOctreeAtlas.from_evidence(
+            evidence.positions,
+            evidence.mass,
+            AtlasConfig(base_level=1, max_level=2),
+        )
+        operator = ManifoldMappingOperator(
+            evidence.features.shape[-1],
+            ManifoldMappingConfig(support_radius_factor=4.0),
+        ).double()
+        mapping = operator(atlas, evidence)
+        reliability = torch.ones(
+            mapping.graph.source_count,
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        reliability = reliability.clone()
+        reliability[0] = 0.0
+        reliability.retain_grad()
+        mapping.observation_reliability = reliability
+        _, uncertainty = GraftGS._attention_edge_evidence(atlas, mapping)
+        uncertainty.sum().backward()
+        self.assertIsNotNone(reliability.grad)
+        self.assertTrue(torch.all(torch.isfinite(reliability.grad)))
+
 
 class ImplicitSinkhornTest(unittest.TestCase):
     def test_float32_storage_underflow_uses_log_domain_float64_reference(self) -> None:
@@ -454,6 +480,28 @@ class ImplicitSinkhornTest(unittest.TestCase):
         plan.sum().backward()
         self.assertIsNotNone(cost.grad)
         self.assertTrue(torch.all(torch.isfinite(cost.grad)))
+
+    def test_adjoint_rejects_nonfinite_positive_mass_cotangent(self) -> None:
+        edge = torch.tensor([[0, 1], [0, 1]], dtype=torch.int64)
+        cost = torch.tensor(
+            [0.0, 200.0], dtype=torch.float32, requires_grad=True
+        )
+        mass = torch.tensor([0.5, 0.5], dtype=torch.float32)
+        solver = ImplicitUnbalancedSinkhorn(
+            ImplicitSinkhornConfig(
+                max_iterations=1000,
+                tolerance=1.0e-10,
+                backward_max_iterations=1000,
+                backward_tolerance=1.0e-10,
+                solve_in_float64=True,
+            )
+        )
+        plan, _ = solver(cost, mass, mass, edge)
+        with self.assertRaisesRegex(
+            FloatingPointError,
+            "non-finite upstream plan",
+        ):
+            plan.backward(torch.tensor([torch.inf, 0.0]))
 
     def test_solver_rejects_invalid_measure_and_nonconvergence(self) -> None:
         dtype = torch.float64

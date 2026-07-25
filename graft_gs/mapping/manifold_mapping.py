@@ -579,7 +579,12 @@ class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
                 f"minimum_log_plan={minimum_log_plan:.6e}, dtype={input_dtype}"
             )
         ctx.save_for_backward(
-            plan, row_probability, col_probability, source, target
+            plan,
+            row_probability,
+            col_probability,
+            source,
+            target,
+            storage_plan,
         )
         ctx.input_dtype = input_dtype
         ctx.source_count = log_source_mass.numel()
@@ -632,7 +637,35 @@ class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
         del grad_log_u, grad_log_v, grad_status
         if grad_plan is None:
             return (None,) * 15
-        plan, row_probability, col_probability, source, target = ctx.saved_tensors
+        (
+            plan,
+            row_probability,
+            col_probability,
+            source,
+            target,
+            storage_plan,
+        ) = ctx.saved_tensors
+        incoming_finite = torch.isfinite(grad_plan)
+        if not bool(torch.all(incoming_finite)):
+            invalid_significant = (~incoming_finite) & (storage_plan != 0)
+            invalid_count = int(torch.count_nonzero(~incoming_finite).item())
+            significant_count = int(
+                torch.count_nonzero(invalid_significant).item()
+            )
+            finite_value = grad_plan[incoming_finite]
+            maximum_finite = (
+                float(finite_value.abs().amax().detach().cpu())
+                if finite_value.numel()
+                else float("nan")
+            )
+            raise FloatingPointError(
+                "implicit Sinkhorn received a non-finite upstream plan "
+                "cotangent; no NaN/Inf replacement is permitted: "
+                f"nonfinite_edges={invalid_count}, "
+                f"positive_mass_edges={significant_count}, "
+                f"storage_underflow_edges={invalid_count - significant_count}, "
+                f"maximum_finite_abs={maximum_finite:.6e}"
+            )
         grad_plan = grad_plan.to(dtype=plan.dtype)
         weighted_gradient = grad_plan * plan
         source_count = ctx.source_count
@@ -709,7 +742,24 @@ class _ImplicitUnbalancedSinkhorn(torch.autograd.Function):
             & torch.all(torch.isfinite(grad_log_target))
         )
         if not bool(gradients_finite):
-            raise FloatingPointError("implicit Sinkhorn adjoint produced non-finite gradients")
+            raise FloatingPointError(
+                "implicit Sinkhorn adjoint produced non-finite gradients from "
+                "a finite upstream cotangent"
+            )
+        input_limit = torch.finfo(ctx.input_dtype).max
+        maximum_gradient = torch.stack(
+            (
+                grad_cost.abs().amax(),
+                grad_log_source.abs().amax(),
+                grad_log_target.abs().amax(),
+            )
+        ).amax()
+        if bool(maximum_gradient > input_limit):
+            raise FloatingPointError(
+                "implicit Sinkhorn adjoint exceeds the input gradient dtype "
+                f"range: maximum_abs={float(maximum_gradient.detach().cpu()):.6e}, "
+                f"dtype={ctx.input_dtype}"
+            )
         return (
             grad_cost.to(dtype=ctx.input_dtype),
             grad_log_source.to(dtype=ctx.input_dtype),

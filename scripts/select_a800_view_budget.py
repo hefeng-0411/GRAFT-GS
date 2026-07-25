@@ -61,6 +61,11 @@ def audit_report(
     """Return a normalized candidate record with explicit rejection reasons."""
 
     reasons: list[str] = []
+    if report.get("evaluation_execution_stage") != "atlas_autoencoding":
+        reasons.append(
+            "view-budget evaluation did not stop at the Phase-B "
+            "atlas-autoencoding boundary"
+        )
     world_size = int(report.get("world_size", 0))
     rank_rows = report.get("rank_performance")
     if world_size < 1:
@@ -553,7 +558,7 @@ def main() -> None:
         selected = None
         selection_error = str(error)
     output = {
-        "schema": "graft-gs-a800-view-selection-v4",
+        "schema": "graft-gs-a800-view-selection-v5",
         "maximum_reserved_fraction": args.maximum_reserved_fraction,
         "maximum_allocated_fraction": args.maximum_allocated_fraction,
         "minimum_driver_free_fraction": args.minimum_driver_free_fraction,

@@ -267,6 +267,286 @@ class BarrierProjector:
         triangle_separation = self._triangle_separation_margin(position)
         return torch.cat((area, orientation, separation, triangle_separation))
 
+    def _sparse_position_linearization(
+        self,
+        position: Tensor,
+        diagnostics: bool = False,
+    ) -> Tuple[Tensor, Tensor, Tensor]:
+        r"""Return values and an exact six-vertex sparse constraint Jacobian.
+
+        Every constraint family is local: area/orientation touches one triangle,
+        vertex separation touches two vertices, and triangle separation touches
+        two disjoint triangles.  If ``S[j,k]`` is the global vertex for local
+        slot ``k``, the returned derivative is
+
+        ``gradient[j,k] = d constraint[j] / d position[S[j,k]]``.
+
+        Computing the derivative of the *sum* of a batched local family with
+        respect to its gathered local coordinates yields every row derivative
+        independently; no dense ``[J,V,3]`` autograd Jacobian is constructed.
+        The closest-feature branch of triangle distance has the same piecewise
+        differentiability contract as :meth:`position_constraints`.
+        """
+
+        build_higher_order_graph = torch.is_grad_enabled()
+        with torch.enable_grad():
+            working = (
+                position
+                if position.requires_grad
+                else position.detach().requires_grad_(True)
+            )
+            reference_normal = (
+                self.reference_face_normal_diagnostics
+                if diagnostics
+                else self.reference_face_normal
+            ).to(device=working.device, dtype=working.dtype)
+
+            values: List[Tensor] = []
+            supports: List[Tensor] = []
+            gradients: List[Tensor] = []
+
+            face_vertex = working[self.faces]
+            if face_vertex.shape[0]:
+                cross = torch.linalg.cross(
+                    face_vertex[:, 1] - face_vertex[:, 0],
+                    face_vertex[:, 2] - face_vertex[:, 0],
+                    dim=-1,
+                )
+                double_area = torch.linalg.vector_norm(cross, dim=-1)
+                normal = cross / double_area[:, None].clamp_min(
+                    torch.finfo(working.dtype).eps
+                )
+                area = 0.5 * double_area - self.config.minimum_face_area
+                orientation = (
+                    torch.sum(normal * reference_normal, dim=-1)
+                    - self.config.minimum_orientation_cosine
+                )
+                area_gradient = torch.autograd.grad(
+                    area.sum(),
+                    face_vertex,
+                    retain_graph=True,
+                    create_graph=build_higher_order_graph,
+                )[0]
+                orientation_gradient = torch.autograd.grad(
+                    orientation.sum(),
+                    face_vertex,
+                    retain_graph=True,
+                    create_graph=build_higher_order_graph,
+                )[0]
+                padded_support = self.faces.new_zeros((self.faces.shape[0], 6))
+                padded_support[:, :3] = self.faces
+                padded_area_gradient = working.new_zeros(
+                    (self.faces.shape[0], 6, 3)
+                )
+                padded_orientation_gradient = torch.zeros_like(
+                    padded_area_gradient
+                )
+                padded_area_gradient[:, :3] = area_gradient
+                padded_orientation_gradient[:, :3] = orientation_gradient
+                values.extend((area, orientation))
+                supports.extend((padded_support, padded_support))
+                gradients.extend(
+                    (padded_area_gradient, padded_orientation_gradient)
+                )
+
+            pair_vertex = working[self.nonlocal_pairs]
+            if pair_vertex.shape[0]:
+                delta = pair_vertex[:, 0] - pair_vertex[:, 1]
+                separation = (
+                    delta.square().sum(-1)
+                    - self.config.minimum_separation**2
+                )
+                separation_gradient = torch.autograd.grad(
+                    separation.sum(),
+                    pair_vertex,
+                    retain_graph=True,
+                    create_graph=build_higher_order_graph,
+                )[0]
+                padded_support = self.nonlocal_pairs.new_zeros(
+                    (self.nonlocal_pairs.shape[0], 6)
+                )
+                padded_support[:, :2] = self.nonlocal_pairs
+                padded_gradient = working.new_zeros(
+                    (self.nonlocal_pairs.shape[0], 6, 3)
+                )
+                padded_gradient[:, :2] = separation_gradient
+                values.append(separation)
+                supports.append(padded_support)
+                gradients.append(padded_gradient)
+
+            face_pair_support = self.faces[self.nonlocal_face_pairs].reshape(
+                -1, 6
+            )
+            face_pair_vertex = working[face_pair_support]
+            if face_pair_vertex.shape[0]:
+                left = face_pair_vertex[:, :3]
+                right = face_pair_vertex[:, 3:]
+                triangle_separation = (
+                    triangle_distance_squared(left, right)
+                    - self.config.minimum_separation**2
+                )
+                triangle_gradient = torch.autograd.grad(
+                    triangle_separation.sum(),
+                    face_pair_vertex,
+                    retain_graph=build_higher_order_graph,
+                    create_graph=build_higher_order_graph,
+                )[0]
+                values.append(triangle_separation)
+                supports.append(face_pair_support)
+                gradients.append(triangle_gradient)
+
+            if not values:
+                return (
+                    working.new_empty(0),
+                    self.faces.new_empty((0, 6)),
+                    working.new_empty((0, 6, 3)),
+                )
+            constraint = torch.cat(values)
+            support = torch.cat(supports)
+            gradient = torch.cat(gradients)
+        if not build_higher_order_graph:
+            constraint = constraint.detach()
+            gradient = gradient.detach()
+        return constraint, support, gradient
+
+    @staticmethod
+    def _sparse_constraint_transpose(
+        gradient: Tensor,
+        support: Tensor,
+        dual: Tensor,
+        metric_inverse: Tensor,
+    ) -> Tensor:
+        """Evaluate ``G^{-1} A^T dual`` in linear memory."""
+
+        covector = gradient.new_zeros((metric_inverse.shape[0], 3))
+        covector.index_add_(
+            0,
+            support.reshape(-1),
+            (gradient * dual[:, None, None]).reshape(-1, 3),
+        )
+        return torch.einsum("vab,vb->va", metric_inverse, covector)
+
+    @classmethod
+    def _sparse_gram_product(
+        cls,
+        gradient: Tensor,
+        support: Tensor,
+        dual: Tensor,
+        metric_inverse: Tensor,
+        regularization: float,
+    ) -> Tensor:
+        weighted = cls._sparse_constraint_transpose(
+            gradient, support, dual, metric_inverse
+        )
+        return (
+            torch.sum(gradient * weighted[support], dim=(-2, -1))
+            + regularization * dual
+        )
+
+    @staticmethod
+    def _sparse_gram_spectral_bound(
+        gradient: Tensor,
+        support: Tensor,
+        metric_inverse: Tensor,
+        regularization: float,
+    ) -> Tensor:
+        r"""A linear-memory upper bound on ``||A G^-1 A^T||_infinity``.
+
+        Cauchy--Schwarz in each vertex metric gives
+
+        ``|g_jv^T G_v^-1 g_iv| <= ||g_jv||_* ||g_iv||_*``.
+
+        Accumulating incident dual norms per vertex therefore bounds every
+        absolute Gram row sum without forming a quadratic constraint matrix.
+        """
+
+        weighted_local = torch.einsum(
+            "jkab,jkb->jka", metric_inverse[support], gradient
+        )
+        local_norm = torch.sqrt(
+            torch.sum(gradient * weighted_local, dim=-1).clamp_min(0.0)
+        )
+        incidence_norm = gradient.new_zeros(metric_inverse.shape[0])
+        incidence_norm.index_add_(
+            0, support.reshape(-1), local_norm.reshape(-1)
+        )
+        row_bound = torch.sum(
+            local_norm * incidence_norm[support],
+            dim=-1,
+        )
+        return (row_bound.amax() + regularization).clamp_min(regularization)
+
+    def _solve_sparse_dual_qp(
+        self,
+        gradient: Tensor,
+        support: Tensor,
+        metric_inverse: Tensor,
+        linear: Tensor,
+    ) -> Tuple[Tensor, Tensor, float]:
+        """Projected-gradient solve for the exact sparse CBF dual."""
+
+        if not bool(torch.all(torch.isfinite(gradient))) or not bool(
+            torch.all(torch.isfinite(linear))
+        ):
+            raise RuntimeError("control-barrier QP contains non-finite coefficients")
+        spectral_bound = self._sparse_gram_spectral_bound(
+            gradient,
+            support,
+            metric_inverse,
+            self.config.dual_regularization,
+        )
+        step = 1.0 / spectral_bound
+        dual = torch.zeros_like(linear)
+        residual_value = float("inf")
+        for iteration in range(self.config.dual_iterations):
+            gram_dual = self._sparse_gram_product(
+                gradient,
+                support,
+                dual,
+                metric_inverse,
+                self.config.dual_regularization,
+            )
+            dual = torch.relu(dual - step * (gram_dual + linear))
+            should_check = (
+                (iteration + 1) % self.config.dual_check_interval == 0
+                or iteration + 1 == self.config.dual_iterations
+            )
+            if should_check:
+                fixed_dual = torch.relu(
+                    dual
+                    - step
+                    * (
+                        self._sparse_gram_product(
+                            gradient,
+                            support,
+                            dual,
+                            metric_inverse,
+                            self.config.dual_regularization,
+                        )
+                        + linear
+                    )
+                )
+                residual = torch.max(torch.abs(fixed_dual - dual))
+                threshold = self.config.dual_tolerance * (
+                    1.0 + dual.abs().amax()
+                )
+                residual_value, threshold_value = (
+                    float(value)
+                    for value in torch.stack((residual, threshold))
+                    .detach()
+                    .cpu()
+                    .tolist()
+                )
+                if residual_value <= threshold_value:
+                    break
+        correction = self._sparse_constraint_transpose(
+            gradient,
+            support,
+            dual,
+            metric_inverse,
+        )
+        return dual, correction, residual_value
+
     def _restoration_targets_and_scales(self, position: Tensor) -> Tuple[Tensor, Tensor]:
         """Return dimensionally normalized strict-interior targets.
 
@@ -368,7 +648,14 @@ class BarrierProjector:
 
         for iteration in range(1, self.config.restoration_iterations + 1):
             completed_iterations = iteration
-            constraint = self.position_constraints(position, diagnostics=True)
+            (
+                constraint,
+                constraint_support,
+                constraint_gradient,
+            ) = self._sparse_position_linearization(
+                position,
+                diagnostics=True,
+            )
             normalized = (constraint - target) / scale
             active = normalized < 0.0
             if not bool(torch.any(active)):
@@ -380,56 +667,19 @@ class BarrierProjector:
                     break
 
             active = active.detach()
-            jacobian = torch.autograd.functional.jacobian(
-                lambda value: (
-                    (self.position_constraints(value, diagnostics=True) - target)
-                    / scale
-                )[active],
-                position,
-                create_graph=torch.is_grad_enabled(),
-                vectorize=True,
+            jacobian = (
+                constraint_gradient[active]
+                / scale[active, None, None]
             )
+            active_support = constraint_support[active]
             linear = normalized[active]
-            weighted = torch.linalg.solve(
-                metric.unsqueeze(0), jacobian.unsqueeze(-1)
-            ).squeeze(-1)
-            gram = torch.einsum("iva,jva->ij", jacobian, weighted)
-            gram = gram + self.config.dual_regularization * torch.eye(
-                gram.shape[0], dtype=gram.dtype, device=gram.device
+            metric_inverse = torch.linalg.inv(metric)
+            _, correction, last_dual_residual = self._solve_sparse_dual_qp(
+                jacobian,
+                active_support,
+                metric_inverse,
+                linear,
             )
-            if not bool(torch.all(torch.isfinite(gram))) or not bool(
-                torch.all(torch.isfinite(linear))
-            ):
-                raise RuntimeError("embedding-restoration QP contains non-finite coefficients")
-            spectral_bound = torch.linalg.matrix_norm(
-                gram, ord=float("inf")
-            ).clamp_min(self.config.dual_regularization)
-            dual_step = 1.0 / spectral_bound
-            dual = torch.zeros_like(linear)
-            for dual_iteration in range(self.config.dual_iterations):
-                candidate_dual = torch.relu(
-                    dual - dual_step * (gram @ dual + linear)
-                )
-                dual = candidate_dual
-                should_check = (
-                    (dual_iteration + 1) % self.config.dual_check_interval == 0
-                    or dual_iteration + 1 == self.config.dual_iterations
-                )
-                if should_check:
-                    fixed_dual = torch.relu(
-                        dual - dual_step * (gram @ dual + linear)
-                    )
-                    residual = torch.max(torch.abs(fixed_dual - dual))
-                    threshold = self.config.dual_tolerance * (
-                        1.0 + dual.abs().amax()
-                    )
-                    residual_value, threshold_value = torch.stack(
-                        (residual, threshold)
-                    ).detach().cpu().tolist()
-                    last_dual_residual = float(residual_value)
-                    if last_dual_residual <= float(threshold_value):
-                        break
-            correction = torch.einsum("jva,j->va", weighted, dual)
             if not bool(torch.all(torch.isfinite(correction))):
                 raise RuntimeError("embedding-restoration QP produced a non-finite step")
 
@@ -590,56 +840,34 @@ class BarrierProjector:
         """Solve ``min ||v-v_raw||_G`` subject to linearized CBF inequalities."""
 
         tangent = self._limit_position_speed(tangent)
-        constraints = self.position_constraints(state.position)
+        constraints, support, gradient = self._sparse_position_linearization(
+            state.position
+        )
         if constraints.numel() == 0:
             return tangent, self.report(state)
-        _, directional = torch.autograd.functional.jvp(
-            self.position_constraints,
-            state.position,
-            tangent.position,
-            create_graph=torch.is_grad_enabled(),
+        directional = torch.sum(
+            gradient * tangent.position[support],
+            dim=(-2, -1),
         )
         rhs_margin = directional + self.config.decay_rate * constraints
         active = (constraints < self.config.activation_margin) | (rhs_margin < 0)
         if not torch.any(active):
             return tangent, self.report(state)
-        a = torch.autograd.functional.jacobian(
-            lambda value: self.position_constraints(value)[active],
-            state.position,
-            create_graph=torch.is_grad_enabled(),
-            vectorize=True,
-        )
+        active = active.detach()
+        a = gradient[active]
+        active_support = support[active]
         h = constraints[active]
         metric_inverse = torch.linalg.inv(state.evidence_metric)
-        weighted = torch.einsum("vab,jvb->jva", metric_inverse, a)
-        gram = torch.einsum("iva,jva->ij", a, weighted)
-        gram = gram + self.config.dual_regularization * torch.eye(gram.shape[0], dtype=gram.dtype, device=gram.device)
-        linear = torch.einsum("jva,va->j", a, tangent.position) + self.config.decay_rate * h
-        spectral_bound = torch.linalg.matrix_norm(gram, ord=float("inf")).clamp_min(self.config.dual_regularization)
-        step = 1.0 / spectral_bound
-        dual = torch.zeros_like(linear)
-        residual_value = float("inf")
-        for iteration in range(self.config.dual_iterations):
-            candidate = torch.relu(dual - step * (gram @ dual + linear))
-            dual = candidate
-            should_check = (
-                (iteration + 1) % self.config.dual_check_interval == 0
-                or iteration + 1 == self.config.dual_iterations
-            )
-            if should_check:
-                fixed_dual = torch.relu(dual - step * (gram @ dual + linear))
-                residual = torch.max(torch.abs(fixed_dual - dual))
-                threshold = self.config.dual_tolerance * (1.0 + dual.abs().amax())
-                residual_value, threshold_value = (
-                    float(value)
-                    for value in torch.stack((residual, threshold))
-                    .detach()
-                    .cpu()
-                    .tolist()
-                )
-                if residual_value <= threshold_value:
-                    break
-        correction = torch.einsum("jva,j->va", weighted, dual)
+        linear = (
+            torch.sum(a * tangent.position[active_support], dim=(-2, -1))
+            + self.config.decay_rate * h
+        )
+        _, correction, residual_value = self._solve_sparse_dual_qp(
+            a,
+            active_support,
+            metric_inverse,
+            linear,
+        )
         safe_position = tangent.position + correction
         projected = ManifoldTangent(
             position=safe_position,
@@ -653,7 +881,10 @@ class BarrierProjector:
         # inequality because all accepted states have h > 0.
         projected = self._limit_position_speed(projected)
         linearized_margin = (
-            torch.einsum("jva,va->j", a, projected.position)
+            torch.sum(
+                a * projected.position[active_support],
+                dim=(-2, -1),
+            )
             + self.config.decay_rate * h
         )
         minimum_linearized_margin = float(

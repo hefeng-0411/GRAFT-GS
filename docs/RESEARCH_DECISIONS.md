@@ -97,3 +97,36 @@ is allowed to silently cross that boundary.
 The selected design changes execution lifetime and prior conditioning cost, not
 the sparse UOT objective, topology energy, manifold metric, barrier margins,
 analytical readout, supervision set, or output geometry.
+# 2026-07-25 — Sparse local control-barrier linearization
+
+- Problem: the control-barrier constraints are geometrically local, but the
+  implementation asked autograd for a dense `[constraints, vertices, 3]`
+  Jacobian and then formed a dense dual Gram matrix.
+- Candidates: non-vectorized dense Jacobian (lower transient memory but still
+  `O(JV+J^2)`); chunked dense Jacobian (same asymptotic storage); penalty-only
+  feasibility (rejects the hard CBF invariant); generic matrix-free JVP/VJP
+  (linear memory but repeats the entire constraint graph per dual iteration);
+  sparse local derivatives with a matrix-free Gram operator.
+- Selection: exact sparse local derivatives. Area/orientation have three local
+  vertices, point separation two, and triangle separation six. Batched local
+  sum-gradients recover every independent Jacobian row. Scatter/gather evaluates
+  `A G^-1 A^T` exactly, and incident dual norms give a Cauchy--Schwarz upper
+  bound on its infinity norm.
+- Invariants: unchanged active constraint family, evidence metric, dual
+  regularization, CBF inequality, global speed rescaling, nonlinear
+  backtracking, and FP64 strict-margin recertification.
+- Complexity: `O(J+V)` live storage and `O(I(J+V))` dual work for `I` projected
+  iterations, replacing `O(JV+J^2)` storage. Conditional guarantee remains
+  dependent on fixed closest-feature/active strata and dual convergence.
+
+# 2026-07-25 — Zero-mass attention continuation and offline TRELLIS source
+
+- The raw reliability geometric mean has a singular derivative at a valid UOT
+  boundary (`r_i r_j = 0`). An endpoint-normalized Charbonnier continuation was
+  selected over clamping (zero-gradient dead zone) and arbitrary epsilon inside
+  `sqrt` (endpoint bias). It is monotone, exact at zero/one, and finite-gradient.
+- TRELLIS' released `torch.hub.load("facebookresearch/dinov2", ...)` was kept
+  architecturally intact but its repository argument is scoped to the already
+  installed local Hub checkout. Permitting an opportunistic network fallback
+  was rejected because it breaks checkpoint provenance and deterministic
+  enterprise-server startup.

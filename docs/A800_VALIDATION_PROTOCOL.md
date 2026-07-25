@@ -36,6 +36,81 @@ precedence.
 SHA-256 values are recorded in `upstream_repositories` before any model is
 loaded, and the resolved roots are propagated to every child process.
 
+## Offload-v4 failure regression gate (2026-07-25)
+
+The supplied vpr-8, vpr-12, and vpr-24 logs predate the zero-reliability,
+offline-Hub, sparse-barrier, and phase-boundary repairs. Run this focused gate
+before another long sweep:
+
+```bash
+mkdir -p outputs/validation
+"$GRAFT_GS_PYTHON" -m unittest -v \
+  tests.test_atlas_mapping.PersistentAtlasTest.test_attention_uncertainty_has_finite_zero_reliability_gradient \
+  tests.test_atlas_mapping.ImplicitSinkhornTest.test_float32_storage_underflow_uses_log_domain_float64_reference \
+  tests.test_atlas_mapping.ImplicitSinkhornTest.test_adjoint_rejects_nonfinite_positive_mass_cotangent \
+  tests.test_atlas_mapping.ImplicitSinkhornTest.test_sparse_all_edges_matches_dense_fixed_point_and_has_gradients \
+  tests.test_atlas_mapping.ImplicitSinkhornTest.test_implicit_backward_matches_finite_difference \
+  tests.test_geometry_invariants.TopologyAndManifoldTest.test_metric_minimal_restoration_enters_strict_feasible_set \
+  tests.test_external_adapters.TrellisAdapterBoundaryTest.test_dinov2_torch_hub_load_is_strictly_redirected_to_cache \
+  tests.test_external_adapters.TrellisAdapterBoundaryTest.test_missing_dinov2_cache_fails_without_calling_network_loader \
+  2>&1 | tee outputs/validation/offload_v4_numerics.log
+
+"$GRAFT_GS_PYTHON" scripts/validate_external_models.py \
+  trellis \
+  "$GRAFT_GS_MESHFLEET_ROOT" \
+  "$GRAFT_GS_MESHFLEET_MANIFEST" \
+  --object-id "$GRAFT_GS_TEST_OBJECT_ID" \
+  --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
+  --trellis-samples 2 \
+  --trellis-sampler-steps 2 \
+  --output outputs/validation/trellis_offline_cache.json \
+  2>&1 | tee outputs/validation/trellis_offline_cache.log
+```
+
+The first command must pass all eight tests. The sparse-barrier regression
+constructs the former dense Jacobian only inside a small test oracle and
+compares every row, the exact Gram product, its certified infinity-norm upper
+bound, restoration feasibility, and backward finiteness. Production
+`barrier.py` must contain no call to `torch.autograd.functional.jacobian`.
+The second command must complete with networking disabled; absence of
+`facebookresearch_dinov2_main/hubconf.py` under `torch.hub.get_dir()` is a
+provisioning failure, not permission to download mutable source.
+
+Then create a fresh schema-v5 sweep root. Do not reuse any pre-repair
+`overfit_metrics.json`:
+
+```bash
+RUN_TAG=$(date -u +%Y%m%dT%H%M%SZ)
+SWEEP_ROOT="outputs/concurrency/${GRAFT_GS_TRAIN_OBJECT_ID}/sparse-barrier-${RUN_TAG}"
+
+"$GRAFT_GS_PYTHON" scripts/sweep_a800_view_budget.py \
+  "$GRAFT_GS_MESHFLEET_ROOT" \
+  "$GRAFT_GS_MESHFLEET_MANIFEST" \
+  --object-id "$GRAFT_GS_TRAIN_OBJECT_ID" \
+  --config configs/graft_gs_a800_native.yaml \
+  --vggt-checkpoint "$VGGT_CHECKPOINT" \
+  --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
+  --views-per-rank 8 12 16 24 32 48 64 \
+  --evaluation-views 24 \
+  --steps 3 \
+  --minimum-relative-improvement -1 \
+  --maximum-reserved-fraction 0.85 \
+  --maximum-allocated-fraction 0.90 \
+  --minimum-driver-free-fraction 0.05 \
+  --minimum-initial-driver-free-fraction 0.95 \
+  --maximum-storage-relative-l1-error 1e-6 \
+  --maximum-zero-marginal-mass-fraction 1e-12 \
+  --throughput-fraction 0.97 \
+  --output "$SWEEP_ROOT" \
+  2>&1 | tee "$SWEEP_ROOT.log"
+```
+
+Every admitted report must contain
+`"evaluation_execution_stage": "atlas_autoencoding"`. Selection schema v5
+rejects a missing value or `"full"`. This Phase-B sweep does not validate
+continuous flow; retain a separate Phase-C/D profile showing positive final
+margins and linear barrier memory before claiming full-flow scalability.
+
 Before importing PyTorch, verify that the active interpreter has every one of
 the 444 exact versions pinned by the repository. This check is metadata-only;
 it never installs or upgrades packages:

@@ -415,3 +415,22 @@
   inactive-cache release have completed. The frozen prior peak is retained in
   separate telemetry; neither value is represented as an end-to-end global
   maximum.
+# Sparse CBF and zero-retained-mass assumptions (2026-07-25)
+
+- Each position constraint depends on at most six global vertices. This follows
+  from the implemented families: one triangle for area/orientation, one vertex
+  pair for point separation, and two nonincident triangles for exact triangle
+  separation. A future nonlocal constraint must extend the sparse support
+  contract rather than silently reuse the six-slot representation.
+- The matrix-free dual product is algebraically identical to
+  `A G^-1 A^T` for the fixed active set and fixed closest-feature branches.
+  Projected-gradient convergence and the subsequent explicit linearized-margin
+  check remain required; sparsity is not itself a feasibility proof.
+- The smooth attention continuation changes the raw geometric mean only within
+  the numerical neighborhood set by `sqrt(machine_epsilon)`. It preserves the
+  exact endpoints and ordering but is an explicit differentiable
+  approximation, not the literal derivative of `sqrt(r_i r_j)` at zero (which
+  does not exist).
+- Server construction assumes the frozen DINOv2 Torch Hub source checkout and
+  its weight cache were provisioned before GRAFT-GS starts. Missing source is a
+  hard provenance error; training must not fetch mutable upstream code.

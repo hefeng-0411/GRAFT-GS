@@ -550,6 +550,79 @@ class TopologyAndManifoldTest(unittest.TestCase):
             maximum_position_speed=1.0e-3,
         )
         projector = BarrierProjector(state, config)
+        constraint, support, sparse_gradient = (
+            projector._sparse_position_linearization(
+                state.position,
+                diagnostics=True,
+            )
+        )
+        dense_gradient = torch.autograd.functional.jacobian(
+            lambda value: projector.position_constraints(
+                value,
+                diagnostics=True,
+            ),
+            state.position,
+            create_graph=True,
+            vectorize=True,
+        )
+        reconstructed = torch.zeros_like(dense_gradient)
+        for constraint_index in range(constraint.shape[0]):
+            reconstructed[constraint_index].index_add_(
+                0,
+                support[constraint_index],
+                sparse_gradient[constraint_index],
+            )
+        torch.testing.assert_close(
+            reconstructed,
+            dense_gradient,
+            atol=2.0e-10,
+            rtol=2.0e-10,
+        )
+        metric_inverse = torch.linalg.inv(state.evidence_metric)
+        dual = torch.linspace(
+            0.1,
+            1.0,
+            constraint.shape[0],
+            dtype=dtype,
+        )
+        sparse_product = projector._sparse_gram_product(
+            sparse_gradient,
+            support,
+            dual,
+            metric_inverse,
+            config.dual_regularization,
+        )
+        weighted_dense = torch.einsum(
+            "vab,jvb->jva",
+            metric_inverse,
+            dense_gradient,
+        )
+        dense_gram = torch.einsum(
+            "iva,jva->ij",
+            dense_gradient,
+            weighted_dense,
+        )
+        dense_gram = dense_gram + config.dual_regularization * torch.eye(
+            constraint.shape[0],
+            dtype=dtype,
+        )
+        torch.testing.assert_close(
+            sparse_product,
+            dense_gram @ dual,
+            atol=2.0e-10,
+            rtol=2.0e-10,
+        )
+        bound = projector._sparse_gram_spectral_bound(
+            sparse_gradient,
+            support,
+            metric_inverse,
+            config.dual_regularization,
+        )
+        self.assertGreaterEqual(
+            float(bound),
+            float(torch.linalg.matrix_norm(dense_gram, ord=float("inf")))
+            - 1.0e-10,
+        )
         initial = projector.report(state)
         self.assertFalse(initial.feasible)
         self.assertLess(initial.minimum_separation_margin, 0.0)

@@ -174,6 +174,14 @@ def main() -> None:
                     "test_sparse_all_edges_matches_dense_fixed_point_and_has_gradients",
                     "tests.test_atlas_mapping.ImplicitSinkhornTest."
                     "test_implicit_backward_matches_finite_difference",
+                    "tests.test_atlas_mapping.ImplicitSinkhornTest."
+                    "test_adjoint_rejects_nonfinite_positive_mass_cotangent",
+                    "tests.test_atlas_mapping.PersistentAtlasTest."
+                    "test_attention_uncertainty_has_finite_zero_reliability_gradient",
+                    "tests.test_external_adapters.TrellisAdapterBoundaryTest."
+                    "test_dinov2_torch_hub_load_is_strictly_redirected_to_cache",
+                    "tests.test_external_adapters.TrellisAdapterBoundaryTest."
+                    "test_missing_dinov2_cache_fails_without_calling_network_loader",
                 )
             ),
         )

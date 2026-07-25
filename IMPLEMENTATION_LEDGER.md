@@ -967,3 +967,38 @@ The full conditional validity domain is maintained in
   points, `scripts/overfit_meshfleet_object.py`,
   `scripts/select_a800_view_budget.py`,
   `scripts/sweep_a800_view_budget.py`, A800 config, tests, and ledgers.
+
+## 2026-07-25 sparse-barrier, offline-upstream, and zero-mass adjoint repair
+
+- Requirement `A800-NUMERICAL-WORKFLOW-06`: the supplied fresh sweep exposed
+  three independent failures. Vpr-8 reached backward but a zero-reliability
+  attention edge differentiated the singular expression
+  `sqrt(reliability_i * reliability_j)` and surfaced later as a non-finite
+  Sinkhorn cotangent. Vpr-12 failed before model construction because Torch
+  2.4 probed GitHub while a complete DINOv2 Hub checkout was already cached.
+  Vpr-24 completed training, then incorrectly executed Phase-D flow during the
+  Phase-B final measurement and attempted a 3.78-GiB dense barrier Jacobian.
+- The attention bias now uses an endpoint-preserving Charbonnier continuation
+  of the geometric mean. It maps exact zero and one to zero and one, retains
+  monotonicity, and has a finite derivative at zero. The implicit UOT adjoint
+  separately diagnoses non-finite upstream positive-mass cotangents, internal
+  adjoint failures, and gradients outside the destination dtype range.
+- TRELLIS construction scopes a Torch Hub redirect for
+  `facebookresearch/dinov2` to the deterministic cached `main`/`master`
+  checkout and restores the original loader after construction. A missing
+  cache fails before any network loader is invoked.
+- `BarrierProjector` now represents every position constraint by at most six
+  vertex indices and local derivatives. Exact products with
+  `A G^-1 A^T` are matrix-free, and a Cauchy--Schwarz incident-vertex bound
+  supplies a valid projected-gradient step. Both flow projection and
+  pre-flow embedding restoration use this path. Storage is `O(J+V)` instead
+  of dense `O(JV+J^2)`; the same piecewise linearized CBF QP is solved.
+- The overfit/concurrency executable evaluates at the Phase-B
+  `atlas_autoencoding` boundary. Selection schema v5 rejects missing or
+  full-flow evaluation metadata, so stale reports cannot be admitted.
+- Production files: `graft_gs/integration/pipeline.py`,
+  `graft_gs/integration/trellis_prior.py`,
+  `graft_gs/mapping/manifold_mapping.py`,
+  `graft_gs/manifold/barrier.py`, `scripts/overfit_meshfleet_object.py`,
+  `scripts/select_a800_view_budget.py`, `scripts/validate_ddp_server.py`,
+  numerical/static tests, protocol, and project ledgers.

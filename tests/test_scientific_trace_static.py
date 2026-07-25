@@ -297,6 +297,22 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
             validator,
         )
 
+    def test_latest_a800_failures_have_production_path_repairs(self) -> None:
+        mapping = source("graft_gs/mapping/manifold_mapping.py")
+        pipeline = source("graft_gs/integration/pipeline.py")
+        prior = source("graft_gs/integration/trellis_prior.py")
+        barrier = source("graft_gs/manifold/barrier.py")
+        overfit = source("scripts/overfit_meshfleet_object.py")
+        self.assertIn("geometric_reliability", pipeline)
+        self.assertIn("reliability_product + smooth.square()", pipeline)
+        self.assertIn("implicit Sinkhorn received a non-finite upstream plan", mapping)
+        self.assertIn("_offline_torch_hub_repository", prior)
+        self.assertIn('source="local"', prior)
+        self.assertIn("_sparse_position_linearization", barrier)
+        self.assertIn("_sparse_gram_product", barrier)
+        self.assertNotIn("torch.autograd.functional.jacobian", barrier)
+        self.assertIn('execution_stage="atlas_autoencoding"', overfit)
+
     def test_remote_entry_points_resolve_checkpoint_environment_at_runtime(self) -> None:
         scripts = (
             "scripts/train_a800.py",

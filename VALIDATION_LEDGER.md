@@ -570,3 +570,30 @@ sweep's intentional OOM classifier was excluded from that contamination scan.
   checkpoint residency, stage traces, cuBLAS-headroom repair, and schema-v4
   exhaustive sweep are server-ready but unexecuted. No post-repair A800 memory,
   throughput, optimizer-step, or quality claim is made.
+
+## 2026-07-25 supplied offload-v4 failures and local repair validation
+
+- Supplied A800 evidence is pre-repair and not counted as a pass:
+  vpr-8 failed in the implicit UOT backward after a finite forward; vpr-12
+  failed when Torch Hub attempted a GitHub request for cached DINOv2 source;
+  vpr-24 failed only in the rank-zero terminal evaluation while a dense
+  vectorized barrier Jacobian requested 3.78 GiB with 2.44 GiB free. The latter
+  is live algorithmic memory pressure, not fragmentation (75.54 GiB was
+  allocated and only 0.75 GiB reserved-but-unused).
+- Locally executed with bundled Python 3.12.13: whole-tree `compileall` passed.
+  Environment, manifest/discovery/handoff, scientific production-path, and
+  concurrency selector suites passed `75/75` in `8.131 s`, with one expected
+  PyTorch-dependent dataset tensor-loading skip. The focused production and
+  selector suites passed `44/44`. They require the smooth zero-mass attention derivative, explicit
+  upstream Sinkhorn-cotangent diagnostics, cached-local Torch Hub redirection,
+  absence of a production dense barrier Jacobian, Phase-B terminal evaluation,
+  and rejection of stale full-flow reports.
+- Torch-backed numerical tests were added for: finite attention gradients with
+  exact zero reliability; positive-mass non-finite cotangent rejection;
+  sparse/dense constraint-Jacobian and Gram-product equivalence; restoration
+  backward; and cached/missing DINOv2 Hub behavior. They are server-ready but
+  unexecuted locally because the bundled drafting runtime has no PyTorch.
+- No post-repair A800 optimizer step, memory peak, throughput, render, PLY,
+  GLB, checkpoint, or selected view budget is claimed. The exact focused test
+  and fresh schema-v5 sweep commands are in
+  `docs/A800_VALIDATION_PROTOCOL.md`.

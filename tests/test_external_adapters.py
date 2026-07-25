@@ -3,14 +3,20 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
+from pathlib import Path
 from types import SimpleNamespace
+import tempfile
 import unittest
 from unittest import mock
 
 import torch
 from torch import nn
 
-from graft_gs.integration.trellis_prior import TrellisPriorAdapter
+from graft_gs.integration.trellis_prior import (
+    TrellisPriorAdapter,
+    _cached_torch_hub_checkout,
+    _offline_torch_hub_repository,
+)
 from graft_gs.integration.vggt_adapter import VGGTAdapter
 
 
@@ -144,6 +150,55 @@ class _MockDecodedGridTrellisPipeline:
 
 
 class TrellisAdapterBoundaryTest(unittest.TestCase):
+    def test_dinov2_torch_hub_load_is_strictly_redirected_to_cache(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            hub_root = Path(directory)
+            checkout = hub_root / "facebookresearch_dinov2_main"
+            checkout.mkdir()
+            (checkout / "hubconf.py").write_text("# cached\n", encoding="utf8")
+            upstream_load = mock.Mock(return_value="dinov2")
+            with (
+                mock.patch.object(torch.hub, "get_dir", return_value=str(hub_root)),
+                mock.patch.object(torch.hub, "load", upstream_load),
+            ):
+                self.assertEqual(
+                    _cached_torch_hub_checkout("facebookresearch/dinov2"),
+                    checkout.resolve(),
+                )
+                with _offline_torch_hub_repository(
+                    "facebookresearch/dinov2"
+                ) as selected:
+                    self.assertEqual(selected, checkout.resolve())
+                    self.assertEqual(
+                        torch.hub.load(
+                            "facebookresearch/dinov2",
+                            "dinov2_vitl14",
+                            pretrained=True,
+                            force_reload=True,
+                        ),
+                        "dinov2",
+                    )
+            upstream_load.assert_called_once_with(
+                str(checkout.resolve()),
+                "dinov2_vitl14",
+                pretrained=True,
+                source="local",
+            )
+
+    def test_missing_dinov2_cache_fails_without_calling_network_loader(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            upstream_load = mock.Mock()
+            with (
+                mock.patch.object(torch.hub, "get_dir", return_value=directory),
+                mock.patch.object(torch.hub, "load", upstream_load),
+                self.assertRaisesRegex(FileNotFoundError, "offline TRELLIS"),
+            ):
+                with _offline_torch_hub_repository(
+                    "facebookresearch/dinov2"
+                ):
+                    self.fail("missing cache must fail before entering context")
+            upstream_load.assert_not_called()
+
     def test_hidden_prior_view_cap_is_deterministic_and_endpoint_covering(self) -> None:
         pipeline = _MockTrellisPipeline()
         adapter = TrellisPriorAdapter(

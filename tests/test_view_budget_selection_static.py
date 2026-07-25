@@ -28,6 +28,7 @@ SWEEP_SPEC.loader.exec_module(SWEEP)
 def report(views: int, throughput: float, reserved: float) -> dict[str, object]:
     return {
         "world_size": 2,
+        "evaluation_execution_stage": "atlas_autoencoding",
         "losses": [2.0, 1.9],
         "trellis_prior": {
             "enabled": True,
@@ -114,6 +115,15 @@ def report(views: int, throughput: float, reserved: float) -> dict[str, object]:
 
 
 class ViewBudgetSelectionTest(unittest.TestCase):
+    def test_rejects_stale_report_that_executed_post_phase_b_flow(self) -> None:
+        candidate = report(16, 1.0, 0.7)
+        candidate["evaluation_execution_stage"] = "full"
+        audited = MODULE.audit_report(candidate, 0.85)
+        self.assertFalse(audited["admissible"])
+        self.assertTrue(
+            any("Phase-B" in reason for reason in audited["reasons"])
+        )
+
     def test_visible_cuda_inventory_is_json_typed_and_rank_checked(self) -> None:
         payload = (
             '[{"free_bytes": 79000000000, "free_fraction": 0.9875, '

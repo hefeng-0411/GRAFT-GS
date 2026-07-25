@@ -9,10 +9,11 @@ occupancy as an additive surface hazard before topology proposal.
 from __future__ import annotations
 
 from collections import OrderedDict
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 import hashlib
-from typing import Optional
+from pathlib import Path
+from typing import Iterator, Optional
 
 import torch
 from torch import Tensor
@@ -23,6 +24,82 @@ from .external import (
     import_external_module,
     resolve_trellis_checkpoint,
 )
+
+
+def _cached_torch_hub_checkout(repository: str) -> Path:
+    """Resolve an already-installed Torch Hub checkout without network access.
+
+    Torch 2.4 resolves an unqualified ``owner/repository`` through GitHub before
+    checking the local checkout.  TRELLIS uses precisely that form for DINOv2,
+    so an otherwise complete server cache still fails when GitHub is transiently
+    unavailable.  GRAFT-GS server execution is intentionally checkpoint-frozen:
+    select a local checkout deterministically and fail closed if it is absent.
+    """
+
+    parts = repository.split("/")
+    if len(parts) != 2 or any(not part for part in parts):
+        raise ValueError("Torch Hub repository must have the form 'owner/name'")
+    owner, name = parts
+    hub_root = Path(torch.hub.get_dir()).expanduser().resolve()
+    candidates = (
+        hub_root / f"{owner}_{name}_main",
+        hub_root / f"{owner}_{name}_master",
+    )
+    complete = [
+        path
+        for path in candidates
+        if path.is_dir() and (path / "hubconf.py").is_file()
+    ]
+    if not complete:
+        expected = ", ".join(str(path) for path in candidates)
+        raise FileNotFoundError(
+            f"offline TRELLIS initialization requires a cached {repository} "
+            f"Torch Hub checkout containing hubconf.py; expected one of: {expected}"
+        )
+    # The released DINOv2 reference is ``main``.  Candidate order is therefore
+    # meaningful and independent of filesystem enumeration order.
+    return complete[0]
+
+
+@contextmanager
+def _offline_torch_hub_repository(repository: str) -> Iterator[Path]:
+    """Redirect one upstream Hub repository to its exact cached checkout.
+
+    The patch is deliberately scoped to TRELLIS construction and restored even
+    on failure.  Other repositories retain ordinary Torch Hub semantics.
+    """
+
+    checkout = _cached_torch_hub_checkout(repository)
+    original_load = torch.hub.load
+
+    def load_from_cache(
+        repo_or_dir: object,
+        model: str,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        if repo_or_dir != repository:
+            return original_load(repo_or_dir, model, *args, **kwargs)
+        # These options belong to remote repository resolution.  Passing them
+        # to a ``source='local'`` load is either meaningless or rejected by
+        # older Torch releases.
+        kwargs.pop("force_reload", None)
+        kwargs.pop("trust_repo", None)
+        kwargs.pop("skip_validation", None)
+        kwargs.pop("source", None)
+        return original_load(
+            str(checkout),
+            model,
+            *args,
+            source="local",
+            **kwargs,
+        )
+
+    torch.hub.load = load_from_cache
+    try:
+        yield checkout
+    finally:
+        torch.hub.load = original_load
 
 
 def _decoded_structure_resolution(value: object) -> int:
@@ -266,7 +343,11 @@ class TrellisPriorAdapter:
         checkpoint = resolve_trellis_checkpoint(checkpoint)
         module = import_external_module("trellis.pipelines")
         pipeline_class = getattr(module, "TrellisImageTo3DPipeline")
-        pipeline = pipeline_class.from_pretrained(checkpoint)
+        # TRELLIS' released constructor calls
+        # ``torch.hub.load('facebookresearch/dinov2', ...)``.  Resolve that
+        # frozen dependency from the server cache without a GitHub probe.
+        with _offline_torch_hub_repository("facebookresearch/dinov2"):
+            pipeline = pipeline_class.from_pretrained(checkpoint)
         target_device = torch.device("cuda") if device is None else torch.device(device)
         initial_device = (
             torch.device("cpu")
