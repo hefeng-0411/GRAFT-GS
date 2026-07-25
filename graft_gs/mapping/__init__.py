@@ -8,6 +8,7 @@ from .manifold_mapping import (
     ManifoldMappingOperator,
     MappingResult,
     SparseTransportGraph,
+    finite_gradient_identity,
     sparse_view_reprojection_variance,
 )
 
@@ -19,5 +20,6 @@ __all__ = [
     "ManifoldMappingOperator",
     "MappingResult",
     "SparseTransportGraph",
+    "finite_gradient_identity",
     "sparse_view_reprojection_variance",
 ]

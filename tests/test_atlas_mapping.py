@@ -27,6 +27,7 @@ from graft_gs.mapping.manifold_mapping import (
     ManifoldMappingConfig,
     ManifoldMappingOperator,
     SparseTransportGraph,
+    finite_gradient_identity,
     sparse_view_reprojection_variance,
 )
 from graft_gs.integration.trellis_prior import (
@@ -249,6 +250,16 @@ class PersistentAtlasTest(unittest.TestCase):
             query, metric, node_index=active
         )
         self.assertTrue(torch.all(torch.linalg.eigvalsh(interpolated) > 0))
+        coincident_query = (
+            atlas.chart_centers[active[:1]].detach().clone().requires_grad_(True)
+        )
+        coincident_metric = atlas.partition_of_unity_metric(
+            coincident_query, metric, node_index=active
+        )
+        coincident_gradient = torch.autograd.grad(
+            coincident_metric.square().sum(), coincident_query
+        )[0]
+        self.assertTrue(torch.all(torch.isfinite(coincident_gradient)))
 
         angle = torch.tensor(0.37, dtype=torch.float64)
         cosine, sine = torch.cos(angle), torch.sin(angle)
@@ -443,6 +454,78 @@ class PersistentAtlasTest(unittest.TestCase):
         uncertainty.sum().backward()
         self.assertIsNotNone(reliability.grad)
         self.assertTrue(torch.all(torch.isfinite(reliability.grad)))
+
+    def test_zero_transport_rows_use_finite_atlas_posterior_moments(self) -> None:
+        """A storage-underflow row must never divide by machine epsilon."""
+
+        evidence = _surface_evidence()
+        atlas = PersistentOctreeAtlas.from_evidence(
+            evidence.positions,
+            evidence.mass,
+            AtlasConfig(base_level=1, max_level=2),
+        )
+        config = ManifoldMappingConfig(support_radius_factor=4.0)
+        operator = ManifoldMappingOperator(
+            evidence.features.shape[-1], config
+        ).double()
+        reference = operator(atlas, evidence)
+        graph = reference.graph
+        plan = torch.zeros(
+            graph.num_edges, dtype=torch.float64, requires_grad=True
+        )
+        source_mass = (
+            torch.pi * atlas.chart_radii[graph.atlas_node_index].square()
+        )
+        (
+            centers,
+            transported_mass,
+            retention_prior_mass,
+            metric,
+            irreps,
+            reliability,
+        ) = operator.chart_writer(
+            atlas,
+            evidence,
+            graph,
+            plan,
+            config.metric_epsilon,
+            config.metric_normal_weight,
+            config.radial_support_factor,
+            source_mass,
+            config.retention_shrinkage,
+        )
+        torch.testing.assert_close(
+            retention_prior_mass,
+            config.retention_shrinkage * source_mass,
+        )
+        torch.testing.assert_close(
+            centers, atlas.chart_centers[graph.atlas_node_index]
+        )
+        torch.testing.assert_close(
+            transported_mass, torch.zeros_like(transported_mass)
+        )
+        torch.testing.assert_close(
+            reliability, torch.zeros_like(reliability)
+        )
+        objective = (
+            centers.square().sum()
+            + metric.square().sum()
+            + irreps.pack().square().sum()
+            + reliability.square().sum()
+        )
+        gradient = torch.autograd.grad(objective, plan)[0]
+        self.assertTrue(torch.all(torch.isfinite(gradient)))
+        self.assertLess(float(gradient.abs().amax()), 1.0e12)
+
+    def test_named_gradient_boundary_rejects_without_replacement(self) -> None:
+        value = torch.ones(3, dtype=torch.float64, requires_grad=True)
+        guarded = finite_gradient_identity(value, "test.posterior_boundary")
+        with self.assertRaisesRegex(
+            FloatingPointError, "test.posterior_boundary"
+        ):
+            guarded.backward(
+                torch.tensor([1.0, torch.inf, 2.0], dtype=torch.float64)
+            )
 
 
 class ImplicitSinkhornTest(unittest.TestCase):

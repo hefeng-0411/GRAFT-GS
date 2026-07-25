@@ -178,6 +178,16 @@ def main() -> None:
                     "test_adjoint_rejects_nonfinite_positive_mass_cotangent",
                     "tests.test_atlas_mapping.PersistentAtlasTest."
                     "test_attention_uncertainty_has_finite_zero_reliability_gradient",
+                    "tests.test_atlas_mapping.PersistentAtlasTest."
+                    "test_zero_transport_rows_use_finite_atlas_posterior_moments",
+                    "tests.test_atlas_mapping.PersistentAtlasTest."
+                    "test_named_gradient_boundary_rejects_without_replacement",
+                    "tests.test_geometry_invariants.GaugeEquivarianceTest."
+                    "test_coincident_connection_edges_have_finite_center_gradient",
+                    "tests.test_geometry_invariants.TopologyAndManifoldTest."
+                    "test_exact_persistence_identity_has_finite_zero_gradient",
+                    "tests.test_assets_and_vertical_slice.AnalyticalAssetTest."
+                    "test_exact_surface_chamfer_match_has_finite_zero_gradient",
                     "tests.test_external_adapters.TrellisAdapterBoundaryTest."
                     "test_dinov2_torch_hub_load_is_strictly_redirected_to_cache",
                     "tests.test_external_adapters.TrellisAdapterBoundaryTest."

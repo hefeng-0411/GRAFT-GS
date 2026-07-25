@@ -597,3 +597,37 @@ sweep's intentional OOM classifier was excluded from that contamination scan.
   GLB, checkpoint, or selected view budget is claimed. The exact focused test
   and fresh schema-v5 sweep commands are in
   `docs/A800_VALIDATION_PROTOCOL.md`.
+
+## 2026-07-25 supplied schema-v5 sweep and posterior-measure repair
+
+- Supplied A800 results are pre-repair evidence. On one visible A800, vpr
+  8/12/16 completed and schema v5 selected vpr-16 at
+  `0.027420849479884938` aggregate views/s. It recorded peak allocated/active
+  `0.1482315932296512`, peak reserved `0.19083543598586894`, and ending
+  driver-free fraction `0.801792`. Its UOT storage relative-L1 error was about
+  `1.99e-8`; many count-underflow edges carried negligible mass.
+- Vpr-24, 32, 48, and 64 did not OOM. They failed in the first Phase-B
+  backward when implicit Sinkhorn received respectively 845, 7639, 19219, and
+  17933 non-finite plan-cotangent edges. Positive-stored-mass subsets were 483,
+  4516, 10865, and 10328. This common scaling pattern motivated the fused
+  posterior-moment repair; no loss, gradient, or plan entry is replaced.
+- Locally executed with bundled Python 3.12.13: whole-tree `compileall` passed.
+  Exact environment, dynamic MeshFleet discovery, deterministic manifest,
+  remote-manifest handoff, scientific production trace, and view-budget
+  selection suites passed `76/76` in `8.142 s`, with one expected skip for
+  PyTorch-dependent dataset tensor loading. The complete command elapsed
+  `9.080 s` including compilation.
+- Static guards verify that no `conditional_centers=sum(...)/m` path remains,
+  posterior source-area mass reaches chart writing and attention, coincident
+  direction floors exist in chart/GSTA paths, squared appearance/Chamfer avoid
+  intermediate norms, and named gradient boundaries reach production.
+- PyTorch-backed zero-row plan gradients, coincident-edge gauge gradients,
+  exact-match Chamfer gradients, analytical readout backward, implicit
+  finite-difference agreement, and the intentional named-boundary failure are
+  implemented but not executed locally because the drafting runtime has no
+  PyTorch.
+- The minimum-time server sequence is recorded in
+  `docs/A800_VALIDATION_PROTOCOL.md`: nine focused numerical tests, then one
+  24-view one-step smoke and, only if it passes, one 32-view one-step smoke.
+  No post-repair A800 optimizer step, throughput, memory, checkpoint, render,
+  PLY, GLB, or training-quality result is claimed yet.

@@ -298,3 +298,23 @@ checkpoints, data, or a compiled server dependency.
 - No claim of zero loss or universally error-free training is supportable.
   Admission remains fail-closed on finite gradients, converged UOT, positive
   feasibility margins, deterministic assets, and explicit A800 memory limits.
+
+## 2026-07-25 posterior-measure A800 validation boundary
+
+- Supplied pre-repair schema-v5 evidence: vpr-8/12/16 completed and vpr-16 was
+  selected at `0.027420849` aggregate views/s with `14.8232%` peak allocated,
+  `19.0835%` peak reserved, and `80.1792%` ending driver-free memory. Vpr
+  24/32/48/64 failed with respectively 845, 7639, 19219, and 17933 non-finite
+  upstream plan-cotangent edges. None of these four failures was OOM.
+- Local drafting cannot execute the new PyTorch numerical tests. First run the
+  focused posterior/zero-distance suite, then one fresh 24-view, one-step
+  Phase-B smoke with two evaluation views. This directly crosses the first
+  prior failure boundary without paying for another complete sweep.
+- If 24 passes, run the same one-step smoke at 32. Do not launch 48/64 or
+  change production view count until 24 and 32 both produce finite optimizer
+  steps and named gradient boundaries remain silent.
+- Existing vpr-16 is a valid measurement of the pre-repair code, not proof of
+  post-repair correctness. After the focused gate passes, 16 views/rank is the
+  conservative training start; a new schema-v5 sweep is required before
+  increasing it. Full Phase-D/F memory and numerical validation remain
+  separate.

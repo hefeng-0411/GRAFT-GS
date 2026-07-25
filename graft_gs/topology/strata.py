@@ -369,7 +369,16 @@ def persistence_wasserstein(
     large = left.new_tensor(1.0e12)
     cost = left.new_full((size, size), large)
     if n and m:
-        cost[:n, :m] = torch.cdist(left, right, p=2).pow(order)
+        if order == 2:
+            # Squared W2 ground cost has a unique zero gradient at identical
+            # persistence points. Avoid an intermediate Euclidean norm whose
+            # derivative is set-valued at that same, common match.
+            pair_cost = (
+                left[:, None, :] - right[None, :, :]
+            ).square().sum(-1)
+        else:
+            pair_cost = torch.cdist(left, right, p=2).pow(order)
+        cost[:n, :m] = pair_cost
     if n:
         diagonal_left = ((left[:, 1] - left[:, 0]).abs() / sqrt(2.0)).pow(order)
         cost[torch.arange(n), m + torch.arange(n)] = diagonal_left

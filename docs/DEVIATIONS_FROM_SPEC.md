@@ -324,3 +324,13 @@
   final export measurement. It still performs topology selection, analytical
   readout, rendering, and shared-atlas asset export. Full flow validation
   belongs to Phase C/D and must be measured separately.
+- Conditional chart moments are evaluated in their algebraically fused
+  persistent-prior posterior form rather than as a conditional quotient
+  followed by a retention multiplication. The mathematical positive-mass
+  result is unchanged, but the fused form supplies the continuous finite
+  extension when FP32 plan storage represents a negligible row as zero.
+- Gauge directions and radial distances at exact coincidence use a
+  support-relative smooth zero stratum. Squared surface/appearance objectives
+  are evaluated directly without an intermediate Euclidean norm. These are
+  explicit numerical-domain strengthenings; no arbitrary direction, mass
+  floor, detached tensor, or fabricated observation is introduced.

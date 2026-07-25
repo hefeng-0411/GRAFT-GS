@@ -270,11 +270,58 @@ class MappingResult:
     diagnostics: SinkhornDiagnostics
     transported_centers: Tensor
     transported_mass: Tensor
+    retention_prior_mass: Tensor
     observation_reliability: Tensor
     transported_color: Optional[Tensor]
     riemannian_metric: Tensor
     irreps: IrrepMoments
     latent: Tensor
+
+
+class _FiniteGradientIdentity(torch.autograd.Function):
+    """Identity map that attributes a non-finite cotangent to its first branch.
+
+    The sparse Sinkhorn adjoint can only report that its aggregate plan
+    cotangent is invalid.  These identities sit at the mathematically distinct
+    chart-writing boundaries and retain the exact forward/backward map when
+    gradients are finite.  They never clamp, detach, or replace a value.
+    """
+
+    @staticmethod
+    def forward(
+        ctx: torch.autograd.function.FunctionCtx,
+        value: Tensor,
+        label: str,
+    ) -> Tensor:
+        ctx.label = label
+        return value
+
+    @staticmethod
+    def backward(
+        ctx: torch.autograd.function.FunctionCtx,
+        gradient: Optional[Tensor],
+    ) -> tuple[Optional[Tensor], None]:
+        if gradient is not None and not bool(torch.all(torch.isfinite(gradient))):
+            finite = torch.isfinite(gradient)
+            finite_values = gradient[finite]
+            maximum_finite = (
+                float(finite_values.abs().amax().detach().cpu())
+                if finite_values.numel()
+                else float("nan")
+            )
+            raise FloatingPointError(
+                f"{ctx.label} received a non-finite upstream cotangent; "
+                "no NaN/Inf replacement is permitted: "
+                f"nonfinite_values={int(torch.count_nonzero(~finite).item())}, "
+                f"maximum_finite_abs={maximum_finite:.6e}"
+            )
+        return gradient, None
+
+
+def finite_gradient_identity(value: Tensor, label: str) -> Tensor:
+    """Return ``value`` unchanged and fail at this named backward boundary."""
+
+    return _FiniteGradientIdentity.apply(value, label)
 
 
 def sparse_view_reprojection_variance(
@@ -1295,30 +1342,47 @@ class GaugeCovariantChartWriter(nn.Module):
         radial_support_factor: float,
         source_mass: Tensor,
         retention_shrinkage: float,
-    ) -> Tuple[Tensor, Tensor, Tensor, IrrepMoments, Tensor]:
+    ) -> Tuple[Tensor, Tensor, Tensor, Tensor, IrrepMoments, Tensor]:
         source, target = graph.source, graph.target
         nodes = graph.atlas_node_index[source]
         count = graph.source_count
         transported_mass = _segment_sum(plan, source, count)
-        denominator = transported_mass.clamp_min(torch.finfo(plan.dtype).eps)
-        conditional_centers = _segment_sum(
+        # A chart carries the explicit persistent-atlas prior measure
+        #
+        #   lambda_i = retention_shrinkage * a_i > 0.
+        #
+        # The former implementation first divided every transported moment by
+        # m_i=sum_j pi_ij and then multiplied by r_i=m_i/(m_i+lambda_i).
+        # Although algebraically correct for m_i>0, that ordering creates a
+        # 1/machine-epsilon derivative on FP32 rows whose geometrically
+        # negligible UOT mass underflows to zero.  Fuse the cancellable factors:
+        #
+        #   r_i (sum_j pi_ij f_j / m_i)
+        #       = sum_j pi_ij f_j / (m_i + lambda_i).
+        #
+        # This is the exact positive-mass posterior and its continuous
+        # zero-observation extension.  It bounds every plan cotangent by the
+        # physical atlas prior rather than a storage-dtype artifact.
+        retention_prior_mass = retention_shrinkage * source_mass
+        posterior_mass = transported_mass + retention_prior_mass
+        position_numerator = _segment_sum(
             plan[:, None] * evidence.positions[target], source, count
-        ) / denominator[:, None]
-        retained_ratio = transported_mass / source_mass.clamp_min(torch.finfo(plan.dtype).eps)
-        reliability = retained_ratio / (retained_ratio + retention_shrinkage)
-        chart_center = atlas.chart_centers[graph.atlas_node_index]
-        transported_centers = chart_center + reliability[:, None] * (
-            conditional_centers - chart_center
         )
+        reliability = transported_mass / posterior_mass
+        chart_center = atlas.chart_centers[graph.atlas_node_index]
+        transported_centers = (
+            position_numerator
+            + retention_prior_mass[:, None] * chart_center
+        ) / posterior_mass[:, None]
 
         covariance = 0.5 * (
             evidence.covariance[target]
             + evidence.covariance[target].transpose(-1, -2)
         )
         precision = torch.cholesky_inverse(torch.linalg.cholesky(covariance))
-        conditional_metric = _segment_sum(
+        metric_numerator = _segment_sum(
             plan[:, None, None] * precision, source, count
-        ) / denominator[:, None, None]
+        )
         normal = atlas.chart_frames[graph.atlas_node_index, :, 2]
         eye = torch.eye(3, dtype=plan.dtype, device=plan.device)
         radius = atlas.chart_radii[graph.atlas_node_index].clamp_min(
@@ -1326,35 +1390,48 @@ class GaugeCovariantChartWriter(nn.Module):
         )
         baseline_metric = eye / radius[:, None, None].square()
         metric = metric_epsilon * eye + (
-            reliability[:, None, None] * conditional_metric
-            + (1.0 - reliability)[:, None, None] * baseline_metric
+            (
+                metric_numerator
+                + retention_prior_mass[:, None, None] * baseline_metric
+            )
+            / posterior_mass[:, None, None]
             + metric_normal_weight * normal[:, :, None] * normal[:, None, :]
         )
 
         world_delta = evidence.positions[target] - atlas.chart_centers[nodes]
         local_delta = torch.einsum("eji,ej->ei", atlas.chart_frames[nodes], world_delta)
-        radius = torch.linalg.vector_norm(local_delta, dim=-1)
-        direction = local_delta / radius[:, None].clamp_min(torch.finfo(radius.dtype).eps)
         support = radial_support_factor * atlas.cell_sides[nodes]
+        # Every GSTA graph contains self/coincident observations.  Raw
+        # ||delta|| has a set-valued derivative at delta=0.  A
+        # scale-relative Charbonnier radius keeps radius(0)=0 and gives the
+        # local direction the finite zero subgradient without changing units.
+        direction_floor = support * torch.finfo(local_delta.dtype).eps**0.5
+        safe_radius = torch.sqrt(
+            local_delta.square().sum(-1) + direction_floor.square()
+        )
+        radius = safe_radius - direction_floor
+        direction = local_delta / safe_radius[:, None]
         radial = self._radial_basis(radius, support)
 
         scalar_coeff = self.scalar_projection(evidence.features[target])
         scalar_channel_basis = torch.arange(48, device=plan.device).remainder(self.radial_basis_count)
         scalar_coeff = scalar_coeff * radial[:, scalar_channel_basis]
-        scalar = _segment_sum(plan[:, None] * scalar_coeff, source, count) / denominator[:, None]
+        scalar = _segment_sum(
+            plan[:, None] * scalar_coeff, source, count
+        ) / posterior_mass[:, None]
         vector_coeff = self.vector_projection(evidence.features[target])
         vector_channel_basis = torch.arange(16, device=plan.device).remainder(self.radial_basis_count)
         vector_coeff = vector_coeff * radial[:, vector_channel_basis]
         vector = _segment_sum(
             plan[:, None, None] * vector_coeff[:, :, None] * direction[:, None, :], source, count
-        ) / denominator[:, None, None]
+        ) / posterior_mass[:, None, None]
         tensor_coeff = self.tensor_projection(evidence.features[target])
         tensor_channel_basis = torch.arange(4, device=plan.device).remainder(self.radial_basis_count)
         tensor_coeff = tensor_coeff * radial[:, tensor_channel_basis]
         l2 = _real_l2_basis(direction)
         tensor = _segment_sum(
             plan[:, None, None] * tensor_coeff[:, :, None] * l2[:, None, :], source, count
-        ) / denominator[:, None, None]
+        ) / posterior_mass[:, None, None]
 
         # The final 12 invariant channels explicitly carry transported
         # uncertainty/measure statistics rather than duplicating appearance.
@@ -1378,11 +1455,9 @@ class GaugeCovariantChartWriter(nn.Module):
             ),
             dim=-1,
         )
-        auxiliary = _segment_sum(plan[:, None] * uncertainty_edge, source, count) / denominator[:, None]
-        scalar = reliability[:, None] * scalar
-        vector = reliability[:, None, None] * vector
-        tensor = reliability[:, None, None] * tensor
-        auxiliary = reliability[:, None] * auxiliary
+        auxiliary = _segment_sum(
+            plan[:, None] * uncertainty_edge, source, count
+        ) / posterior_mass[:, None]
         irreps = IrrepMoments(
             scalar_0e=scalar,
             vector_1o=vector,
@@ -1392,7 +1467,14 @@ class GaugeCovariantChartWriter(nn.Module):
         latent = irreps.pack()
         if latent.shape[-1] != 128:
             raise RuntimeError("internal irrep layout must total 128 channels")
-        return transported_centers, transported_mass, metric, irreps, reliability
+        return (
+            transported_centers,
+            transported_mass,
+            retention_prior_mass,
+            metric,
+            irreps,
+            reliability,
+        )
 
 
 class ManifoldMappingOperator(nn.Module):
@@ -1421,7 +1503,7 @@ class ManifoldMappingOperator(nn.Module):
         source_mass = torch.pi * atlas.chart_radii[graph.atlas_node_index].square()
         target_mass = evidence.mass
         plan, diagnostics = self.sinkhorn(cost, source_mass, target_mass, graph.edge_index)
-        centers, mass, metric, irreps, reliability = self.chart_writer(
+        centers, mass, retention_prior_mass, metric, irreps, reliability = self.chart_writer(
             atlas,
             evidence,
             graph,
@@ -1437,8 +1519,35 @@ class ManifoldMappingOperator(nn.Module):
             color_sum = _segment_sum(
                 plan[:, None] * evidence.colors[graph.target], graph.source, graph.source_count
             )
-            conditional_color = color_sum / mass.clamp_min(torch.finfo(plan.dtype).eps)[:, None]
-            transported_color = 0.5 + reliability[:, None] * (conditional_color - 0.5)
+            transported_color = (
+                color_sum + 0.5 * retention_prior_mass[:, None]
+            ) / (mass + retention_prior_mass)[:, None]
+        centers = finite_gradient_identity(
+            centers, "chart_writer.transported_centers"
+        )
+        mass = finite_gradient_identity(mass, "chart_writer.transported_mass")
+        metric = finite_gradient_identity(metric, "chart_writer.riemannian_metric")
+        reliability = finite_gradient_identity(
+            reliability, "chart_writer.observation_reliability"
+        )
+        irreps = IrrepMoments(
+            scalar_0e=finite_gradient_identity(
+                irreps.scalar_0e, "chart_writer.scalar_0e"
+            ),
+            vector_1o=finite_gradient_identity(
+                irreps.vector_1o, "chart_writer.vector_1o"
+            ),
+            tensor_2e=finite_gradient_identity(
+                irreps.tensor_2e, "chart_writer.tensor_2e"
+            ),
+            auxiliary_0e=finite_gradient_identity(
+                irreps.auxiliary_0e, "chart_writer.auxiliary_0e"
+            ),
+        )
+        if transported_color is not None:
+            transported_color = finite_gradient_identity(
+                transported_color, "chart_writer.transported_color"
+            )
         return MappingResult(
             evidence=evidence,
             graph=graph,
@@ -1447,6 +1556,7 @@ class ManifoldMappingOperator(nn.Module):
             diagnostics=diagnostics,
             transported_centers=centers,
             transported_mass=mass,
+            retention_prior_mass=retention_prior_mass,
             observation_reliability=reliability,
             transported_color=transported_color,
             riemannian_metric=metric,
@@ -1470,5 +1580,6 @@ __all__ = [
     "SparseTransportGraph",
     "TransportCost",
     "build_sparse_transport_graph",
+    "finite_gradient_identity",
     "sparse_view_reprojection_variance",
 ]

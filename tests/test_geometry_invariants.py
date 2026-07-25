@@ -139,6 +139,45 @@ class GaugeEquivarianceTest(unittest.TestCase):
         layer.set_operator_scale(0.25)
         torch.testing.assert_close(layer(value), 0.25 * reference)
 
+    def test_coincident_connection_edges_have_finite_center_gradient(self) -> None:
+        """Connection directions use the zero subgradient at coincidence."""
+
+        atlas = _grid_atlas()
+        active = atlas.active_indices[:2]
+        config = GSTAConfig(residual_step=0.2)
+        layer = GaugeCovariantSparseTransportAttention(config).double()
+        centers = torch.zeros(2, 3, dtype=torch.float64, requires_grad=True)
+        fields = IrrepTensor(
+            torch.linspace(
+                -0.4, 0.7, 2 * config.scalar_channels, dtype=torch.float64
+            ).reshape(2, config.scalar_channels),
+            torch.linspace(
+                -0.3,
+                0.5,
+                2 * config.vector_channels * 3,
+                dtype=torch.float64,
+            ).reshape(2, config.vector_channels, 3),
+            torch.linspace(
+                -0.2,
+                0.6,
+                2 * config.tensor_channels * 5,
+                dtype=torch.float64,
+            ).reshape(2, config.tensor_channels, 5),
+        )
+        output = layer(
+            atlas,
+            fields,
+            node_index=active,
+            local_edge_index=torch.tensor([[0], [1]], dtype=torch.int64),
+            centers=centers,
+            frames=atlas.chart_frames[active],
+        )
+        probe = torch.linspace(
+            0.1, 1.0, output.pack().numel(), dtype=torch.float64
+        ).reshape_as(output.pack())
+        gradient = torch.autograd.grad((output.pack() * probe).sum(), centers)[0]
+        self.assertTrue(torch.all(torch.isfinite(gradient)))
+
     def test_global_se3_and_local_gauge_covariance(self) -> None:
         atlas = _grid_atlas()
         v = atlas.num_active
@@ -199,6 +238,20 @@ class GaugeEquivarianceTest(unittest.TestCase):
 
 
 class TopologyAndManifoldTest(unittest.TestCase):
+    def test_exact_persistence_identity_has_finite_zero_gradient(self) -> None:
+        diagram = torch.tensor(
+            [[0.05, 0.4], [0.2, 0.7], [0.35, 0.9]],
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        distance = persistence_wasserstein(
+            diagram, diagram, order=2, maximum_exact_points=16
+        )
+        torch.testing.assert_close(distance, torch.zeros_like(distance))
+        gradient = torch.autograd.grad(distance, diagram)[0]
+        self.assertTrue(torch.all(torch.isfinite(gradient)))
+        torch.testing.assert_close(gradient, torch.zeros_like(gradient))
+
     def test_large_persistence_matching_is_linear_memory_symmetric_and_differentiable(self) -> None:
         dtype = torch.float64
         birth = torch.linspace(0.0, 0.8, 600, dtype=dtype)

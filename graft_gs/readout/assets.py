@@ -16,7 +16,7 @@ from torch import Tensor, nn
 
 from ..geometry.atlas import PersistentOctreeAtlas
 from ..manifold.geometry import ManifoldState
-from ..mapping.manifold_mapping import MappingResult
+from ..mapping.manifold_mapping import MappingResult, finite_gradient_identity
 
 
 @dataclass(frozen=True)
@@ -218,6 +218,9 @@ class AnalyticalSurfaceReadout(nn.Module):
         gaussian_xi = []
         gaussian_area = []
         cfg = self.config
+        appearance_plan = finite_gradient_identity(
+            mapping.plan, "analytical_readout.appearance_plan"
+        )
         for local_chart, global_node in enumerate(state.complex.atlas_node_index.tolist()):
             mapping_index = node_to_mapping[global_node]
             radius = atlas.chart_radii[global_node]
@@ -283,7 +286,20 @@ class AnalyticalSurfaceReadout(nn.Module):
                 dim1=-2, dim2=-1
             ).sum(-1).clamp_min(cfg.opacity_epsilon)
             relative_normal_uncertainty = (normal_variance / total_variance).clamp(0.0, 1.0)
-            uncertainty_thickness = 0.25 * delta_q * torch.sqrt(relative_normal_uncertainty)
+            # The uncertainty ratio may be exactly zero after a valid
+            # projection/clamp.  Use a zero-preserving Charbonnier square root
+            # instead of the singular derivative of sqrt at the origin.
+            uncertainty_floor = relative_normal_uncertainty.new_tensor(
+                cfg.metric_epsilon
+            )
+            relative_uncertainty_root = (
+                torch.sqrt(relative_normal_uncertainty + uncertainty_floor)
+                - torch.sqrt(uncertainty_floor)
+            ) / (
+                torch.sqrt(1.0 + uncertainty_floor)
+                - torch.sqrt(uncertainty_floor)
+            )
+            uncertainty_thickness = 0.25 * delta_q * relative_uncertainty_root
             normal_scale = torch.sqrt(
                 normal_scale.square() + cfg.uncertainty_normal_weight * uncertainty_thickness.square()
             )
@@ -302,7 +318,14 @@ class AnalyticalSurfaceReadout(nn.Module):
                 normal[:, :, None] * normal[:, None, :]
             )
             covariance = 0.5 * (covariance + covariance.transpose(-1, -2))
-            area = torch.sqrt(torch.linalg.det(first_form)).clamp_min(cfg.opacity_epsilon) * domain_area / count
+            # Clamp squared area before sqrt.  sqrt(det(G)).clamp_min(eps)
+            # evaluates the singular sqrt derivative first when a chart
+            # reaches the immersion boundary.
+            area = torch.sqrt(
+                torch.linalg.det(first_form).clamp_min(
+                    cfg.opacity_epsilon**2
+                )
+            ) * domain_area / count
             base_alpha = torch.sigmoid(state.opacity_logit[local_chart, 0])
             base_optical_depth = -torch.log1p(-base_alpha.clamp_max(1.0 - cfg.opacity_epsilon))
             # State opacity is optical depth per chart-domain area.  Dividing by
@@ -310,7 +333,15 @@ class AnalyticalSurfaceReadout(nn.Module):
             optical_depth = base_optical_depth * (domain_area / count) / area
             opacity = -torch.expm1(-optical_depth.clamp_min(cfg.opacity_epsilon))
             opacity = opacity.clamp(cfg.opacity_epsilon, 1.0 - cfg.opacity_epsilon)
-            sh = self._solve_appearance(local_chart, mapping_index, means, state, mapping, atlas)
+            sh = self._solve_appearance(
+                local_chart,
+                mapping_index,
+                means,
+                state,
+                mapping,
+                atlas,
+                appearance_plan,
+            )
             gaussian_means.append(means)
             gaussian_covariance.append(covariance)
             gaussian_rotation.append(rotation)
@@ -321,15 +352,33 @@ class AnalyticalSurfaceReadout(nn.Module):
             gaussian_xi.append(xi)
             gaussian_area.append(area)
         gaussians = GaussianAsset(
-            means=torch.cat(gaussian_means),
-            covariance=torch.cat(gaussian_covariance),
-            rotation=torch.cat(gaussian_rotation),
-            scales=torch.cat(gaussian_scales),
-            sh_coefficients=torch.cat(gaussian_sh),
-            opacity=torch.cat(gaussian_opacity),
+            means=finite_gradient_identity(
+                torch.cat(gaussian_means), "analytical_readout.gaussian_means"
+            ),
+            covariance=finite_gradient_identity(
+                torch.cat(gaussian_covariance),
+                "analytical_readout.gaussian_covariance",
+            ),
+            rotation=finite_gradient_identity(
+                torch.cat(gaussian_rotation),
+                "analytical_readout.gaussian_rotation",
+            ),
+            scales=finite_gradient_identity(
+                torch.cat(gaussian_scales), "analytical_readout.gaussian_scales"
+            ),
+            sh_coefficients=finite_gradient_identity(
+                torch.cat(gaussian_sh), "analytical_readout.gaussian_sh"
+            ),
+            opacity=finite_gradient_identity(
+                torch.cat(gaussian_opacity),
+                "analytical_readout.gaussian_opacity",
+            ),
             chart_index=torch.cat(gaussian_chart),
             chart_coordinates=torch.cat(gaussian_xi),
-            represented_area=torch.cat(gaussian_area),
+            represented_area=finite_gradient_identity(
+                torch.cat(gaussian_area),
+                "analytical_readout.represented_area",
+            ),
         )
         gaussians.validate()
         mesh = self._mesh_from_state(state)
@@ -343,11 +392,12 @@ class AnalyticalSurfaceReadout(nn.Module):
         state: ManifoldState,
         mapping: MappingResult,
         atlas: PersistentOctreeAtlas,
+        appearance_plan: Tensor,
     ) -> Tensor:
         cfg = self.config
         edge_mask = mapping.graph.source == mapping_index
         target = mapping.graph.target[edge_mask]
-        plan = mapping.plan[edge_mask]
+        plan = appearance_plan[edge_mask]
         count = means.shape[0]
         prior_color = torch.sigmoid(state.appearance[local_chart, :3])
         if target.numel() == 0 or mapping.evidence.colors is None:
@@ -359,8 +409,17 @@ class AnalyticalSurfaceReadout(nn.Module):
         basis = real_sh_basis_degree3(view_direction)
         color = mapping.evidence.colors[target] - 0.5
         bandwidth = cfg.observation_bandwidth_factor * atlas.chart_radii[state.complex.atlas_node_index[local_chart]]
-        distance = torch.cdist(means, evidence_position)
-        weight = plan[None] * torch.exp(-0.5 * distance.square() / bandwidth.square().clamp_min(1.0e-12))
+        # The kernel only needs squared Euclidean distance.  Constructing
+        # cdist and then squaring it inserts an unnecessary ||x-y|| derivative
+        # that is undefined at a perfectly surface-attached observation.
+        distance_squared = (
+            means[:, None, :] - evidence_position[None, :, :]
+        ).square().sum(-1)
+        weight = plan[None] * torch.exp(
+            -0.5
+            * distance_squared
+            / bandwidth.square().clamp_min(1.0e-12)
+        )
         weighted_basis = basis[None] * weight[:, :, None]
         gram = torch.einsum("gni,gnj->gij", weighted_basis, basis[None].expand(count, -1, -1))
         rhs = torch.einsum("gni,nc->gic", weighted_basis, color)

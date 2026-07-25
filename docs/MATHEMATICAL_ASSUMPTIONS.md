@@ -434,3 +434,25 @@
 - Server construction assumes the frozen DINOv2 Torch Hub source checkout and
   its weight cache were provisioned before GRAFT-GS starts. Missing source is a
   hard provenance error; training must not fetch mutable upstream code.
+
+## Posterior chart-measure assumptions (2026-07-25)
+
+- Every active chart has strictly positive source area
+  `a_i=pi*r_i^2`, and `retention_shrinkage` is strictly positive. Therefore
+  `lambda_i=retention_shrinkage*a_i` and the posterior denominator
+  `m_i+lambda_i` remain positive even when every stored transport edge in a row
+  is zero.
+- The fused posterior quotient is not a new approximation. For `m_i>0`,
+  multiplying a conditional observation by reliability gives
+  `(m_i/(m_i+lambda_i))*(sum pi f/m_i)=sum pi f/(m_i+lambda_i)`.
+  At `m_i=0` the implementation selects the continuous prior/zero-moment
+  extension. Raw transported mass is not replaced by posterior mass in
+  occupancy, UOT objectives, or numerical certificates.
+- The transport plan may still contain FP32 storage zeros only under the
+  existing FP64-referenced mass/L1 certificate. Posterior chart writing makes
+  downstream derivatives finite; it does not redefine a materially inaccurate
+  stored plan as acceptable.
+- A support-relative smooth norm selects the zero subgradient at a coincident
+  chart/evidence or connection edge. Its forward perturbation is confined to a
+  neighborhood proportional to `sqrt(machine_epsilon)` times that edge's
+  support/cutoff. The A800 equivariance and finite-gradient tests are required.

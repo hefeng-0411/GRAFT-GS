@@ -1002,3 +1002,45 @@ The full conditional validity domain is maintained in
   `graft_gs/manifold/barrier.py`, `scripts/overfit_meshfleet_object.py`,
   `scripts/select_a800_view_budget.py`, `scripts/validate_ddp_server.py`,
   numerical/static tests, protocol, and project ledgers.
+
+## 2026-07-25 posterior-measure transport-gradient repair
+
+- Requirement `A800-POSTERIOR-MOMENT-STABILITY-07`: the supplied schema-v5
+  sweep completed 8, 12, and 16 views on one A800, but 24/32/48/64 all failed
+  before the optimizer step because the implicit Sinkhorn plan received
+  non-finite upstream cotangents. The failing edge counts grew with evidence
+  size and included both positive stored mass and representationally
+  negligible FP32-underflow edges. This is not an allocator failure.
+- Root cause: chart writing formed conditional quantities
+  `sum(pi f)/sum(pi)` and then multiplied them by
+  `sum(pi)/(sum(pi)+lambda)`. Although the factors cancel analytically for
+  positive mass, evaluating them separately creates a storage-dependent
+  `1/epsilon_float32` derivative on an underflow row.
+- Chart position, metric, every irrep moment, auxiliary statistics, and color
+  now use the fused posterior denominator `m_i + lambda_i`, where
+  `lambda_i = retention_shrinkage * source_area_i > 0`. This is exactly equal
+  to the previous positive-mass Bayesian shrinkage and defines its continuous,
+  finite zero-observation extension. Raw transported mass remains separate for
+  occupancy and UOT diagnostics.
+- Transport-conditioned attention uses the same posterior prior: its cost is
+  the ordinary conditional cost multiplied by observation reliability.
+  Named identity boundaries now reject and attribute non-finite cotangents at
+  chart fields, attention evidence, and analytical Gaussian attributes without
+  detaching, clipping, or replacing any gradient.
+- Exact-zero geometric derivatives were repaired at chart radial directions,
+  GSTA self/coincident edges, zero-weight curvature fits, surface-attached SH
+  distances, represented-area square roots, uncertainty thickness, and
+  squared Chamfer. These changes use either algebraically exact squared
+  quantities or scale-aware zero-preserving smooth norms.
+- Production files: `graft_gs/mapping/manifold_mapping.py`,
+  `graft_gs/mapping/__init__.py`, `graft_gs/integration/pipeline.py`,
+  `graft_gs/equivariant/gsta.py`, `graft_gs/geometry/atlas.py`,
+  `graft_gs/readout/assets.py`, and `graft_gs/engine/losses.py`.
+  Numerical regressions were added to `tests/test_atlas_mapping.py`,
+  `tests/test_geometry_invariants.py`, and
+  `tests/test_assets_and_vertical_slice.py`; the static production guard was
+  extended in `tests/test_scientific_trace_static.py`.
+- Whole-tree compilation and all locally executable environment/dataset/
+  manifest/production/selection guards passed (`76/76`, one expected
+  PyTorch-dependent loader skip). The new mathematical gradient tests and
+  first-failing 24/32-view backward gates are server-pending.

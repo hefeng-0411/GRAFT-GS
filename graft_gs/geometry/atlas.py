@@ -535,9 +535,14 @@ class PersistentOctreeAtlas(nn.Module):
             local = (positions[mask] - means[group]) @ frames[group]
             x, y, z = local.unbind(-1)
             design = torch.stack((0.5 * x.square(), x * y, 0.5 * y.square()), dim=-1)
-            w = mass[mask].clamp_min(0).sqrt()[:, None]
-            lhs = (design * w).transpose(0, 1) @ (design * w)
-            rhs = (design * w).transpose(0, 1) @ (z[:, None] * w)
+            # Form X^T W X and X^T W z directly.  Multiplying both operands by
+            # sqrt(w) is algebraically identical but sqrt has an unbounded
+            # derivative at a valid zero-confidence particle.  Direct
+            # non-negative measure weighting is exact and has a finite linear
+            # mass derivative.
+            weight = mass[mask].clamp_min(0)[:, None]
+            lhs = design.transpose(0, 1) @ (weight * design)
+            rhs = design.transpose(0, 1) @ (weight * z[:, None])
             coeff = torch.linalg.solve(lhs + self.config.curvature_ridge * eye3, rhs).flatten()
             result[group] = torch.stack((coeff[[0, 1]], coeff[[1, 2]]))
         return result
@@ -958,18 +963,27 @@ class PersistentOctreeAtlas(nn.Module):
         output = []
         for start in range(0, query.shape[0], chunk_size):
             value = query[start : start + chunk_size]
-            distance = torch.cdist(value, center)
-            normalized = distance / support[None].clamp_min(1.0e-12)
-            inside = normalized < 1.0
-            denominator = (1.0 - normalized.square()).clamp_min(1.0e-12)
+            # The compact bump is a function of r^2, so evaluate squared
+            # distance directly.  This is algebraically exact and avoids the
+            # undefined intermediate derivative of ||x-c|| at a chart center.
+            squared_distance = (
+                value.square().sum(-1, keepdim=True)
+                + center.square().sum(-1)[None]
+                - 2.0 * (value @ center.transpose(0, 1))
+            ).clamp_min(0.0)
+            normalized_squared = squared_distance / support[None].square().clamp_min(
+                1.0e-12
+            )
+            inside = normalized_squared < 1.0
+            denominator = (1.0 - normalized_squared).clamp_min(1.0e-12)
             bump = torch.where(
                 inside,
                 torch.exp(-1.0 / denominator),
-                torch.zeros_like(normalized),
+                torch.zeros_like(normalized_squared),
             )
             total = bump.sum(dim=-1, keepdim=True)
             nearest = torch.nn.functional.one_hot(
-                distance.argmin(dim=-1),
+                squared_distance.argmin(dim=-1),
                 num_classes=nodes.numel(),
             ).to(bump)
             weight = torch.where(

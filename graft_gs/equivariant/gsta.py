@@ -289,10 +289,18 @@ class GaugeCovariantSparseTransportAttention(nn.Module):
             raise ValueError("dynamic centers/frames must match the selected chart subset")
         displacement_world = centers[target] - centers[source]
         displacement = torch.einsum("eji,ej->ei", frames[source], displacement_world)
-        distance = torch.linalg.vector_norm(displacement, dim=-1)
-        direction = displacement / distance[:, None].clamp_min(cfg.epsilon)
         connection = frames[source].transpose(-1, -2) @ frames[target]
         cutoff = cfg.radial_cutoff_factor * torch.maximum(atlas.cell_sides[active[source]], atlas.cell_sides[active[target]])
+        # Self edges are required by the sparse attention contract and have
+        # exactly zero displacement.  Use a cutoff-relative smooth norm so the
+        # direction has the finite zero subgradient at that gauge-degenerate
+        # point; raw vector_norm/clamp leaves an undefined norm derivative.
+        direction_floor = cutoff * torch.finfo(displacement.dtype).eps**0.5
+        safe_distance = torch.sqrt(
+            displacement.square().sum(-1) + direction_floor.square()
+        )
+        distance = safe_distance - direction_floor
+        direction = displacement / safe_distance[:, None]
         radial = self.radial_basis((distance / cutoff.clamp_min(cfg.epsilon)).clamp(0.0, 1.0))
 
         q0, k0, value0 = self.q0(fields.scalar), self.k0(fields.scalar), self.v0(fields.scalar)
@@ -308,22 +316,22 @@ class GaugeCovariantSparseTransportAttention(nn.Module):
         h = cfg.heads
         c0, c1, c2 = cfg.scalar_channels // h, cfg.vector_channels // h, cfg.tensor_channels // h
         score0 = torch.sum(
-            F.normalize(q0.reshape(v, h, c0), dim=-1)[source]
-            * F.normalize(k0.reshape(v, h, c0), dim=-1)[target],
+            F.normalize(q0.reshape(v, h, c0), dim=-1, eps=cfg.epsilon)[source]
+            * F.normalize(k0.reshape(v, h, c0), dim=-1, eps=cfg.epsilon)[target],
             dim=-1,
         ) / cfg.attention_temperature_scalar
         q1_head = q1.reshape(v, h, c1, 3)
         k1_head = transported_k1.reshape(-1, h, c1, 3)
         score1 = torch.sum(
-            F.normalize(q1_head[source].flatten(-2), dim=-1)
-            * F.normalize(k1_head.flatten(-2), dim=-1),
+            F.normalize(q1_head[source].flatten(-2), dim=-1, eps=cfg.epsilon)
+            * F.normalize(k1_head.flatten(-2), dim=-1, eps=cfg.epsilon),
             dim=-1,
         ) / cfg.attention_temperature_vector
         q2_head = q2.reshape(v, h, c2, 3, 3)
         k2_head = transported_k2.reshape(-1, h, c2, 3, 3)
         score2 = torch.sum(
-            F.normalize(q2_head[source].flatten(-3), dim=-1)
-            * F.normalize(k2_head.flatten(-3), dim=-1),
+            F.normalize(q2_head[source].flatten(-3), dim=-1, eps=cfg.epsilon)
+            * F.normalize(k2_head.flatten(-3), dim=-1, eps=cfg.epsilon),
             dim=-1,
         ) / cfg.attention_temperature_tensor
         logits = score0 + score1 + score2 + radial @ self.score_radial.transpose(0, 1)
@@ -371,7 +379,12 @@ class GaugeCovariantSparseTransportAttention(nn.Module):
         gate0 = torch.sigmoid(self.gate0(invariant))
         gate1 = torch.sigmoid(self.gate1(invariant))
         gate2 = torch.sigmoid(self.gate2(invariant))
-        norm0 = torch.linalg.vector_norm(message0, dim=-1, keepdim=True).clamp_min(cfg.epsilon)
+        # One common smooth RMS floor keeps all three irreps finite at an
+        # exactly cancelled message.  The previous scalar vector_norm/clamp
+        # retained the undefined derivative of ||0||.
+        norm0 = torch.sqrt(
+            torch.sum(message0.square(), dim=-1, keepdim=True) + cfg.epsilon
+        )
         norm1 = torch.sqrt(torch.sum(message1.square(), dim=(-1, -2), keepdim=True) + cfg.epsilon)
         norm2 = torch.sqrt(torch.sum(message2.square(), dim=(-1, -2), keepdim=True) + cfg.epsilon)
         output0 = fields.scalar + cfg.residual_step * gate0 * message0 / norm0

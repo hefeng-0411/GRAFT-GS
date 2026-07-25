@@ -627,6 +627,72 @@ $GRAFT_GS_PYTHON -m torch.distributed.run --standalone \
   2>&1 | tee outputs/meshfleet_evaluation/run.log
 ```
 
+## Fast posterior-measure backward gate (2026-07-25)
+
+The previous full sweep already established that 24 views is the first
+numerical failure and that the failure is not OOM. Do not immediately repeat
+the multi-hour seven-candidate sweep. Validate the repaired primitives first:
+
+```bash
+mkdir -p outputs/validation
+"$GRAFT_GS_PYTHON" -m unittest -v \
+  tests.test_atlas_mapping.PersistentAtlasTest.test_zero_transport_rows_use_finite_atlas_posterior_moments \
+  tests.test_atlas_mapping.PersistentAtlasTest.test_named_gradient_boundary_rejects_without_replacement \
+  tests.test_atlas_mapping.PersistentAtlasTest.test_transport_cost_and_uncertainty_reach_attention_adjacency \
+  tests.test_atlas_mapping.PersistentAtlasTest.test_attention_uncertainty_has_finite_zero_reliability_gradient \
+  tests.test_geometry_invariants.GaugeEquivarianceTest.test_coincident_connection_edges_have_finite_center_gradient \
+  tests.test_geometry_invariants.TopologyAndManifoldTest.test_exact_persistence_identity_has_finite_zero_gradient \
+  tests.test_assets_and_vertical_slice.AnalyticalAssetTest.test_exact_surface_chamfer_match_has_finite_zero_gradient \
+  tests.test_assets_and_vertical_slice.AnalyticalAssetTest.test_flat_chart_analytical_readout_backward_is_finite \
+  tests.test_atlas_mapping.ImplicitSinkhornTest.test_float32_storage_underflow_uses_log_domain_float64_reference \
+  tests.test_atlas_mapping.ImplicitSinkhornTest.test_implicit_backward_matches_finite_difference \
+  2>&1 | tee outputs/validation/posterior_measure_numerics.log
+```
+
+All ten tests must pass. Then cross the first real failure boundary with one
+training step and the minimum valid two-view terminal asset check:
+
+```bash
+RUN_TAG=$(date -u +%Y%m%dT%H%M%SZ)
+for TOTAL_VIEWS in 24 32; do
+  RUN_DIR="outputs/posterior_gate/${GRAFT_GS_TRAIN_OBJECT_ID}/${RUN_TAG}/views-${TOTAL_VIEWS}"
+  mkdir -p "$RUN_DIR"
+  "$GRAFT_GS_PYTHON" -m torch.distributed.run \
+    --standalone --nnodes=1 \
+    --nproc-per-node="$GRAFT_GS_NPROC_PER_NODE" \
+    scripts/overfit_meshfleet_object.py \
+    "$GRAFT_GS_MESHFLEET_ROOT" "$GRAFT_GS_MESHFLEET_MANIFEST" \
+    --split train --object-id "$GRAFT_GS_TRAIN_OBJECT_ID" \
+    --config configs/graft_gs_a800_native.yaml \
+    --vggt-checkpoint "$VGGT_CHECKPOINT" \
+    --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
+    --maximum-views "$TOTAL_VIEWS" \
+    --evaluation-views 2 \
+    --steps 1 \
+    --minimum-relative-improvement -1 \
+    --output "$RUN_DIR" \
+    2>&1 | tee "$RUN_DIR/run.log" || exit 1
+done
+```
+
+The loop deliberately stops if 24 fails, so 32 does not consume another long
+run after an unresolved first boundary. `--maximum-views` fixes the global
+same-object evidence count even when `CUDA_VISIBLE_DEVICES` exposes a dynamic
+number of ranks; `--views-per-rank` would multiply the numerical problem by
+`WORLD_SIZE` and would not reproduce the one-A800 boundary. A pass requires
+one finite optimizer step, a committed checkpoint, finite FP64/log-UOT
+diagnostics, positive feasibility margins,
+`evaluation_execution_stage=atlas_autoencoding`, and silence from every named
+`chart_writer.*`, `transport_attention.*`, and `analytical_readout.*`
+cotangent boundary.
+
+After both pass, start production with the configured 24-view object-level
+Phase-B path. The previously selected 16 views/rank remains the conservative
+fallback if training must begin before a fresh performance sweep; it is not a
+reason to reduce precision or losses. Run the full schema-v5 sweep later only
+to justify increasing concurrency, not to re-establish the corrected
+mathematics.
+
 ## Ablations
 
 ```bash

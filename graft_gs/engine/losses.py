@@ -1014,9 +1014,20 @@ def symmetric_surface_chamfer(predicted: Tensor, target: Tensor, chunk_size: int
     target_minimum = target.new_full((target.shape[0],), torch.inf)
     predicted_minimum: list[Tensor] = []
     for start in range(0, predicted.shape[0], chunk_size):
-        distance = torch.cdist(predicted[start : start + chunk_size], target).square()
-        predicted_minimum.append(distance.amin(dim=1))
-        target_minimum = torch.minimum(target_minimum, distance.amin(dim=0))
+        # Squared Chamfer does not require Euclidean distance itself.  Avoid
+        # cdist(...).square(), whose intermediate norm has a set-valued
+        # derivative at an exact surface match and can poison the transport
+        # cotangent even though squared distance has the unique zero gradient.
+        query = predicted[start : start + chunk_size]
+        distance_squared = (
+            query.square().sum(-1, keepdim=True)
+            + target.square().sum(-1)[None]
+            - 2.0 * (query @ target.transpose(0, 1))
+        ).clamp_min(0.0)
+        predicted_minimum.append(distance_squared.amin(dim=1))
+        target_minimum = torch.minimum(
+            target_minimum, distance_squared.amin(dim=0)
+        )
     return torch.cat(predicted_minimum).mean() + target_minimum.mean()
 
 

@@ -27,6 +27,7 @@ from ..mapping.manifold_mapping import (
     ManifoldMappingConfig,
     ManifoldMappingOperator,
     MappingResult,
+    finite_gradient_identity,
     sparse_view_reprojection_variance,
 )
 from ..readout.assets import AnalyticalReadoutConfig, AnalyticalSurfaceReadout, GaussianAsset, MeshAsset, write_gaussian_ply, write_mesh_glb
@@ -701,15 +702,18 @@ class GraftGS(nn.Module):
 
         For chart ``i`` the scalar
 
-        ``c_i = (sum_j pi_ij C_ij) / (sum_j pi_ij)``
+        ``c_i = (sum_j pi_ij C_ij) / (sum_j pi_ij + lambda_i)``
 
-        is its conditional transport cost.  An undirected connection edge uses
-        the symmetric mean ``(c_i+c_j)/2``; uncertainty analogously uses one
-        minus the geometric mean of observation reliabilities.  Self edges are
-        retained with their node values.  Both quantities are invariant under
-        global SE(3) and local chart-gauge changes, so they are valid scalar
-        attention biases.  ``log1p`` keeps high-cost outliers numerically
-        bounded without detaching the transport/cost gradient path.
+        is its reliability-shrunk conditional transport cost, using the same
+        persistent-atlas prior mass ``lambda_i`` as chart writing.  It equals
+        the ordinary conditional cost times observation reliability and has a
+        finite zero-observation derivative.  An undirected connection edge
+        uses the symmetric mean ``(c_i+c_j)/2``; uncertainty analogously uses
+        one minus the geometric mean of observation reliabilities.  Self edges
+        are retained with their node values.  Both quantities are invariant
+        under global SE(3) and local chart-gauge changes, so they are valid
+        scalar attention biases.  ``log1p`` keeps high-cost outliers
+        numerically bounded without detaching the transport/cost gradient path.
         """
 
         edge, active = active_adjacency(atlas)
@@ -724,9 +728,18 @@ class GraftGS(nn.Module):
             source,
             mapping.plan * mapping.cost,
         )
-        epsilon = torch.finfo(mapping.plan.dtype).eps
-        node_cost = node_cost_numerator / mapping.transported_mass.clamp_min(epsilon)
+        if mapping.retention_prior_mass.shape != mapping.transported_mass.shape:
+            raise RuntimeError(
+                "transport posterior prior mass must match active atlas rows"
+            )
+        posterior_mass = (
+            mapping.transported_mass + mapping.retention_prior_mass
+        )
+        node_cost = node_cost_numerator / posterior_mass
         node_cost = torch.log1p(node_cost.clamp_min(0.0))
+        node_cost = finite_gradient_identity(
+            node_cost, "transport_attention.reliability_shrunk_cost"
+        )
         reliability = mapping.observation_reliability.clamp(0.0, 1.0)
         edge_source, edge_target = edge
         edge_ot_cost = 0.5 * (
@@ -750,6 +763,9 @@ class GraftGS(nn.Module):
         edge_uncertainty = 1.0 - geometric_reliability.clamp(
             0.0,
             1.0,
+        )
+        edge_uncertainty = finite_gradient_identity(
+            edge_uncertainty, "transport_attention.edge_uncertainty"
         )
         return edge_ot_cost, edge_uncertainty
 

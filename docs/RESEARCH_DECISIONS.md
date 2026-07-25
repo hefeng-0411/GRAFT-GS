@@ -130,3 +130,11 @@ analytical readout, supervision set, or output geometry.
   installed local Hub checkout. Permitting an opportunistic network fallback
   was rejected because it breaks checkpoint provenance and deterministic
   enterprise-server startup.
+
+## 2026-07-25 posterior-measure moment decision
+
+| Problem | Candidates considered | Selected method | Invariants and stability | Complexity / failure boundary |
+|---|---|---|---|---|
+| Sparse UOT rows whose FP64 mass is positive but FP32 plan storage is zero | Clamp the conditional denominator; floor every plan edge; keep all plan/moments in FP64; discard zero rows; fuse the atlas prior and observation measure | Evaluate every shrunk chart moment as `(sum_j pi_ij f_j + lambda_i f_i^prior)/(sum_j pi_ij + lambda_i)` with `lambda_i=retention_shrinkage*a_i`; zero-prior irreps omit the prior numerator | Algebraically identical to the prior formulation for positive row mass; preserves SE(3)/gauge laws, raw UOT mass, unbalanced support, and the persistent chart prior; the denominator is physically positive rather than dtype-dependent | Same `O(E)` reductions and `O(V)` storage. A non-positive source area or retention coefficient is invalid configuration; A800 backward remains an executable validation boundary |
+| Reliability-conditioned attention cost | Raw conditional `sum(pi C)/sum(pi)`; detach empty rows; arbitrary epsilon; reliability-shrunk conditional | `sum(pi C)/(m+lambda)`, equal to conditional cost times `m/(m+lambda)` | Invariant scalar, exactly zero for an unobserved chart, finite zero-row derivative, no detached transport path | `O(E+V)`; very small `lambda` can still amplify a finite derivative and is governed by the declared retention policy |
+| Origin/coincidence derivatives | Raw norm plus clamp; arbitrary unit direction; detach direction; scale-aware smooth zero stratum | Cutoff/support-relative Charbonnier norm with zero direction at coincidence; use squared distances when only the square is required | Preserves units, rotations, parity, exact zero, and the unique derivative of squared distance; does not invent a gauge direction | Linear in existing tensors; smooth-norm behavior differs only inside `sqrt(machine_epsilon)` times the physical support |

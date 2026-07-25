@@ -25,6 +25,45 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("edge_uncertainty=edge_uncertainty", pipeline)
         self.assertIn("mapping.plan * mapping.cost", pipeline)
 
+    def test_transport_moments_cancel_zero_mass_conditional_quotients(self) -> None:
+        mapping = source("graft_gs/mapping/manifold_mapping.py")
+        pipeline = source("graft_gs/integration/pipeline.py")
+        attention = source("graft_gs/equivariant/gsta.py")
+        readout = source("graft_gs/readout/assets.py")
+        losses = source("graft_gs/engine/losses.py")
+        ddp_validation = source("scripts/validate_ddp_server.py")
+        self.assertIn(
+            "posterior_mass = transported_mass + retention_prior_mass",
+            mapping,
+        )
+        self.assertIn(
+            "retention_prior_mass[:, None] * chart_center",
+            mapping,
+        )
+        self.assertNotIn(
+            "conditional_centers = _segment_sum",
+            mapping,
+        )
+        self.assertIn(
+            "mapping.transported_mass + mapping.retention_prior_mass",
+            pipeline,
+        )
+        self.assertIn("direction_floor = support *", mapping)
+        self.assertIn("direction_floor = cutoff *", attention)
+        self.assertIn("distance_squared", readout)
+        self.assertNotIn("distance = torch.cdist(means, evidence_position)", readout)
+        self.assertIn("query @ target.transpose(0, 1)", losses)
+        self.assertIn("finite_gradient_identity", pipeline)
+        self.assertIn("analytical_readout.gaussian_means", readout)
+        self.assertIn(
+            "test_zero_transport_rows_use_finite_atlas_posterior_moments",
+            ddp_validation,
+        )
+        self.assertIn(
+            "test_coincident_connection_edges_have_finite_center_gradient",
+            ddp_validation,
+        )
+
     def test_implicit_sinkhorn_requires_forward_and_adjoint_convergence(self) -> None:
         mapping = source("graft_gs/mapping/manifold_mapping.py")
         configuration = source("graft_gs/engine/configuration.py")

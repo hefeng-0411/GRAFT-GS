@@ -21,6 +21,7 @@ from graft_gs.engine.losses import (
     multiscale_perceptual_loss,
     structural_similarity_loss,
     surface_pseudo_relational_distillation,
+    symmetric_surface_chamfer,
 )
 from graft_gs.manifold.geometry import so3_exp
 from graft_gs.mapping.manifold_mapping import (
@@ -94,6 +95,18 @@ def _fixture() -> tuple[PersistentOctreeAtlas, object, TopologySelection]:
 
 
 class AnalyticalAssetTest(unittest.TestCase):
+    def test_exact_surface_chamfer_match_has_finite_zero_gradient(self) -> None:
+        target = torch.tensor(
+            [[0.0, 0.0, 0.0], [0.3, -0.2, 0.5], [-0.4, 0.1, 0.2]],
+            dtype=torch.float64,
+        )
+        predicted = target.clone().requires_grad_(True)
+        loss = symmetric_surface_chamfer(predicted, target, chunk_size=2)
+        torch.testing.assert_close(loss, torch.zeros_like(loss))
+        gradient = torch.autograd.grad(loss, predicted)[0]
+        self.assertTrue(torch.all(torch.isfinite(gradient)))
+        torch.testing.assert_close(gradient, torch.zeros_like(gradient))
+
     def test_isotropic_chart_metric_has_finite_basis_free_backward(self) -> None:
         metric = torch.eye(2, dtype=torch.float64).repeat(3, 1, 1)
         metric.requires_grad_(True)
