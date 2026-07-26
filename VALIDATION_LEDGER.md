@@ -727,3 +727,49 @@ sweep's intentional OOM classifier was excluded from that contamination scan.
 - Server-pending: zero-padding metric-gradient and full restoration
   metric-gradient tests, then one fresh 32-view gate. No v2 optimizer-step or
   asset result is claimed.
+
+### Supplied v2 32-view Phase-B closure pass
+
+- Executed remotely by the user on one A800 80 GB with Torch 2.4/CUDA 11.8:
+  the v2 CUDA preflight passed; the production forward, backward, one optimizer
+  step, checkpoint, two-view terminal evaluation, PLY, GLB, and metrics all
+  completed. This closes the previously failing 32-view chart-metric boundary.
+- Loss was finite at `375.6942138671875`. A one-step gate has no meaningful
+  improvement statistic (`0.0`) and is not an overfitting or quality claim.
+- FP64/log UOT converged in 88 iterations: residual
+  `1.5716289e-4 <= 2.1371535e-4`, 14,380 edges, 4,388 source charts, 419
+  evidence targets, storage relative-L1 error `2.2089347e-8`, and discarded
+  underflow mass fraction `5.9861e-44`. Zero stored marginals therefore
+  represent negligible acknowledged mass, not a failed transport solve.
+- Initial and final feasibility were true. Minimum margins were area
+  `2.7361922e-4`, orientation `0.9`, separation `4.4286446e-4`, lower
+  covariance `1.1732638e-3`, and upper covariance `0.99837684`; no restoration
+  or projected constraint was needed in terminal evaluation.
+- Peak allocated/active memory was `39,571,416,064` bytes (46.46% of device);
+  peak reserved was `43,190,845,440` bytes (50.71%). Ending driver-free memory
+  was `41,346,400,256` bytes (48.55%). Local throughput was
+  `0.02622846` views/s over `1,220.05 s`. These are one-step correctness
+  measurements, not steady-state performance.
+- The emitted metrics used Python's non-standard bare `Infinity` for an
+  inactive linearized margin. The strict-JSON serializer repair is locally
+  compiled/static-validated (`76/76`, one expected skip) but was not part of
+  this already successful A800 run.
+
+### Post-closure strict production-metrics gate
+
+- Local whole-tree `compileall`: passed.
+- Local command:
+  `python -m unittest -v tests.test_environment_contract_static
+  tests.test_server_manifest_handoff_static
+  tests.test_meshfleet_dynamic_discovery tests.test_meshfleet_manifest_static
+  tests.test_scientific_trace_static
+  tests.test_view_budget_selection_static`.
+- Result: `77/77` executed tests passed in `6.851 s`; one separate
+  PyTorch-dependent MeshFleet tensor-loading test was expectedly skipped.
+- New failure condition: trainer/evaluation/concurrency JSON writers reject
+  NaN or infinity. A rejected candidate with unavailable rank memory fields
+  remains serializable using JSON `null`; the selector test independently
+  verifies this behavior.
+- Server-pending: the metadata-only strict-writer extension does not require
+  repeating the already passed 32-view numerical gate. Production Phase-A/B
+  logs generated from this source must be strict-JSON parseable.

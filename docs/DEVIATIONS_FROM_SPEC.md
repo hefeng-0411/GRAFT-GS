@@ -365,3 +365,10 @@ sparse-row representation. Adding a detached storage-relative `delta^2`
 preserves the upper-bound proof and constraint set while selecting a finite
 zero-padding derivative. No feasibility margin, primal correction, loss, or
 nonzero covector is discarded.
+
+## Tagged positive infinity in JSON reports
+
+Empty feasibility families retain their exact unbounded-positive semantics as
+the strict-JSON string tag `"positive_infinity"`. This affects metadata only;
+the in-memory mathematical report continues to use IEEE positive infinity.
+NaN and negative infinity are rejected rather than sanitized.

@@ -43,6 +43,8 @@ def _positive_margin(value: object) -> bool:
     # ``+inf`` is the exact report convention for an empty constraint family
     # (for example, no nonlocal collision pair). It is a valid positive margin;
     # NaN, -inf, zero, and negative margins are not.
+    if value == "positive_infinity":
+        return True
     return (
         isinstance(value, (int, float))
         and not isinstance(value, bool)
@@ -425,19 +427,19 @@ def audit_report(
         "global_useful_views": sum(local_views),
         "aggregate_views_per_second": sum(throughput),
         "maximum_peak_reserved_fraction": (
-            max(peak_reserved) if peak_reserved else float("inf")
+            max(peak_reserved) if peak_reserved else None
         ),
         "maximum_peak_allocated_fraction": (
-            max(peak_allocated) if peak_allocated else float("inf")
+            max(peak_allocated) if peak_allocated else None
         ),
         "maximum_peak_active_fraction": (
-            max(peak_active) if peak_active else float("inf")
+            max(peak_active) if peak_active else None
         ),
         "maximum_ending_reserved_fraction": (
-            max(ending_reserved) if ending_reserved else float("inf")
+            max(ending_reserved) if ending_reserved else None
         ),
         "minimum_ending_driver_free_fraction": (
-            min(ending_driver_free) if ending_driver_free else float("-inf")
+            min(ending_driver_free) if ending_driver_free else None
         ),
         "maximum_trellis_conditioning_views": (
             max(conditioning_views) if conditioning_views else 0
@@ -583,8 +585,11 @@ def main() -> None:
         "selection_error": selection_error,
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(output, indent=2, sort_keys=True), encoding="utf8")
-    print(json.dumps(output, indent=2, sort_keys=True))
+    args.output.write_text(
+        json.dumps(output, indent=2, sort_keys=True, allow_nan=False),
+        encoding="utf8",
+    )
+    print(json.dumps(output, indent=2, sort_keys=True, allow_nan=False))
     if selection_error is not None:
         rejection_summary = "; ".join(
             f"{candidate['path']}: {', '.join(candidate['reasons'])}"

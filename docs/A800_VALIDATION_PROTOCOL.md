@@ -723,6 +723,14 @@ test -f "$RUN_DIR/meshfleet_overfit.ply"
 test -f "$RUN_DIR/meshfleet_overfit.glb"
 ```
 
+The supplied v2 A800 run passed this gate at 32 views: the preflight marker,
+finite backward/optimizer step, checkpoint, atlas-autoencoding evaluation,
+PLY, GLB, converged FP64 UOT, and positive feasibility margins were all
+present. Do not rerun this expensive one-step gate unless the mapped,
+restoration, renderer, or trainer numerical path changes. Proceed to the
+phase-aware production smoke/exact-resume checks below and then staged
+training.
+
 `--maximum-views` fixes the global same-object evidence count even when
 `CUDA_VISIBLE_DEVICES` exposes a dynamic number of ranks; `--views-per-rank`
 would multiply the numerical problem by `WORLD_SIZE` and would not reproduce

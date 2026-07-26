@@ -608,8 +608,15 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("maximum_views = args.views_per_rank * world_size", overfit)
         self.assertIn('"--evaluation-views"', overfit)
         self.assertIn('"rank_performance": rank_performance', overfit)
-        self.assertIn('"initial_feasibility": scene.feasibility_reports[0].__dict__', overfit)
-        self.assertIn('"final_feasibility": scene.feasibility_reports[-1].__dict__', overfit)
+        self.assertIn(
+            '"initial_feasibility": scene.feasibility_reports[0].to_json_dict()',
+            overfit,
+        )
+        self.assertIn(
+            '"final_feasibility": scene.feasibility_reports[-1].to_json_dict()',
+            overfit,
+        )
+        self.assertIn("allow_nan=False", overfit)
         self.assertIn('"fixed_point_residual": transport.fixed_point_residual', overfit)
         selector = source("scripts/select_a800_view_budget.py")
         sweep = source("scripts/sweep_a800_view_budget.py")
@@ -643,6 +650,11 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("ending_driver_free_fraction", trainer)
         self.assertIn("trellis_cache_released_reserved_bytes", trainer)
         self.assertIn("local_views_per_second", trainer)
+        self.assertIn(
+            "json.dumps(record, sort_keys=True, allow_nan=False)",
+            trainer,
+        )
+        self.assertIn("allow_nan=False", training)
         self.assertIn("release_cuda_cache_after_sampling: true", config)
         self.assertIn("offload_cuda_pipeline_after_sampling: true", config)
         self.assertIn("maximum_conditioning_views: 16", config)

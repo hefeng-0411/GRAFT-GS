@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 from typing import List, Tuple
 
 import numpy as np
@@ -151,6 +152,29 @@ class FeasibilityReport:
     accepted_step: float = 0.0
     restoration_iterations: int = 0
     restoration_maximum_displacement: float = 0.0
+
+    def to_json_dict(self) -> dict[str, bool | int | float | str]:
+        """Return an RFC-8259-safe feasibility certificate.
+
+        Positive infinity is the exact convention for an empty constraint
+        family or for a linearized margin that was never activated. JSON has
+        no infinity literal, so preserve that meaning with an explicit tag.
+        NaN and negative infinity can never be valid certificates and fail
+        closed instead of being emitted through Python's non-standard JSON
+        extension.
+        """
+
+        result: dict[str, bool | int | float | str] = {}
+        for name, value in self.__dict__.items():
+            if isinstance(value, float) and not math.isfinite(value):
+                if value == math.inf:
+                    result[name] = "positive_infinity"
+                    continue
+                raise ValueError(
+                    f"feasibility field {name} is not JSON-serializable: {value}"
+                )
+            result[name] = value
+        return result
 
 
 class BarrierProjector:

@@ -177,7 +177,7 @@ def main() -> None:
             scene.mapping.observation_reliability.mean().detach().cpu()
         ),
         "betti": scene.topology.selected.betti,
-        "feasibility": scene.feasibility_reports[-1].__dict__,
+        "feasibility": scene.feasibility_reports[-1].to_json_dict(),
         "quantization_topology_certificate": quantization_topology_certificate,
         "gaussians": scene.gaussians.means.shape[0],
         "faces": scene.mesh.faces.shape[0],
@@ -187,7 +187,10 @@ def main() -> None:
         "checkpoint": checkpoint_report.__dict__ if checkpoint_report is not None else None,
     }
     metrics_path = args.output_directory / "inference_metrics.json"
-    metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf8")
+    metrics_path.write_text(
+        json.dumps(metrics, indent=2, allow_nan=False),
+        encoding="utf8",
+    )
     print(metrics)
 
 

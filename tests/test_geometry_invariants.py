@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import copy
+import json
+import math
 import unittest
 from unittest import mock
 
@@ -25,7 +27,12 @@ from graft_gs.equivariant.gsta import (
 from graft_gs.geometry.atlas import AtlasConfig, PersistentOctreeAtlas
 from graft_gs.integration.pipeline import GraftGSOutput
 from graft_gs.integration.vggt_adapter import VGGTGeometryOutput
-from graft_gs.manifold.barrier import BarrierConfig, BarrierProjector, triangle_distance_squared
+from graft_gs.manifold.barrier import (
+    BarrierConfig,
+    BarrierProjector,
+    FeasibilityReport,
+    triangle_distance_squared,
+)
 from graft_gs.manifold.geometry import (
     ManifoldState,
     ManifoldTangent,
@@ -1044,6 +1051,27 @@ class TopologyAndManifoldTest(unittest.TestCase):
         metric_gradient = torch.autograd.grad(bound, metric_inverse)[0]
         self.assertTrue(torch.isfinite(bound))
         self.assertTrue(torch.all(torch.isfinite(metric_gradient)))
+
+    def test_feasibility_report_uses_strict_json_infinity_tag(self) -> None:
+        report = FeasibilityReport(
+            feasible=True,
+            minimum_area_margin=0.1,
+            minimum_orientation_margin=0.2,
+            minimum_separation_margin=math.inf,
+            minimum_covariance_margin=0.3,
+            maximum_covariance_margin=0.4,
+        )
+        payload = report.to_json_dict()
+        self.assertEqual(
+            payload["minimum_separation_margin"],
+            "positive_infinity",
+        )
+        rendered = json.dumps(payload, allow_nan=False)
+        self.assertNotIn("Infinity", rendered)
+
+        report.minimum_separation_margin = -math.inf
+        with self.assertRaisesRegex(ValueError, "not JSON-serializable"):
+            report.to_json_dict()
 
     def test_triangle_collision_distance_detects_face_crossing(self) -> None:
         dtype = torch.float64

@@ -613,14 +613,14 @@ def main() -> None:
                 scene.topology.selected.persistence_matching_mode
             ),
         },
-        "initial_feasibility": scene.feasibility_reports[0].__dict__,
-        "final_feasibility": scene.feasibility_reports[-1].__dict__,
+        "initial_feasibility": scene.feasibility_reports[0].to_json_dict(),
+        "final_feasibility": scene.feasibility_reports[-1].to_json_dict(),
         "ply": str(ply),
         "glb": str(glb),
     }
     args.output.mkdir(parents=True, exist_ok=True)
     (args.output / "overfit_metrics.json").write_text(
-        json.dumps(summary, indent=2), encoding="utf8"
+        json.dumps(summary, indent=2, allow_nan=False), encoding="utf8"
     )
     if improvement < args.minimum_relative_improvement:
         raise RuntimeError(

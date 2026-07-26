@@ -381,7 +381,13 @@ def main() -> None:
         precision_path = Path(args.output) / "precision_policy.json"
         precision_path.parent.mkdir(parents=True, exist_ok=True)
         precision_path.write_text(
-            json.dumps(precision_record, indent=2, sort_keys=True) + "\n",
+            json.dumps(
+                precision_record,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            + "\n",
             encoding="utf8",
         )
     dataset_format = args.dataset_format
@@ -467,6 +473,7 @@ def main() -> None:
                     },
                     indent=2,
                     sort_keys=True,
+                    allow_nan=False,
                 )
                 + "\n",
                 encoding="utf8",

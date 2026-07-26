@@ -2242,14 +2242,16 @@ class GraftGSTrainer:
                 "unexpected_keys": incompatible.unexpected_keys,
             }
             with self.log_path.open("a", encoding="utf8") as file:
-                file.write(json.dumps(record, sort_keys=True) + "\n")
+                file.write(
+                    json.dumps(record, sort_keys=True, allow_nan=False) + "\n"
+                )
 
     def _log(self, metrics: Mapping[str, float]) -> None:
         if self.context.rank != 0:
             return
         record = {"step": self.global_step, "phase": self.config.phase.value, **metrics}
         with self.log_path.open("a", encoding="utf8") as file:
-            file.write(json.dumps(record, sort_keys=True) + "\n")
+            file.write(json.dumps(record, sort_keys=True, allow_nan=False) + "\n")
 
 
 __all__ = [

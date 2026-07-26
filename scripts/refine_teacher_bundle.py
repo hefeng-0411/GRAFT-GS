@@ -241,7 +241,7 @@ def main() -> None:
         "reprojection_rmse": float(result.reprojection_rmse.cpu()),
         "topology_entropy": float(result.topology_entropy.cpu()),
         "cycle_residual": float(result.cycle_residual.cpu()),
-        "feasibility": result.feasibility.__dict__,
+        "feasibility": result.feasibility.to_json_dict(),
         "topology": scene.topology.selected.identifier,
         "betti": scene.topology.selected.betti,
         "ply": str(ply),
@@ -252,9 +252,15 @@ def main() -> None:
         "final_loss": result.loss_history[-1],
     }
     metadata_path.write_text(
-        json.dumps(metadata, indent=2, sort_keys=True), encoding="utf8"
+        json.dumps(
+            metadata,
+            indent=2,
+            sort_keys=True,
+            allow_nan=False,
+        ),
+        encoding="utf8",
     )
-    print(json.dumps(metadata, indent=2, sort_keys=True))
+    print(json.dumps(metadata, indent=2, sort_keys=True, allow_nan=False))
 
 
 if __name__ == "__main__":

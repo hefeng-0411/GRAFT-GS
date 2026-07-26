@@ -100,14 +100,20 @@ def main() -> None:
         "losses": losses,
     }
     output_directory.mkdir(parents=True, exist_ok=True)
-    (output_directory / "overfit_metrics.json").write_text(json.dumps(summary, indent=2), encoding="utf8")
+    (output_directory / "overfit_metrics.json").write_text(
+        json.dumps(summary, indent=2, allow_nan=False),
+        encoding="utf8",
+    )
     trainer.save_checkpoint(output_directory / "final.pt")
     trainer.module.eval()
     with torch.no_grad():
         result = trainer.module(images.to(trainer.context.device), render_input_views=True)
     ply, glb = result.scenes[0].export(output_directory, "overfit")
     summary.update(ply=str(ply), glb=str(glb))
-    (output_directory / "overfit_metrics.json").write_text(json.dumps(summary, indent=2), encoding="utf8")
+    (output_directory / "overfit_metrics.json").write_text(
+        json.dumps(summary, indent=2, allow_nan=False),
+        encoding="utf8",
+    )
     if relative_improvement < args.minimum_relative_improvement:
         raise RuntimeError(
             f"one-object overfit failed: relative loss improvement {relative_improvement:.6f} "

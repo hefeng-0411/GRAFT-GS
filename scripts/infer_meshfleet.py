@@ -320,7 +320,7 @@ def main() -> None:
         ),
         "shape_prior_active": scene.topology_shape_prior_probability is not None,
         "betti": scene.topology.selected.betti,
-        "feasibility": scene.feasibility_reports[-1].__dict__,
+        "feasibility": scene.feasibility_reports[-1].to_json_dict(),
         "quantization_topology_certificate": quantization_topology_certificate,
         "gaussians": scene.gaussians.means.shape[0],
         "mesh_faces": scene.mesh.faces.shape[0],
@@ -342,8 +342,11 @@ def main() -> None:
         "topology_activation_reason": sample["topology_activation_reason"],
     }
     metrics_path = args.output_directory / "meshfleet_inference_metrics.json"
-    metrics_path.write_text(json.dumps(metrics, indent=2), encoding="utf8")
-    print(json.dumps(metrics, indent=2))
+    metrics_path.write_text(
+        json.dumps(metrics, indent=2, allow_nan=False),
+        encoding="utf8",
+    )
+    print(json.dumps(metrics, indent=2, allow_nan=False))
 
 
 if __name__ == "__main__":

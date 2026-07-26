@@ -1171,3 +1171,42 @@ The full conditional validity domain is maintained in
   dataset/manifest/selection/production guards pass (`6.498 s`, one expected
   no-PyTorch loader skip). Torch restoration tests and one 32-view A800 gate
   remain server-pending.
+
+### A800 closure result and strict metrics serialization
+
+- The supplied v2 run printed
+  `GRAFT_GS_NUMERICAL_PREFLIGHT=phase-b-rational-spd-zero-dual-v2:passed` and
+  completed the real 32-view Phase-B forward, backward, optimizer step,
+  checkpoint, terminal atlas-autoencoding evaluation, PLY, GLB, and metrics.
+  No named cotangent boundary fired.
+- `FeasibilityReport.to_json_dict()` now maps the exact positive-infinity
+  convention for an absent constraint family to the explicit
+  `"positive_infinity"` tag. NaN and negative infinity fail closed. Overfit,
+  inference, teacher-refinement, and ablation writers use `allow_nan=False`;
+  the concurrency selector accepts the tagged unbounded positive margin.
+  This repairs the successful run's otherwise non-RFC bare `Infinity` token
+  without changing any training tensor or certificate.
+- Whole-tree compilation and all 76 locally executable guards pass after the
+  serialization repair (`6.508 s`, one expected no-PyTorch loader skip).
+
+### Strict production metrics and selector diagnostics
+
+- Extended RFC-8259 fail-closed serialization from feasibility artifacts to
+  the real trainer `metrics.jsonl`, phase-initialization events, A800 precision
+  and dataset-coverage records, corpus evaluation records, the legacy
+  one-object overfit writer, and concurrency-selection output.
+- An incomplete/rejected concurrency candidate now records unavailable memory
+  extrema as JSON `null`. It no longer invents positive or negative infinity
+  merely to represent a missing measurement. The exact
+  `"positive_infinity"` feasibility tag remains reserved for a mathematically
+  empty constraint family.
+- Production paths changed:
+  `graft_gs/engine/trainer.py`, `scripts/train_a800.py`,
+  `scripts/evaluate_meshfleet.py`, `scripts/overfit_one_object.py`, and
+  `scripts/select_a800_view_budget.py`. Static guards changed in
+  `tests/test_scientific_trace_static.py` and
+  `tests/test_view_budget_selection_static.py`.
+- Whole-tree compilation passes. All 77 locally executable
+  environment/manifest/dataset/production/selector guards pass in `6.851 s`;
+  the one PyTorch-dependent loader test is expectedly skipped in the local
+  drafting runtime.

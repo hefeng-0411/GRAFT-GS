@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import importlib.util
+import json
 import os
 from pathlib import Path
 from types import SimpleNamespace
@@ -203,6 +204,10 @@ class ViewBudgetSelectionTest(unittest.TestCase):
         value = report(16, 10.0, 0.3)
         value["final_feasibility"]["minimum_separation_margin"] = float("inf")
         self.assertTrue(MODULE.audit_report(value, 0.85)["admissible"])
+        value["final_feasibility"][
+            "minimum_separation_margin"
+        ] = "positive_infinity"
+        self.assertTrue(MODULE.audit_report(value, 0.85)["admissible"])
 
     def test_selects_largest_safe_near_optimal_throughput_budget(self) -> None:
         candidates = []
@@ -228,6 +233,14 @@ class ViewBudgetSelectionTest(unittest.TestCase):
         self.assertIn("sparse transport is not certified converged", candidate["reasons"])
         with self.assertRaisesRegex(RuntimeError, "no concurrency candidate"):
             MODULE.select_candidate([candidate], 0.97)
+
+    def test_rejected_incomplete_candidate_remains_strict_json(self) -> None:
+        incomplete = report(16, 10.0, 0.3)
+        incomplete["rank_performance"] = []
+        candidate = MODULE.audit_report(incomplete, 0.85)
+        self.assertFalse(candidate["admissible"])
+        rendered = json.dumps(candidate, allow_nan=False)
+        self.assertIn('"maximum_peak_allocated_fraction": null', rendered)
 
     def test_edge_underflow_count_is_diagnostic_when_discarded_mass_is_tiny(self) -> None:
         valid = report(32, 10.0, 0.5)

@@ -168,7 +168,7 @@ def main() -> None:
             ),
             "betti": scene.topology.selected.betti,
             "minimum_immersion_margin": float(barrier.min()),
-            "feasibility": scene.feasibility_reports[-1].__dict__,
+            "feasibility": scene.feasibility_reports[-1].to_json_dict(),
             "atlas_rejected_evidence_count": scene.atlas_rejected_evidence_count,
             "atlas_rejected_evidence_mass": scene.atlas_rejected_evidence_mass,
             "gaussians": int(scene.gaussians.means.shape[0]),
@@ -177,7 +177,10 @@ def main() -> None:
             "checkpoint_step": checkpoint_report.global_step,
         }
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(records, indent=2), encoding="utf8")
+    args.output.write_text(
+        json.dumps(records, indent=2, allow_nan=False),
+        encoding="utf8",
+    )
 
 
 if __name__ == "__main__":

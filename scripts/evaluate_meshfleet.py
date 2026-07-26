@@ -37,7 +37,7 @@ from graft_gs.integration import (
 
 def _append_jsonl(path: Path, value: dict[str, object]) -> None:
     with path.open("a", encoding="utf8", newline="\n") as file:
-        file.write(json.dumps(value, sort_keys=True) + "\n")
+        file.write(json.dumps(value, sort_keys=True, allow_nan=False) + "\n")
 
 
 def _read_jsonl(path: Path) -> list[dict[str, object]]:
@@ -294,7 +294,10 @@ def main() -> None:
         all_metrics.sort(key=lambda value: (str(value["split"]), str(value["object_id"])))
         merged = args.output_directory / "metrics.jsonl"
         merged.write_text(
-            "".join(json.dumps(value, sort_keys=True) + "\n" for value in all_metrics),
+            "".join(
+                json.dumps(value, sort_keys=True, allow_nan=False) + "\n"
+                for value in all_metrics
+            ),
             encoding="utf8",
         )
         ok = sum(value["status"] == "ok" for value in all_metrics)
@@ -313,9 +316,16 @@ def main() -> None:
             "complete": len(all_metrics) == total_admitted and ok == total_admitted,
         }
         (args.output_directory / "summary.json").write_text(
-            json.dumps(summary, indent=2, sort_keys=True) + "\n", encoding="utf8"
+            json.dumps(
+                summary,
+                indent=2,
+                sort_keys=True,
+                allow_nan=False,
+            )
+            + "\n",
+            encoding="utf8",
         )
-        print(json.dumps(summary, indent=2, sort_keys=True))
+        print(json.dumps(summary, indent=2, sort_keys=True, allow_nan=False))
     if world_size > 1:
         dist.barrier()
         dist.destroy_process_group()

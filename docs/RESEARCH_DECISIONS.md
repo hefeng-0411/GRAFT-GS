@@ -120,6 +120,17 @@ projected-gradient step may only decrease. Its zero-covector metric derivative
 is finite and exactly zero because `dq/dG^-1=g g^T=0`. Complexity and memory
 remain `O(J)` and no constraint or gradient row is removed.
 
+## Strict serialization of empty feasibility families
+
+An empty constraint family has mathematical minimum margin `+infinity`, but
+RFC 8259 JSON has no infinity literal. Silently emitting Python's bare
+`Infinity` extension was rejected because strict evaluators cannot reload it;
+replacing it with zero or a large finite number was rejected because both
+falsify the certificate. Feasibility reports therefore serialize exact
+positive infinity as the explicit string tag `"positive_infinity"`. NaN and
+negative infinity fail closed, writers use `allow_nan=False`, and report
+auditors recognize only that exact positive-unbounded tag.
+
 ## Selected end-to-end factorization
 
 ```text
