@@ -11,6 +11,7 @@ import torch
 import torch.nn.functional as F
 from scipy.spatial import cKDTree
 from torch import Tensor
+from torch.utils.checkpoint import checkpoint
 
 from .geometry import (
     ManifoldState,
@@ -152,6 +153,7 @@ class FeasibilityReport:
     accepted_step: float = 0.0
     restoration_iterations: int = 0
     restoration_maximum_displacement: float = 0.0
+    restoration_degenerate_constraints: int = 0
 
     def to_json_dict(self) -> dict[str, bool | int | float | str]:
         """Return an RFC-8259-safe feasibility certificate.
@@ -189,6 +191,10 @@ class BarrierProjector:
     def __init__(self, reference: ManifoldState, config: BarrierConfig = BarrierConfig()) -> None:
         self.config = config
         self.faces = reference.complex.faces
+        self.vertex_identifier = reference.complex.atlas_node_index.detach()
+        self.reference_rotation_diagnostics = reference.rotation.detach().to(
+            dtype=torch.float64
+        )
         face_position = reference.position[self.faces]
         cross = torch.linalg.cross(face_position[:, 1] - face_position[:, 0], face_position[:, 2] - face_position[:, 0])
         self.reference_face_normal = F.normalize(cross, dim=-1)
@@ -531,6 +537,7 @@ class BarrierProjector:
         support: Tensor,
         metric_inverse: Tensor,
         linear: Tensor,
+        checkpoint_iterations: bool = False,
     ) -> Tuple[Tensor, Tensor, float]:
         """Projected-gradient solve for the exact sparse CBF dual."""
 
@@ -547,47 +554,91 @@ class BarrierProjector:
         step = 1.0 / spectral_bound
         dual = torch.zeros_like(linear)
         residual_value = float("inf")
-        for iteration in range(self.config.dual_iterations):
-            gram_dual = self._sparse_gram_product(
-                gradient,
-                support,
-                dual,
-                metric_inverse,
-                self.config.dual_regularization,
+        completed_iterations = 0
+        while completed_iterations < self.config.dual_iterations:
+            block_iterations = min(
+                self.config.dual_check_interval,
+                self.config.dual_iterations - completed_iterations,
             )
-            dual = torch.relu(dual - step * (gram_dual + linear))
-            should_check = (
-                (iteration + 1) % self.config.dual_check_interval == 0
-                or iteration + 1 == self.config.dual_iterations
-            )
-            if should_check:
-                fixed_dual = torch.relu(
-                    dual
-                    - step
-                    * (
-                        self._sparse_gram_product(
-                            gradient,
-                            support,
-                            dual,
-                            metric_inverse,
-                            self.config.dual_regularization,
-                        )
-                        + linear
+
+            def update_block(
+                block_dual: Tensor,
+                block_gradient: Tensor,
+                block_support: Tensor,
+                block_metric_inverse: Tensor,
+                block_linear: Tensor,
+                block_step: Tensor,
+                iterations: int = block_iterations,
+            ) -> Tensor:
+                for _ in range(iterations):
+                    gram_dual = self._sparse_gram_product(
+                        block_gradient,
+                        block_support,
+                        block_dual,
+                        block_metric_inverse,
+                        self.config.dual_regularization,
                     )
+                    block_dual = torch.relu(
+                        block_dual - block_step * (gram_dual + block_linear)
+                    )
+                return block_dual
+
+            use_checkpoint = checkpoint_iterations and torch.is_grad_enabled() and any(
+                value.requires_grad
+                for value in (gradient, metric_inverse, linear, step)
+            )
+            if use_checkpoint:
+                # Restoration differentiates through the exact unrolled QP. Save
+                # one state per convergence block and recompute its inexpensive
+                # sparse products in backward instead of retaining every iterate.
+                dual = checkpoint(
+                    update_block,
+                    dual,
+                    gradient,
+                    support,
+                    metric_inverse,
+                    linear,
+                    step,
+                    use_reentrant=False,
+                    preserve_rng_state=False,
                 )
-                residual = torch.max(torch.abs(fixed_dual - dual))
-                threshold = self.config.dual_tolerance * (
-                    1.0 + dual.abs().amax()
+            else:
+                dual = update_block(
+                    dual,
+                    gradient,
+                    support,
+                    metric_inverse,
+                    linear,
+                    step,
                 )
-                residual_value, threshold_value = (
-                    float(value)
-                    for value in torch.stack((residual, threshold))
-                    .detach()
-                    .cpu()
-                    .tolist()
+            completed_iterations += block_iterations
+            fixed_dual = torch.relu(
+                dual
+                - step
+                * (
+                    self._sparse_gram_product(
+                        gradient,
+                        support,
+                        dual,
+                        metric_inverse,
+                        self.config.dual_regularization,
+                    )
+                    + linear
                 )
-                if residual_value <= threshold_value:
-                    break
+            )
+            residual = torch.max(torch.abs(fixed_dual - dual))
+            threshold = self.config.dual_tolerance * (
+                1.0 + dual.abs().amax()
+            )
+            residual_value, threshold_value = (
+                float(value)
+                for value in torch.stack((residual, threshold))
+                .detach()
+                .cpu()
+                .tolist()
+            )
+            if residual_value <= threshold_value:
+                break
         correction = self._sparse_constraint_transpose(
             gradient,
             support,
@@ -637,6 +688,123 @@ class BarrierProjector:
             )
         )
         return target, scale
+
+    def _pair_tie_break_direction(self, pair: Tensor, dtype: torch.dtype) -> Tensor:
+        """Return deterministic frame-equivariant directions for coincident pairs."""
+
+        identifier = self.vertex_identifier[pair].to(dtype=torch.int64)
+        key = torch.bitwise_xor(
+            (identifier[:, 0] + 1) * 73_856_093,
+            (identifier[:, 1] + 1) * 19_349_663,
+        ).abs()
+        azimuth_fraction = (
+            key.remainder(104_729).to(dtype=dtype) + 0.5
+        ) / 104_729.0
+        height_fraction = (
+            torch.div(key, 104_729, rounding_mode="floor")
+            .remainder(130_363)
+            .to(dtype=dtype)
+            + 0.5
+        ) / 130_363.0
+        height = 2.0 * height_fraction - 1.0
+        radius = torch.sqrt((1.0 - height.square()).clamp_min(0.0))
+        azimuth = 2.0 * torch.pi * azimuth_fraction
+        local_direction = torch.stack(
+            (
+                radius * torch.cos(azimuth),
+                radius * torch.sin(azimuth),
+                height,
+            ),
+            dim=-1,
+        )
+        frame = self.reference_rotation_diagnostics[pair[:, 0]].to(dtype=dtype)
+        return F.normalize(
+            torch.einsum("nij,nj->ni", frame, local_direction),
+            dim=-1,
+        )
+
+    def _regularize_degenerate_restoration_gradient(
+        self,
+        position: Tensor,
+        constraint: Tensor,
+        gradient: Tensor,
+    ) -> Tuple[Tensor, int]:
+        """Supply a conditional first-order escape from exact collisions.
+
+        Squared separation has an exact zero gradient when two closest features
+        coincide. The strict certificate still evaluates the unmodified squared
+        distance; this tie-break only resolves the otherwise non-unique first
+        restoration direction at that measure-zero point.
+        """
+
+        face_count = int(self.faces.shape[0])
+        pair_count = int(self.nonlocal_pairs.shape[0])
+        face_pair_count = int(self.nonlocal_face_pairs.shape[0])
+        pair_start = 2 * face_count
+        face_pair_start = pair_start + pair_count
+        minimum_distance_squared = self.config.minimum_separation**2
+        finfo = torch.finfo(position.dtype)
+        centered_position = position.detach() - position.detach().mean(
+            dim=0,
+            keepdim=True,
+        )
+        coordinate_scale_squared = (
+            centered_position.square().sum(-1).amax().clamp_min(
+                minimum_distance_squared
+            )
+        )
+        zero_distance_tolerance = 32.0 * finfo.eps * coordinate_scale_squared
+        pieces = [gradient[:pair_start]]
+        degenerate_count = 0
+
+        pair_gradient = gradient[pair_start:face_pair_start]
+        if pair_count:
+            pair_distance_squared = (
+                constraint[pair_start:face_pair_start] + minimum_distance_squared
+            ).detach()
+            degenerate_pair = pair_distance_squared <= zero_distance_tolerance
+            direction = self._pair_tie_break_direction(
+                self.nonlocal_pairs,
+                position.dtype,
+            )
+            surrogate = torch.zeros_like(pair_gradient)
+            surrogate[:, 0] = 2.0 * self.config.minimum_separation * direction
+            surrogate[:, 1] = -surrogate[:, 0]
+            pair_gradient = torch.where(
+                degenerate_pair[:, None, None],
+                surrogate,
+                pair_gradient,
+            )
+            degenerate_count += int(degenerate_pair.sum().detach().cpu())
+        pieces.append(pair_gradient)
+
+        face_pair_gradient = gradient[face_pair_start:]
+        if face_pair_count:
+            face_pair_distance_squared = (
+                constraint[face_pair_start:] + minimum_distance_squared
+            ).detach()
+            degenerate_face_pair = (
+                face_pair_distance_squared <= zero_distance_tolerance
+            )
+            left_face = self.nonlocal_face_pairs[:, 0]
+            direction = F.normalize(
+                self.reference_face_normal_diagnostics[left_face].to(
+                    dtype=position.dtype
+                ),
+                dim=-1,
+            )
+            surrogate = torch.zeros_like(face_pair_gradient)
+            amplitude = 2.0 * self.config.minimum_separation / 3.0
+            surrogate[:, :3] = amplitude * direction[:, None, :]
+            surrogate[:, 3:] = -amplitude * direction[:, None, :]
+            face_pair_gradient = torch.where(
+                degenerate_face_pair[:, None, None],
+                surrogate,
+                face_pair_gradient,
+            )
+            degenerate_count += int(degenerate_face_pair.sum().detach().cpu())
+        pieces.append(face_pair_gradient)
+        return torch.cat(pieces), degenerate_count
 
     @staticmethod
     def _replace_position(state: ManifoldState, position: Tensor) -> ManifoldState:
@@ -694,6 +862,7 @@ class BarrierProjector:
         last_report = initial_report
         completed_iterations = 0
         last_dual_residual = float("inf")
+        degenerate_constraints = 0
 
         for iteration in range(1, self.config.restoration_iterations + 1):
             completed_iterations = iteration
@@ -705,6 +874,14 @@ class BarrierProjector:
                 position,
                 diagnostics=True,
             )
+            constraint_gradient, iteration_degenerate_constraints = (
+                self._regularize_degenerate_restoration_gradient(
+                    position,
+                    constraint,
+                    constraint_gradient,
+                )
+            )
+            degenerate_constraints += iteration_degenerate_constraints
             normalized = (constraint - target) / scale
             active = normalized < 0.0
             if not bool(torch.any(active)):
@@ -728,6 +905,7 @@ class BarrierProjector:
                 active_support,
                 metric_inverse,
                 linear,
+                checkpoint_iterations=True,
             )
             if not bool(torch.all(torch.isfinite(correction))):
                 raise RuntimeError("embedding-restoration QP produced a non-finite step")
@@ -775,6 +953,7 @@ class BarrierProjector:
         final_report = self.report(restored)
         final_report.restoration_iterations = completed_iterations
         final_report.dual_residual = last_dual_residual
+        final_report.restoration_degenerate_constraints = degenerate_constraints
         final_report.restoration_maximum_displacement = float(
             torch.linalg.vector_norm(
                 restored.position.detach().to(dtype=torch.float64)

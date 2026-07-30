@@ -25,7 +25,7 @@ from graft_gs.equivariant.gsta import (
     matrix_to_l2,
 )
 from graft_gs.geometry.atlas import AtlasConfig, PersistentOctreeAtlas
-from graft_gs.integration.pipeline import GraftGSOutput
+from graft_gs.integration.pipeline import GraftGS, GraftGSOutput
 from graft_gs.integration.vggt_adapter import VGGTGeometryOutput
 from graft_gs.manifold.barrier import (
     BarrierConfig,
@@ -1005,6 +1005,219 @@ class TopologyAndManifoldTest(unittest.TestCase):
         self.assertIsNotNone(state.evidence_metric.grad)
         self.assertTrue(torch.all(torch.isfinite(state.evidence_metric.grad)))
 
+    def test_stratum_search_builds_autograd_only_for_selected_candidate(
+        self,
+    ) -> None:
+        class CandidateSelection:
+            def __init__(self) -> None:
+                complex_ = mock.Mock()
+                complex_.manifold_incidence_valid.return_value = True
+                complex_.orientation_consistent.return_value = True
+                self.candidates = [
+                    mock.Mock(
+                        total_energy=torch.tensor(0.0, requires_grad=True),
+                        identifier="rejected",
+                        manifold_incidence_valid=True,
+                        orientation_consistent=True,
+                        complex=complex_,
+                    ),
+                    mock.Mock(
+                        total_energy=torch.tensor(1.0, requires_grad=True),
+                        identifier="selected",
+                        manifold_incidence_valid=True,
+                        orientation_consistent=True,
+                        complex=complex_,
+                    ),
+                ]
+                self.selected_index = 0
+
+            @property
+            def selected(self) -> object:
+                return self.candidates[self.selected_index]
+
+        selection = CandidateSelection()
+        harness = mock.Mock()
+        calls = []
+
+        def materialize(*_: object) -> tuple[object, object, FeasibilityReport]:
+            calls.append((selection.selected_index, torch.is_grad_enabled()))
+            if selection.selected_index == 0:
+                raise RuntimeError("synthetic rejection")
+            return (
+                object(),
+                object(),
+                FeasibilityReport(
+                    feasible=True,
+                    minimum_area_margin=1.0,
+                    minimum_orientation_margin=1.0,
+                    minimum_separation_margin=1.0,
+                    minimum_covariance_margin=1.0,
+                    maximum_covariance_margin=1.0,
+                ),
+            )
+
+        harness._materialize_feasible_stratum.side_effect = materialize
+        result = GraftGS._select_feasible_stratum(
+            harness,
+            mock.Mock(),
+            mock.Mock(),
+            selection,
+            torch.ones(1),
+        )
+        self.assertIs(result[0], selection)
+        self.assertEqual(selection.selected_index, 1)
+        self.assertEqual(calls, [(0, False), (1, False), (1, True)])
+
+    def test_restoration_escapes_exact_vertex_collision(self) -> None:
+        dtype = torch.float64
+        position = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [0.2, 0.0, 0.0],
+                [0.0, 0.2, 0.0],
+                [0.0, 0.0, 0.0],
+            ],
+            dtype=dtype,
+            requires_grad=True,
+        )
+        complex_ = SimplicialComplex(
+            torch.arange(4),
+            torch.tensor([[0, 1], [1, 2], [0, 2]], dtype=torch.int64),
+            torch.tensor([[0, 1, 2]], dtype=torch.int64),
+        )
+        state = ManifoldState(
+            position=position,
+            rotation=torch.eye(3, dtype=dtype).expand(4, -1, -1).clone(),
+            covariance=0.1 * torch.eye(3, dtype=dtype).expand(4, -1, -1).clone(),
+            opacity_logit=torch.zeros(4, 1, dtype=dtype),
+            appearance=torch.zeros(4, 48, dtype=dtype),
+            latent=torch.zeros(4, 128, dtype=dtype),
+            evidence_metric=torch.eye(3, dtype=dtype)
+            .expand(4, -1, -1)
+            .clone()
+            .requires_grad_(True),
+            complex=complex_,
+        )
+        projector = BarrierProjector(
+            state,
+            BarrierConfig(
+                minimum_separation=1.0e-4,
+                maximum_position_speed=1.0e-3,
+            ),
+        )
+        self.assertEqual(
+            projector.report(state).minimum_separation_margin,
+            -1.0e-8,
+        )
+        restored, report = projector.restore_feasible_embedding(state)
+        self.assertTrue(report.feasible)
+        self.assertGreater(report.minimum_separation_margin, 0.0)
+        self.assertGreater(report.restoration_degenerate_constraints, 0)
+        restored.position.square().sum().backward()
+        self.assertTrue(torch.all(torch.isfinite(position.grad)))
+        self.assertTrue(torch.all(torch.isfinite(state.evidence_metric.grad)))
+
+        world_rotation = so3_exp(
+            torch.tensor([[0.2, -0.1, 0.3]], dtype=dtype)
+        )[0]
+        world_translation = torch.tensor([12.0, -7.0, 3.0], dtype=dtype)
+        transformed_state = ManifoldState(
+            position=torch.einsum(
+                "ij,vj->vi",
+                world_rotation,
+                position.detach(),
+            )
+            + world_translation,
+            rotation=world_rotation @ state.rotation.detach(),
+            covariance=(
+                world_rotation
+                @ state.covariance.detach()
+                @ world_rotation.transpose(-1, -2)
+            ),
+            opacity_logit=state.opacity_logit,
+            appearance=state.appearance,
+            latent=state.latent,
+            evidence_metric=(
+                world_rotation
+                @ state.evidence_metric.detach()
+                @ world_rotation.transpose(-1, -2)
+            ),
+            complex=complex_,
+        )
+        transformed_projector = BarrierProjector(
+            transformed_state,
+            projector.config,
+        )
+        transformed_restored, transformed_report = (
+            transformed_projector.restore_feasible_embedding(transformed_state)
+        )
+        self.assertTrue(transformed_report.feasible)
+        torch.testing.assert_close(
+            transformed_restored.position,
+            torch.einsum(
+                "ij,vj->vi",
+                world_rotation,
+                restored.position.detach(),
+            )
+            + world_translation,
+            atol=2.0e-10,
+            rtol=2.0e-10,
+        )
+
+    def test_restoration_escapes_exact_coplanar_face_collision(self) -> None:
+        dtype = torch.float64
+        position = torch.tensor(
+            [
+                [0.0, 0.0, 0.0],
+                [1.0, 0.0, 0.0],
+                [0.0, 1.0, 0.0],
+                [0.2, 0.2, 0.0],
+                [0.4, 0.2, 0.0],
+                [0.2, 0.4, 0.0],
+            ],
+            dtype=dtype,
+            requires_grad=True,
+        )
+        complex_ = SimplicialComplex(
+            torch.arange(6),
+            torch.tensor(
+                [[0, 1], [1, 2], [0, 2], [3, 4], [4, 5], [3, 5]],
+                dtype=torch.int64,
+            ),
+            torch.tensor([[0, 1, 2], [3, 5, 4]], dtype=torch.int64),
+        )
+        state = ManifoldState(
+            position=position,
+            rotation=torch.eye(3, dtype=dtype).expand(6, -1, -1).clone(),
+            covariance=0.1 * torch.eye(3, dtype=dtype).expand(6, -1, -1).clone(),
+            opacity_logit=torch.zeros(6, 1, dtype=dtype),
+            appearance=torch.zeros(6, 48, dtype=dtype),
+            latent=torch.zeros(6, 128, dtype=dtype),
+            evidence_metric=torch.eye(3, dtype=dtype)
+            .expand(6, -1, -1)
+            .clone()
+            .requires_grad_(True),
+            complex=complex_,
+        )
+        projector = BarrierProjector(
+            state,
+            BarrierConfig(
+                minimum_separation=1.0e-4,
+                maximum_position_speed=1.0e-3,
+            ),
+        )
+        self.assertEqual(
+            projector.report(state).minimum_separation_margin,
+            -1.0e-8,
+        )
+        restored, report = projector.restore_feasible_embedding(state)
+        self.assertTrue(report.feasible)
+        self.assertGreater(report.minimum_separation_margin, 0.0)
+        self.assertGreater(report.restoration_degenerate_constraints, 0)
+        restored.position.square().sum().backward()
+        self.assertTrue(torch.all(torch.isfinite(position.grad)))
+        self.assertTrue(torch.all(torch.isfinite(state.evidence_metric.grad)))
+
     def test_sparse_gram_bound_zero_padding_has_finite_metric_gradient(self) -> None:
         dtype = torch.float64
         metric_inverse = (
@@ -1051,6 +1264,64 @@ class TopologyAndManifoldTest(unittest.TestCase):
         metric_gradient = torch.autograd.grad(bound, metric_inverse)[0]
         self.assertTrue(torch.isfinite(bound))
         self.assertTrue(torch.all(torch.isfinite(metric_gradient)))
+
+    def test_checkpointed_sparse_dual_matches_uncheckpointed_value_and_gradient(
+        self,
+    ) -> None:
+        torch.manual_seed(7)
+        dtype = torch.float64
+        gradient_value = torch.randn(19, 6, 3, dtype=dtype)
+        support = torch.randint(0, 11, (19, 6))
+        metric_value = (
+            torch.eye(3, dtype=dtype).expand(11, -1, -1).clone()
+            + 0.05 * torch.randn(11, 3, 3, dtype=dtype)
+        )
+        metric_value = (
+            metric_value @ metric_value.transpose(-1, -2)
+            + 0.2 * torch.eye(3, dtype=dtype)
+        )
+        linear_value = -torch.rand(19, dtype=dtype)
+        projector = object.__new__(BarrierProjector)
+        projector.config = BarrierConfig(
+            dual_iterations=24,
+            dual_check_interval=8,
+            dual_tolerance=1.0e-30,
+        )
+        results = []
+        for checkpoint_iterations in (False, True):
+            gradient = gradient_value.clone().requires_grad_(True)
+            metric = metric_value.clone().requires_grad_(True)
+            linear = linear_value.clone().requires_grad_(True)
+            dual, correction, residual = projector._solve_sparse_dual_qp(
+                gradient,
+                support,
+                metric,
+                linear,
+                checkpoint_iterations=checkpoint_iterations,
+            )
+            derivatives = torch.autograd.grad(
+                dual.square().sum() + correction.square().sum(),
+                (gradient, metric, linear),
+            )
+            results.append(
+                (
+                    dual.detach(),
+                    correction.detach(),
+                    residual,
+                    tuple(value.detach() for value in derivatives),
+                )
+            )
+
+        torch.testing.assert_close(results[0][0], results[1][0], atol=0.0, rtol=0.0)
+        torch.testing.assert_close(results[0][1], results[1][1], atol=0.0, rtol=0.0)
+        self.assertEqual(results[0][2], results[1][2])
+        for ordinary, checkpointed in zip(results[0][3], results[1][3]):
+            torch.testing.assert_close(
+                ordinary,
+                checkpointed,
+                atol=2.0e-12,
+                rtol=2.0e-12,
+            )
 
     def test_feasibility_report_uses_strict_json_infinity_tag(self) -> None:
         report = FeasibilityReport(

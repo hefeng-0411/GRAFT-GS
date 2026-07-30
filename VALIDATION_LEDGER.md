@@ -773,3 +773,32 @@ sweep's intentional OOM classifier was excluded from that contamination scan.
 - Server-pending: the metadata-only strict-writer extension does not require
   repeating the already passed 32-view numerical gate. Production Phase-A/B
   logs generated from this source must be strict-JSON parseable.
+
+## 2026-07-30 exact-collision and restoration-memory gate
+
+- Supplied remote evidence: two A100 80-GB ranks completed frozen TRELLIS
+  sampling, then all candidate feasibility reports had minimum separation
+  exactly `-1e-8`. Early candidates failed because restoration could not
+  decrease the zero-gradient squared-distance violation. Later large
+  candidates attempted additional 90- and 368-MiB allocations with only 69
+  and 361 MiB driver-visible free, respectively.
+- Local RTX A6000/Torch 2.4 validation: exact coincident-vertex and coplanar
+  intersecting-face restoration both enter the unchanged strict feasible set
+  and backpropagate finite position and evidence-metric gradients. The prior
+  nondegenerate restoration and zero-padding regression also pass.
+- Checkpoint equivalence: an ordinary and block-checkpointed 24-iteration FP64
+  sparse dual solve produced bitwise-identical dual/correction values and
+  gradients agreeing within `2e-12`. A 96-iteration, 50,000-constraint CUDA
+  memory probe produced the same residual (`0.00105691`) while reducing peak
+  forward allocation from `1490.7 MiB` to `94.5 MiB`; its checkpointed
+  forward-plus-backward peak was `204.1 MiB`.
+- Executed suites: geometry plus scientific production trace `59/59`; focused
+  precision/configuration/selection `28/28`; whole-tree compilation passed.
+  The repository-wide run executed 200 tests with 181 passes and 11 skips; its
+  eight unrelated existing failures are asset deepcopy/perceptual thresholds,
+  TRELLIS expectation text/numerics, and the already-modified non-exact
+  `requirements.txt` contract.
+- Server-pending: deploy this source and rerun one Phase-B optimizer step with
+  the requested 16-view global cap on the actual 2–4×A100 allocation. Admission
+  requires a positive strict feasibility report, finite backward, checkpoint
+  output, and at least 5% ending driver-visible memory headroom.

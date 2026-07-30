@@ -345,3 +345,17 @@ checkpoints, data, or a compiled server dependency.
   training quality, exact resume, multi-rank equivalence, later Phase C-F
   execution, and full-corpus evaluation remain separate unresolved validation
   requirements.
+
+## 2026-07-30 A100 exact-collision rerun boundary
+
+- The supplied Phase-B failure is locally resolved at its two causal
+  boundaries: exact zero-distance constraints now have a conditional
+  frame-equivariant restoration direction, and rejected candidate trials no
+  longer retain autograd graphs. The selected restoration's unrolled dual
+  computation is block-checkpointed without changing its numerical result.
+- A local synthetic CUDA probe demonstrates a 15.8x reduction in retained
+  forward allocation for the sparse dual solve. This is not a substitute for
+  the real VGGT/TRELLIS/atlas memory composition on the remote A100 ranks.
+- Remaining external gate: rerun the Phase-B command at 16 maximum global views
+  on an idle 2–4×A100 80-GB allocation. Capture the first feasibility report,
+  per-stage/peak/ending memory metrics, optimizer completion, and checkpoint.

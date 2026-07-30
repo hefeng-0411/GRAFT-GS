@@ -616,81 +616,120 @@ class GraftGS(nn.Module):
 
         energy = torch.stack([candidate.total_energy for candidate in topology.candidates])
         failures: list[str] = []
-        for index in torch.argsort(energy).tolist():
-            topology.selected_index = int(index)
-            candidate = topology.selected
-            if (
-                not candidate.manifold_incidence_valid
-                or not candidate.orientation_consistent
-                or not candidate.complex.manifold_incidence_valid()
-                or not candidate.complex.orientation_consistent()
-            ):
-                failures.append(
-                    f"{candidate.identifier}: invalid incidence/orientation"
-                )
-                continue
-            state = self._state_from_mapping(
-                atlas,
-                mapping,
-                topology,
-                occupancy_probability=occupancy,
-            )
-            projector = BarrierProjector(state, self.config.barrier)
-            report = projector.report(state)
-            if not report.feasible:
-                try:
-                    # Restoration is the only Phase-B consumer of the state's
-                    # position metric. Keep a dedicated exact-identity
-                    # cotangent boundary so any future QP regression is
-                    # attributed before it contaminates the shared mapping
-                    # metric.
-                    state.evidence_metric = finite_gradient_identity(
-                        state.evidence_metric,
-                        "feasibility_restoration.position_metric",
+        selected_index: Optional[int] = None
+        # Candidate identity is already a detached discrete decision. Trial
+        # restorations therefore need values and strict certificates, not one
+        # autograd graph per rejected topology. Replay only the winner below.
+        with torch.no_grad():
+            for index in torch.argsort(energy).tolist():
+                topology.selected_index = int(index)
+                candidate = topology.selected
+                if (
+                    not candidate.manifold_incidence_valid
+                    or not candidate.orientation_consistent
+                    or not candidate.complex.manifold_incidence_valid()
+                    or not candidate.complex.orientation_consistent()
+                ):
+                    failures.append(
+                        f"{candidate.identifier}: invalid incidence/orientation"
                     )
-                    state, restoration_report = projector.restore_feasible_embedding(state)
-                    projector = BarrierProjector(state, self.config.barrier)
-                    report = projector.report(state)
-                    # The rebuilt projector defines the reference orientation
-                    # and broad phase used by flow. Retain the conservative
-                    # minimum from the restoration projector as evidence that
-                    # initialization also preserved the transported face
-                    # orientation rather than recertifying only against itself.
-                    for field_name in (
-                        "minimum_area_margin",
-                        "minimum_orientation_margin",
-                        "minimum_separation_margin",
-                        "minimum_covariance_margin",
-                        "maximum_covariance_margin",
-                    ):
-                        setattr(
-                            report,
-                            field_name,
-                            min(
-                                getattr(report, field_name),
-                                getattr(restoration_report, field_name),
-                            ),
-                        )
-                    report.feasible = report.feasible and restoration_report.feasible
-                    report.restoration_iterations = restoration_report.restoration_iterations
-                    report.restoration_maximum_displacement = (
-                        restoration_report.restoration_maximum_displacement
+                    continue
+                try:
+                    trial_state, trial_projector, report = self._materialize_feasible_stratum(
+                        atlas,
+                        mapping,
+                        topology,
+                        occupancy,
                     )
                 except RuntimeError as error:
                     failures.append(
-                        f"{topology.selected.identifier}: {report}; restoration={error}"
+                        f"{candidate.identifier}: restoration={error}"
                     )
                     continue
-            if not report.feasible:
+                del trial_state, trial_projector
+                if report.feasible:
+                    selected_index = int(index)
+                    break
                 failures.append(
-                    f"{topology.selected.identifier}: restoration returned a non-feasible state: {report}"
+                    f"{candidate.identifier}: restoration returned a non-feasible state: {report}"
                 )
-                continue
+        if selected_index is not None:
+            topology.selected_index = selected_index
+            state, projector, report = self._materialize_feasible_stratum(
+                atlas,
+                mapping,
+                topology,
+                occupancy,
+            )
+            if not report.feasible:
+                raise RuntimeError(
+                    "detached topology screening and differentiable restoration "
+                    f"disagree for {topology.selected.identifier}: {report}"
+                )
             return topology, state, projector, report
         raise RuntimeError(
             "no proposed topology stratum has a strictly feasible transported embedding: "
             + "; ".join(failures)
         )
+
+    def _materialize_feasible_stratum(
+        self,
+        atlas: PersistentOctreeAtlas,
+        mapping: MappingResult,
+        topology: TopologySelection,
+        occupancy: Tensor,
+    ) -> tuple[ManifoldState, BarrierProjector, FeasibilityReport]:
+        """Construct and, when necessary, strictly restore one fixed stratum."""
+
+        state = self._state_from_mapping(
+            atlas,
+            mapping,
+            topology,
+            occupancy_probability=occupancy,
+        )
+        projector = BarrierProjector(state, self.config.barrier)
+        report = projector.report(state)
+        if report.feasible:
+            return state, projector, report
+
+        # Restoration is the only Phase-B consumer of the state's position
+        # metric. Keep a dedicated exact-identity cotangent boundary so any
+        # future QP regression is attributed before it contaminates the shared
+        # mapping metric.
+        state.evidence_metric = finite_gradient_identity(
+            state.evidence_metric,
+            "feasibility_restoration.position_metric",
+        )
+        state, restoration_report = projector.restore_feasible_embedding(state)
+        projector = BarrierProjector(state, self.config.barrier)
+        report = projector.report(state)
+        # The rebuilt projector defines the reference orientation and broad
+        # phase used by flow. Retain the conservative minimum from restoration
+        # as evidence that the transported face orientation was also preserved.
+        for field_name in (
+            "minimum_area_margin",
+            "minimum_orientation_margin",
+            "minimum_separation_margin",
+            "minimum_covariance_margin",
+            "maximum_covariance_margin",
+        ):
+            setattr(
+                report,
+                field_name,
+                min(
+                    getattr(report, field_name),
+                    getattr(restoration_report, field_name),
+                ),
+            )
+        report.feasible = report.feasible and restoration_report.feasible
+        report.restoration_iterations = restoration_report.restoration_iterations
+        report.restoration_maximum_displacement = (
+            restoration_report.restoration_maximum_displacement
+        )
+        report.restoration_degenerate_constraints = (
+            restoration_report.restoration_degenerate_constraints
+        )
+        return state, projector, report
 
     def _map_with_feature_fixed_point(self, atlas: PersistentOctreeAtlas, evidence: object) -> MappingResult:
         mapping = self.mapping(atlas, evidence)

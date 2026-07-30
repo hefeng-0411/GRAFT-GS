@@ -1210,3 +1210,36 @@ The full conditional validity domain is maintained in
   environment/manifest/dataset/production/selector guards pass in `6.851 s`;
   the one PyTorch-dependent loader test is expectedly skipped in the local
   drafting runtime.
+
+## 2026-07-30 bounded exact-collision restoration on 80-GB ranks
+
+- Requirement `A100-PHASE-B-RESTORATION-MEMORY-11`: the supplied two-rank
+  Phase-B run failed before its first optimizer step. Every proposed stratum
+  had minimum separation margin exactly `-1e-8`, the value of
+  `0^2 - minimum_separation^2`. Squared-distance restoration consequently had
+  a zero Jacobian at each exact collision and could not decrease violation.
+  Candidate search eventually reached very large complexes while retaining
+  differentiable FP64 dual iterations and exhausted rank-zero VRAM.
+- Exact vertex and triangle collisions now receive a deterministic
+  frame-equivariant first restoration direction. It is used only when squared
+  distance is within an FP64 scale-relative zero tolerance. The hard constraint
+  value, configured margin, line search, displacement limit, and independent
+  strict FP64 certification are unchanged.
+- Topology candidates are screened under `torch.no_grad()`. After the first
+  strictly feasible candidate is identified, that fixed discrete stratum is
+  replayed once with autograd. Rejected candidates no longer retain training
+  graphs, while the selected state's differentiable value and gradients remain
+  available to the unchanged objective.
+- Differentiable restoration checkpoints each eight-iteration sparse dual
+  block. This evaluates the same 96 projected-gradient iterations and
+  convergence checks, recomputing sparse products during backward instead of
+  retaining every iterate. A 50,000-constraint FP64 CUDA probe measured
+  `1490.7 MiB` ordinary versus `94.5 MiB` checkpointed peak forward allocation;
+  the checkpointed forward-plus-backward peak was `204.1 MiB`. Values and
+  residual were identical and FP64 gradients agreed within `2e-12`.
+- New regressions cover exact coincident vertices, exact coplanar face
+  intersection, finite position/evidence-metric gradients, and checkpointed
+  versus ordinary dual value/gradient equivalence. Geometry plus production
+  static contracts pass `59/59`; precision/configuration/selection contracts
+  pass `28/28`. A real multi-rank A100 Phase-B optimizer-step and steady-state
+  memory record remain required before declaring the remote run closed.

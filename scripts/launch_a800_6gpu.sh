@@ -22,6 +22,11 @@ if [[ -z "${CUDA_VISIBLE_DEVICES:-}" ]]; then
   exit 2
 fi
 
+# Torch 2.4 renamed this NCCL watchdog setting. Preserve an inherited value
+# while avoiding the deprecated alias warning on every rank.
+export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-${NCCL_ASYNC_ERROR_HANDLING:-1}}
+unset NCCL_ASYNC_ERROR_HANDLING
+
 # Bind server training to explicit upstream source checkouts. Environment
 # overrides support relocated mirrors; the declared paths are the defaults.
 export GRAFT_GS_VGGT_ROOT=${GRAFT_GS_VGGT_ROOT:-/mnt/sda2/hef/Base/vggt}
