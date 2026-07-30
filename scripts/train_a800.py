@@ -8,19 +8,23 @@ import json
 import os
 from pathlib import Path
 
-import torch
+import torch.distributed as dist
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 
 from graft_gs.data import (
+    DistributedViewCountBatchSampler,
     FolderMultiviewDataset,
     MANIFEST_SCHEMA,
     MeshFleetDatasetConfig,
     MeshFleetObjectDataset,
     load_meshfleet_object_ids,
     meshfleet_object_id_digest,
+    meshfleet_object_collate,
     meshfleet_single_object_collate,
+    folder_object_collate,
     single_object_collate,
+    ViewCountBatchSampler,
 )
 from graft_gs.engine import (
     GraftGSTrainer,
@@ -70,15 +74,39 @@ def main() -> None:
     )
     parser.add_argument("--dataloader-workers", type=int)
     parser.add_argument("--dataloader-prefetch-factor", type=int)
+    parser.add_argument(
+        "--object-batch-size",
+        type=int,
+        help=(
+            "real objects processed per rank and forward pass; objects are "
+            "grouped by exact view count so VGGT inputs are never padded"
+        ),
+    )
+    parser.add_argument(
+        "--batch-probe",
+        type=Path,
+        help=(
+            "run one optimizer step, write per-rank memory/throughput JSON, "
+            "and exit without saving a model checkpoint"
+        ),
+    )
     accumulation = parser.add_mutually_exclusive_group()
     accumulation.add_argument("--gradient-accumulation-steps", type=int)
+    accumulation.add_argument(
+        "--global-object-batch",
+        type=int,
+        help=(
+            "require an exact optimizer batch across all ranks; the value must "
+            "be divisible by WORLD_SIZE * object batch size"
+        ),
+    )
     accumulation.add_argument(
         "--minimum-global-object-batch",
         type=int,
         help=(
-            "choose ceil(target/WORLD_SIZE) accumulation steps for ordinary "
-            "object-level DDP; the realized batch is recorded by world size "
-            "and the checkpointed accumulation count"
+            "choose accumulation after accounting for WORLD_SIZE and the "
+            "physical object batch; the realized batch is recorded by world "
+            "size, object batch, and checkpointed accumulation count"
         ),
     )
     parser.add_argument("--config", type=Path, default=Path("configs/graft_gs_a800_native.yaml"))
@@ -94,16 +122,48 @@ def main() -> None:
     synchronize_object_atlas = args.same_object_view_shards or bool(
         distributed_config.get("synchronize_object_atlas", False)
     )
-    if args.minimum_global_object_batch is not None:
+    object_batch_size = int(
+        args.object_batch_size
+        if args.object_batch_size is not None
+        else training_config.get("object_batch_size", 1)
+    )
+    if object_batch_size < 1:
+        raise ValueError("--object-batch-size must be positive")
+    if synchronize_object_atlas and object_batch_size != 1:
+        raise ValueError(
+            "same-object view-sharded DDP requires --object-batch-size 1"
+        )
+    if args.global_object_batch is not None:
+        if synchronize_object_atlas:
+            raise ValueError(
+                "--global-object-batch applies only to independent object-level DDP"
+            )
+        physical_global_batch = world_size * object_batch_size
+        if (
+            args.global_object_batch < physical_global_batch
+            or args.global_object_batch % physical_global_batch
+        ):
+            raise ValueError(
+                "--global-object-batch must be a positive multiple of "
+                "WORLD_SIZE * object batch size"
+            )
+        gradient_accumulation_steps = (
+            args.global_object_batch // physical_global_batch
+        )
+    elif args.minimum_global_object_batch is not None:
         if args.same_object_view_shards:
             raise ValueError(
                 "--minimum-global-object-batch applies only to independent object-level DDP"
             )
         if args.minimum_global_object_batch < 1:
             raise ValueError("--minimum-global-object-batch must be positive")
+        minimum_objects_per_rank = (
+            args.minimum_global_object_batch + world_size - 1
+        ) // world_size
         gradient_accumulation_steps = max(
             1,
-            (args.minimum_global_object_batch + world_size - 1) // world_size,
+            (minimum_objects_per_rank + object_batch_size - 1)
+            // object_batch_size,
         )
     else:
         gradient_accumulation_steps = int(
@@ -235,6 +295,7 @@ def main() -> None:
         TrainerConfig(
             phase=phase,
             learning_rate=float(training_config.get("learning_rate", 1.0e-4)),
+            object_batch_size=object_batch_size,
             gradient_accumulation_steps=gradient_accumulation_steps,
             maximum_gradient_norm=float(training_config.get("maximum_gradient_norm", 1.0)),
             find_unused_parameters=bool(
@@ -458,7 +519,11 @@ def main() -> None:
             ),
             )
         )
-        collate = meshfleet_single_object_collate
+        collate = (
+            meshfleet_single_object_collate
+            if object_batch_size == 1
+            else meshfleet_object_collate
+        )
         if trainer.context.rank == 0:
             coverage_path = Path(args.output) / f"dataset_coverage_{args.split}.json"
             coverage_path.parent.mkdir(parents=True, exist_ok=True)
@@ -483,10 +548,31 @@ def main() -> None:
             args.dataset,
             require_target_state=phase is TrainingPhase.RIEMANNIAN_FLOW,
         )
-        collate = single_object_collate
+        collate = (
+            single_object_collate
+            if object_batch_size == 1
+            else folder_object_collate
+        )
     sampler = None
+    batch_sampler = None
     same_object = trainer.config.synchronize_object_atlas
-    if trainer.context.distributed and not same_object:
+    if object_batch_size > 1 and trainer.context.distributed:
+        batch_sampler = DistributedViewCountBatchSampler(
+            dataset,
+            object_batch_size,
+            num_replicas=trainer.context.world_size,
+            rank=trainer.context.rank,
+            shuffle=True,
+            seed=trainer.config.seed,
+        )
+    elif object_batch_size > 1:
+        batch_sampler = ViewCountBatchSampler(
+            dataset,
+            object_batch_size,
+            shuffle=not same_object,
+            seed=trainer.config.seed,
+        )
+    elif trainer.context.distributed and not same_object:
         sampler = DistributedSampler(
             dataset,
             num_replicas=trainer.context.world_size,
@@ -505,11 +591,8 @@ def main() -> None:
     )
     if dataloader_workers < 0 or prefetch_factor < 1:
         raise ValueError("dataloader workers must be non-negative and prefetch positive")
-    loader = DataLoader(
-        dataset,
-        batch_size=1,
-        sampler=sampler,
-        shuffle=sampler is None and not same_object,
+    loader_options = dict(
+        dataset=dataset,
         num_workers=dataloader_workers,
         pin_memory=True,
         prefetch_factor=prefetch_factor if dataloader_workers > 0 else None,
@@ -518,10 +601,92 @@ def main() -> None:
         persistent_workers=False,
         collate_fn=collate,
     )
+    if batch_sampler is not None:
+        loader_options["batch_sampler"] = batch_sampler
+    else:
+        loader_options.update(
+            batch_size=1,
+            sampler=sampler,
+            shuffle=sampler is None and not same_object,
+        )
+    loader = DataLoader(**loader_options)
     if args.resume:
         trainer.load_checkpoint(args.resume)
     elif args.initialize_from:
         trainer.load_model_weights(args.initialize_from, strict=False)
+    if args.batch_probe is not None:
+        trainer.fit(loader, trainer.global_step + 1)
+        if trainer.last_train_metrics is None:
+            raise RuntimeError("batch probe completed without training metrics")
+        local_probe = {
+            "rank": trainer.context.rank,
+            "logical_device": trainer.context.local_rank,
+            "object_batch_size": object_batch_size,
+            **trainer.last_train_metrics,
+        }
+        if trainer.context.distributed:
+            probes: list[object] = [
+                None for _ in range(trainer.context.world_size)
+            ]
+            dist.all_gather_object(probes, local_probe)
+        else:
+            probes = [local_probe]
+        if trainer.context.rank == 0:
+            typed_probes = [
+                value for value in probes if isinstance(value, dict)
+            ]
+            maximum_seconds = max(float(value["seconds"]) for value in typed_probes)
+            processed_objects = sum(
+                int(value["local_scenes"]) for value in typed_probes
+            )
+            payload = {
+                "schema": "graft-gs-object-batch-probe-v1",
+                "world_size": trainer.context.world_size,
+                "object_batch_size": object_batch_size,
+                "global_objects_per_optimizer_step": (
+                    object_batch_size
+                    * trainer.context.world_size
+                    * gradient_accumulation_steps
+                ),
+                "gradient_accumulation_steps": gradient_accumulation_steps,
+                "minimum_realized_object_batch_size": min(
+                    int(value["local_scenes"]) for value in typed_probes
+                ),
+                "maximum_realized_object_batch_size": max(
+                    int(value["local_scenes"]) for value in typed_probes
+                ),
+                "aggregate_objects_per_second": (
+                    processed_objects / max(maximum_seconds, 1.0e-12)
+                ),
+                "maximum_peak_allocated_fraction": max(
+                    float(value["peak_allocated_fraction"])
+                    for value in typed_probes
+                ),
+                "maximum_peak_reserved_fraction": max(
+                    float(value["peak_reserved_fraction"])
+                    for value in typed_probes
+                ),
+                "minimum_ending_driver_free_fraction": min(
+                    float(value["ending_driver_free_fraction"])
+                    for value in typed_probes
+                ),
+                "ranks": typed_probes,
+            }
+            args.batch_probe.parent.mkdir(parents=True, exist_ok=True)
+            args.batch_probe.write_text(
+                json.dumps(
+                    payload,
+                    indent=2,
+                    sort_keys=True,
+                    allow_nan=False,
+                )
+                + "\n",
+                encoding="utf8",
+            )
+        if trainer.context.distributed:
+            dist.barrier()
+            dist.destroy_process_group()
+        return
     trainer.fit(loader, args.steps)
     trainer.save_checkpoint(Path(args.output) / "final.pt")
 

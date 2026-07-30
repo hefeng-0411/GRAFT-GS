@@ -309,6 +309,16 @@
   Fresh processes now evaluate all requested candidates unless the operator
   explicitly selects a diagnostic early stop. Admission remains fail-closed
   on numerical, feasibility, driver-headroom, and allocator-state certificates.
+51. **Independent-object batching is exact-view homogeneous and measured in
+  fresh processes.** The original server path fixed one variable-topology
+  object per rank. Ordinary object-level DDP may now batch independent scenes,
+  but only inside an identical-view-count bucket. VGGT therefore sees the
+  original unpadded joint-view set, camera gauge alignment ignores unavailable
+  views, sparse surfaces/topologies remain per-object, and TRELLIS seeds are
+  derived from object identity rather than batch position. Training and
+  evaluation batch candidates execute in isolated process groups and are
+  admitted only under allocator, driver-free-memory, and throughput criteria.
+  Same-object global-UOT mode remains one object per rank.
 # 2026-07-25 numerical boundary deviations
 
 - The specification's reliability geometric mean is evaluated exactly away

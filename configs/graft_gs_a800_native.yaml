@@ -124,6 +124,10 @@ trellis_prior:
 training:
   phases: [A, B, C, D, E, F]
   learning_rate: 1.0e-4
+  # Fixed fallback. Use scripts/autotune_object_batch.py on the exact visible
+  # GPU set/phase to select a larger measured value without changing precision,
+  # views, losses, or topology.
+  object_batch_size: 1
   gradient_accumulation_steps: 1
   # Per-rank host-side concurrency. These do not alter the mathematical batch.
   dataloader_workers: 8

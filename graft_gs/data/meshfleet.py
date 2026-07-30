@@ -1585,6 +1585,17 @@ class MeshFleetObjectDataset:
     def __len__(self) -> int:
         return len(self.records)
 
+    def view_count(self, index: int) -> int:
+        """Return the selected view count without decoding any image."""
+
+        available = len(
+            self.records[index].views[self.config.input_view_set][
+                "available_frames"
+            ]
+        )
+        maximum = self.config.maximum_views
+        return available if maximum is None else min(available, int(maximum))
+
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 
@@ -1918,6 +1929,93 @@ def meshfleet_single_object_collate(batch: list[dict[str, object]]) -> dict[str,
     return item
 
 
+def meshfleet_object_collate(
+    batch: list[dict[str, object]],
+) -> dict[str, object]:
+    """Batch equal-view objects while retaining variable topology per object."""
+
+    import torch
+
+    if not batch:
+        raise ValueError("cannot collate an empty MeshFleet object batch")
+    if len(batch) == 1:
+        return meshfleet_single_object_collate(batch)
+    view_keys = {
+        "images",
+        "alpha",
+        "evidence_mask",
+        "valid_mask",
+        "camera_to_world_opencv",
+        "extrinsics_world_to_camera",
+        "intrinsics",
+        "frame_indices",
+        "native_sizes_hw",
+    }
+    view_counts = {int(torch.as_tensor(item["images"]).shape[0]) for item in batch}
+    if len(view_counts) != 1:
+        raise ValueError(
+            "VGGT object batches must have identical view counts; use "
+            "ViewCountBatchSampler instead of padding joint-attention inputs"
+        )
+    result: dict[str, object] = {}
+    keys = set().union(*(item.keys() for item in batch))
+    for key in sorted(keys):
+        values = [item.get(key) for item in batch]
+        if key in {"object_id", "topology_label_provenance"}:
+            result[key] = values
+            continue
+        if key == "teacher_target_state":
+            if any(value is None for value in values):
+                if not all(value is None for value in values):
+                    raise ValueError(
+                        "teacher target states must be available for every batched object"
+                    )
+            else:
+                result["target_states"] = values
+            continue
+        if key == "topology_target_betti_z2":
+            result[key] = (
+                None
+                if all(value is None for value in values)
+                else torch.stack(
+                    [
+                        (
+                            torch.zeros(3, dtype=torch.int64)
+                            if value is None
+                            else torch.as_tensor(value, dtype=torch.int64)
+                        )
+                        for value in values
+                    ]
+                )
+            )
+            continue
+        if key in view_keys:
+            if any(value is None for value in values):
+                raise ValueError(f"view-aligned field {key!r} is incomplete")
+            result[key] = torch.stack(
+                [torch.as_tensor(value) for value in values], dim=0
+            )
+            continue
+        if all(isinstance(value, torch.Tensor) for value in values):
+            tensors = [torch.as_tensor(value) for value in values]
+            if all(tensor.shape == tensors[0].shape for tensor in tensors):
+                result[key] = torch.stack(tensors, dim=0)
+            else:
+                result[key] = tensors
+            continue
+        if all(
+            isinstance(value, (int, float, bool)) and not isinstance(value, str)
+            for value in values
+        ):
+            result[key] = torch.as_tensor(values)
+            continue
+        if all(value == values[0] for value in values):
+            result[key] = values[0]
+        else:
+            result[key] = values
+    return result
+
+
 __all__ = [
     "DEFAULT_OPTIONAL_MODALITIES",
     "DEFAULT_PRIMARY_MODALITIES",
@@ -1933,6 +2031,7 @@ __all__ = [
     "load_meshfleet_object_ids",
     "meshfleet_object_id_digest",
     "meshfleet_record_admission_reasons",
+    "meshfleet_object_collate",
     "meshfleet_single_object_collate",
     "opengl_c2w_to_opencv_c2w",
     "topology_supervision_is_admissible",

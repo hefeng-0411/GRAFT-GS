@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional
+from typing import List, Optional, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -170,7 +171,7 @@ class GraftGS(nn.Module):
         ground_truth_intrinsics: Optional[Tensor] = None,
         atlas_root_bounds: Optional[Tensor] = None,
         execution_stage: str = "full",
-        trellis_prior_seed: int = 0,
+        trellis_prior_seed: int | Sequence[int] = 0,
         capture_distillation_activations: bool = False,
     ) -> GraftGSOutput:
         valid_execution_stages = {
@@ -189,6 +190,31 @@ class GraftGS(nn.Module):
             raise ValueError("images must have shape [B,K,3,H,W]")
         self.last_cuda_memory_stages = {}
         self._record_cuda_memory_stage("input", images.device)
+        if valid_mask is None:
+            valid_views = torch.ones(
+                images.shape[:2], dtype=torch.bool, device=images.device
+            )
+        else:
+            valid_views = torch.as_tensor(
+                valid_mask, dtype=torch.bool, device=images.device
+            )
+            if valid_views.ndim > 2:
+                valid_views = torch.any(
+                    valid_views.reshape(*valid_views.shape[:2], -1), dim=-1
+                )
+            if valid_views.shape != images.shape[:2]:
+                raise ValueError("valid_mask must be view-aligned with images")
+        if isinstance(trellis_prior_seed, Sequence):
+            prior_seeds = tuple(int(value) for value in trellis_prior_seed)
+            if len(prior_seeds) != images.shape[0]:
+                raise ValueError(
+                    "trellis_prior_seed sequence must contain one seed per object"
+                )
+        else:
+            prior_seeds = tuple(
+                int(trellis_prior_seed) + index
+                for index in range(images.shape[0])
+            )
         precomputed_prior_measures: Optional[list[TrellisPriorMeasure]] = None
         if atlas_root_bounds is not None:
             atlas_root_bounds = atlas_root_bounds.to(
@@ -208,19 +234,29 @@ class GraftGS(nn.Module):
                 and execution_stage != "evidence_calibration"
             ):
                 precomputed_prior_measures = []
-                for batch_index in range(images.shape[0]):
-                    with record_function("graft_gs/trellis_structure_prior_prefetch"):
-                        precomputed_prior_measures.append(
-                            self._trellis_prior_measure(
-                                images[batch_index],
-                                (
-                                    atlas_root_bounds[batch_index, 0],
-                                    atlas_root_bounds[batch_index, 1],
-                                ),
-                                distributed_synchronizer,
-                                int(trellis_prior_seed) + batch_index,
+                sampling_session = (
+                    self.trellis_prior.sampling_session()
+                    if hasattr(self.trellis_prior, "sampling_session")
+                    else nullcontext()
+                )
+                with sampling_session:
+                    for batch_index in range(images.shape[0]):
+                        with record_function(
+                            "graft_gs/trellis_structure_prior_prefetch"
+                        ):
+                            precomputed_prior_measures.append(
+                                self._trellis_prior_measure(
+                                    images[
+                                        batch_index, valid_views[batch_index]
+                                    ],
+                                    (
+                                        atlas_root_bounds[batch_index, 0],
+                                        atlas_root_bounds[batch_index, 1],
+                                    ),
+                                    distributed_synchronizer,
+                                    prior_seeds[batch_index],
+                                )
                             )
-                        )
                 self._record_cuda_memory_stage("trellis_prefetch", images.device)
                 if (
                     self.reset_cuda_peak_after_frozen_prior
@@ -243,6 +279,7 @@ class GraftGS(nn.Module):
                 vggt_output,
                 ground_truth_extrinsics,
                 ground_truth_intrinsics,
+                valid_view_mask=valid_views,
             )
         with record_function("graft_gs/evidence_lift"):
             particles = self.evidence_builder(
@@ -317,10 +354,12 @@ class GraftGS(nn.Module):
                 else:
                     with record_function("graft_gs/trellis_structure_prior"):
                         prior_measure = self._trellis_prior_measure(
-                            vggt_output.images[batch_index],
+                            vggt_output.images[
+                                batch_index, valid_views[batch_index]
+                            ],
                             root_bounds,
                             distributed_synchronizer,
-                            int(trellis_prior_seed) + batch_index,
+                            prior_seeds[batch_index],
                         )
             with record_function("graft_gs/atlas_initialize"):
                 atlas = PersistentOctreeAtlas.from_evidence(

@@ -802,3 +802,19 @@ sweep's intentional OOM classifier was excluded from that contamination scan.
   the requested 16-view global cap on the actual 2–4×A100 allocation. Admission
   requires a positive strict feasibility report, finite backward, checkpoint
   output, and at least 5% ending driver-visible memory headroom.
+## 2026-07-30 object-batching validation
+
+- Whole-tree `compileall` passed under
+  `/mnt/sda/hf/miniconda3/envs/CRAFT/bin/python`.
+- The focused CPU/static suite passed: 73 passed and 7 skipped across
+  `test_object_batching`, MeshFleet contracts, distributed evidence, production
+  trace guards, and view-budget selection.
+- New tests prove equal-view collation with variable surfaces, fail-closed
+  mixed-view rejection, homogeneous local/DDP sampler output, masked
+  camera-alignment equivalence, and one TRELLIS offload at the outer batched
+  sampling boundary.
+- The complete local suite reached 190 passed and 11 skipped. Seven unrelated
+  pre-existing numerical/environment-version failures remain in this local
+  non-server environment (deep-copy leaf tensors, two numerical thresholds,
+  and TRELLIS diagnostic wording). No A800 memory, throughput, accuracy, or OOM
+  claim is made locally; the new autotuners are the required server evidence.

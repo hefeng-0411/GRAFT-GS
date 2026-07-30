@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Optional
 
 import torch
 from torch.utils.data import Dataset
@@ -27,6 +26,11 @@ class FolderMultiviewDataset(Dataset):
 
     def __len__(self) -> int:
         return len(self.objects)
+
+    def view_count(self, index: int) -> int:
+        """Return the exact joint-attention view count without loading images."""
+
+        return len(self.objects[index][1])
 
     def __getitem__(self, index: int) -> dict[str, object]:
         directory, paths, target = self.objects[index]
@@ -60,4 +64,46 @@ def single_object_collate(batch: list[dict[str, object]]) -> dict[str, object]:
     return item
 
 
-__all__ = ["FolderMultiviewDataset", "single_object_collate"]
+def folder_object_collate(batch: list[dict[str, object]]) -> dict[str, object]:
+    """Collate objects only when their VGGT joint-view dimensions agree."""
+
+    if not batch:
+        raise ValueError("cannot collate an empty object batch")
+    if len(batch) == 1:
+        return single_object_collate(batch)
+    view_counts = {int(torch.as_tensor(item["images"]).shape[0]) for item in batch}
+    if len(view_counts) != 1:
+        raise ValueError(
+            "VGGT object batches must have identical view counts; use "
+            "ViewCountBatchSampler instead of padding joint-attention inputs"
+        )
+    result: dict[str, object] = {
+        "object_id": [str(item["object_id"]) for item in batch],
+        "images": torch.stack(
+            [torch.as_tensor(item["images"]) for item in batch], dim=0
+        ),
+    }
+    if any("target_states" in item for item in batch):
+        if not all("target_states" in item for item in batch):
+            raise ValueError("folder target-state supervision is incomplete in batch")
+        result["target_states"] = [
+            item["target_states"][0] for item in batch
+        ]
+        provenance = [item.get("target_state_provenance") for item in batch]
+        if len(set(provenance)) != 1:
+            raise ValueError("folder target-state provenance differs within batch")
+        result["target_state_provenance"] = provenance[0]
+        result["target_state_confidence"] = torch.cat(
+            [
+                torch.as_tensor(item.get("target_state_confidence", [1.0])).reshape(-1)
+                for item in batch
+            ]
+        )
+    return result
+
+
+__all__ = [
+    "FolderMultiviewDataset",
+    "folder_object_collate",
+    "single_object_collate",
+]

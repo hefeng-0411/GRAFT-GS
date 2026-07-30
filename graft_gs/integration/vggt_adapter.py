@@ -193,6 +193,7 @@ def align_vggt_to_supervised_cameras(
     target_extrinsics_world_to_camera: Tensor,
     target_intrinsics: Tensor,
     orientation_weight: float = 1.0,
+    valid_view_mask: Optional[Tensor] = None,
 ) -> tuple[VGGTGeometryOutput, CameraAlignmentDiagnostics]:
     """Remove VGGT's global similarity gauge without hiding relative pose error.
 
@@ -214,6 +215,27 @@ def align_vggt_to_supervised_cameras(
         raise ValueError("Sim(3) camera gauge alignment requires at least two views")
     if orientation_weight < 0:
         raise ValueError("orientation_weight must be non-negative")
+    if valid_view_mask is None:
+        view_weight = torch.ones(
+            predicted.shape[:2],
+            dtype=predicted.dtype,
+            device=predicted.device,
+        )
+    else:
+        view_weight = torch.as_tensor(
+            valid_view_mask,
+            dtype=predicted.dtype,
+            device=predicted.device,
+        )
+        if view_weight.shape != predicted.shape[:2]:
+            raise ValueError("valid_view_mask must have shape [B,K]")
+        view_weight = (view_weight > 0).to(predicted.dtype)
+    view_count = view_weight.sum(dim=1)
+    if bool(torch.any(view_count < 2)):
+        raise ValueError(
+            "Sim(3) camera gauge alignment requires at least two valid views per object"
+        )
+    normalized_view_weight = view_weight / view_count[:, None]
 
     predicted_r_c2w = predicted[..., :3, :3].transpose(-1, -2)
     target_r_c2w = target[..., :3, :3].transpose(-1, -2)
@@ -221,12 +243,30 @@ def align_vggt_to_supervised_cameras(
         "bkij,bkj->bki", predicted_r_c2w, predicted[..., :3, 3]
     )
     target_center = -torch.einsum("bkij,bkj->bki", target_r_c2w, target[..., :3, 3])
-    predicted_mean = predicted_center.mean(dim=1, keepdim=True)
-    target_mean = target_center.mean(dim=1, keepdim=True)
+    predicted_mean = torch.sum(
+        normalized_view_weight[..., None] * predicted_center,
+        dim=1,
+        keepdim=True,
+    )
+    target_mean = torch.sum(
+        normalized_view_weight[..., None] * target_center,
+        dim=1,
+        keepdim=True,
+    )
     predicted_centered = predicted_center - predicted_mean
     target_centered = target_center - target_mean
-    predicted_spread = torch.sqrt(predicted_centered.square().sum((1, 2)) / predicted.shape[1])
-    target_spread = torch.sqrt(target_centered.square().sum((1, 2)) / predicted.shape[1])
+    predicted_spread = torch.sqrt(
+        torch.sum(
+            normalized_view_weight[..., None] * predicted_centered.square(),
+            dim=(1, 2),
+        )
+    )
+    target_spread = torch.sqrt(
+        torch.sum(
+            normalized_view_weight[..., None] * target_centered.square(),
+            dim=(1, 2),
+        )
+    )
     epsilon = torch.finfo(predicted.dtype).eps
     if bool(torch.any(predicted_spread.detach() <= 32.0 * epsilon)) or bool(
         torch.any(target_spread.detach() <= 32.0 * epsilon)
@@ -235,10 +275,16 @@ def align_vggt_to_supervised_cameras(
 
     normalized_predicted = predicted_centered / predicted_spread[:, None, None]
     normalized_target = target_centered / target_spread[:, None, None]
-    cross_covariance = normalized_predicted.transpose(1, 2) @ normalized_target
+    cross_covariance = (
+        normalized_predicted.transpose(1, 2)
+        @ (normalized_view_weight[..., None] * normalized_target)
+    )
     orientation_covariance = torch.einsum(
-        "bkic,bkjc->bij", predicted_r_c2w, target_r_c2w
-    ) / float(predicted.shape[1])
+        "bk,bkic,bkjc->bij",
+        normalized_view_weight,
+        predicted_r_c2w,
+        target_r_c2w,
+    )
     cross_covariance = cross_covariance + orientation_weight * orientation_covariance
     u, _, vh = torch.linalg.svd(cross_covariance)
     candidate = vh.transpose(-1, -2) @ u.transpose(-1, -2)
@@ -251,8 +297,12 @@ def align_vggt_to_supervised_cameras(
     rotation = vh.transpose(-1, -2) @ correction @ u.transpose(-1, -2)
     rotated_centered = torch.einsum("bij,bkj->bki", rotation, predicted_centered)
     scale = (
-        (target_centered * rotated_centered).sum((1, 2))
-        / predicted_centered.square().sum((1, 2)).clamp_min(epsilon)
+        (
+            view_weight[..., None] * target_centered * rotated_centered
+        ).sum((1, 2))
+        / (
+            view_weight[..., None] * predicted_centered.square()
+        ).sum((1, 2)).clamp_min(epsilon)
     ).clamp_min(32.0 * epsilon)
     translation = target_mean[:, 0] - scale[:, None] * torch.einsum(
         "bij,bj->bi", rotation, predicted_mean[:, 0]
@@ -292,17 +342,26 @@ def align_vggt_to_supervised_cameras(
     target_focal = target_intrinsics[..., (0, 1), (0, 1)].clamp_min(epsilon)
     focal_residual = torch.log(predicted_focal / target_focal)
 
-    def stable_rms(value: Tensor, dimensions: tuple[int, ...]) -> Tensor:
+    def stable_weighted_rms(value: Tensor) -> Tensor:
         smoothing = 32.0 * epsilon
-        return torch.sqrt(value.square().mean(dim=dimensions) + smoothing**2) - smoothing
+        denominator = (
+            view_count
+            * value.new_tensor(value.shape[-1])
+        ).clamp_min(1.0)
+        squared = torch.sum(
+            view_weight[..., None] * value.square(), dim=(1, 2)
+        ) / denominator
+        return torch.sqrt(squared + smoothing**2) - smoothing
 
     diagnostics = CameraAlignmentDiagnostics(
         scale=scale,
         rotation_predicted_to_target=rotation,
         translation_predicted_to_target=translation,
-        center_rmse=stable_rms(center_residual, (1, 2)),
-        rotation_geodesic=rotation_error.mean(dim=1),
-        intrinsic_log_focal_error=stable_rms(focal_residual, (1, 2)),
+        center_rmse=stable_weighted_rms(center_residual),
+        rotation_geodesic=torch.sum(
+            normalized_view_weight * rotation_error, dim=1
+        ),
+        intrinsic_log_focal_error=stable_weighted_rms(focal_residual),
     )
     aligned = VGGTGeometryOutput(
         images=output.images,

@@ -1243,3 +1243,31 @@ The full conditional validity domain is maintained in
   static contracts pass `59/59`; precision/configuration/selection contracts
   pass `28/28`. A real multi-rank A100 Phase-B optimizer-step and steady-state
   memory record remain required before declaring the remote run closed.
+## 2026-07-30 GPU-aware object batching and pipeline utilization
+
+- Added exact-view-homogeneous multi-object collation and local/distributed
+  batch samplers. VGGT joint-view inputs are never padded; variable surface,
+  topology, pseudo-label, and teacher-state values remain object-indexed.
+- Extended training phases A--F to mean-reduce multiple scenes per rank,
+  including per-object MeshFleet raster targets, stable object-derived TRELLIS
+  seeds, variable surface objectives, Phase-C minibatch coupling, and
+  objectwise Phase-F gradient purification.
+- Added checkpoint provenance for physical object batch size. The new
+  `--global-object-batch` preserves an exact optimizer batch through checked
+  divisibility, while `--minimum-global-object-batch` accounts jointly for
+  world size, physical batch, and accumulation. Same-object global-UOT mode
+  rejects object batches larger than one.
+- Added isolated-process training/evaluation batch tuners. They bind an
+  explicit GPU list, audit the pinned environment and initial device
+  availability, reject OOM/allocator/driver-headroom failures, and select the
+  largest candidate within the configured near-optimal throughput envelope.
+- Batched MeshFleet evaluation now uses pinned asynchronous loading,
+  deterministic per-rank object sharding, per-batch memory accounting, and
+  batched export/metric handoff. Added an explicit-GPU evaluation launcher.
+- Frozen TRELLIS sampling now keeps its weights resident only across adjacent
+  objects in one prior-prefetch session, then restores the existing CPU
+  offload/cache-release boundary before VGGT. Posterior values and seeds are
+  unchanged.
+- Restored the repository's documented 444-entry unconditional server lock
+  after later ranged/missing entries made the fail-closed launcher reject the
+  requirements file before any CUDA work.

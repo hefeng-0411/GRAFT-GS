@@ -135,9 +135,63 @@ The launcher derives one process per GPU from the active
 `--maximum-views N` for the ordinary object-level per-rank view budget. For the
 same-object overfit diagnostic, use `--views-per-rank N`; its global sample
 contains `N * WORLD_SIZE` views and is sharded before CUDA transfer. Do not add
-multiple ranks per GPU or dummy allocations to fill 80 GiB. The measured
-8/12/16-view sweep, allocator-ownership check, headroom criterion, and exact
-commands are in `docs/A800_VALIDATION_PROTOCOL.md`.
+multiple ranks per GPU or dummy allocations to fill 80 GiB.
+
+Ordinary object-level DDP can batch multiple independent objects in one rank
+with `--object-batch-size N`. Batches are grouped by their exact number of
+views: the loader never pads a scene into VGGT's joint-view attention, and
+variable surfaces/topologies remain separate per-object values. Losses retain
+their mean reduction, precision policy, complete view set, and per-object
+TRELLIS seed. Same-object view-sharded DDP deliberately remains batch size one.
+When `--minimum-global-object-batch` is used, accumulation is reduced as the
+physical object batch grows.
+
+Select a training batch on the exact phase, dataset, and explicit GPU IDs with
+fresh-process probes:
+
+```bash
+export GRAFT_GS_PYTHON=/mnt/sda1/miniforge3/envs/CRAFT/bin/python
+"$GRAFT_GS_PYTHON" scripts/autotune_object_batch.py \
+  --gpus 0,2,3,5 --candidates 1 2 4 8 \
+  --output outputs/batch_tuning/phase_d --launch -- \
+  /data/MeshFleet_TRELLIS --phase D --steps 100000 \
+  --manifest data_manifests/meshfleet_server.jsonl --split train \
+  --global-object-batch 32 \
+  --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
+  --initialize-from outputs/phase_c/final.pt --output outputs/phase_d
+```
+
+Each candidate gets a new process group and allocator. The selector rejects
+OOMs and candidates outside allocated, reserved, or driver-free headroom, then
+chooses the largest batch within 3% of the best measured object throughput.
+The selected physical batch and resulting global batch are checkpointed.
+Changing the global optimizer batch can change optimization statistics. Use
+`--global-object-batch N` to retain an exact existing optimizer batch; tuner
+candidates that do not divide that global batch are rejected. Use
+`--minimum-global-object-batch` only when rounding upward is acceptable.
+
+Evaluation uses the same exact-view batching and deterministic per-object
+sharding. It can be launched directly on predetermined GPUs:
+
+```bash
+bash scripts/launch_meshfleet_evaluation.sh 0,2,3,5 \
+  /data/MeshFleet_TRELLIS data_manifests/meshfleet_server.jsonl \
+  outputs/phase_f/final.pt outputs/evaluation \
+  --splits test --object-batch-size 4
+```
+
+Or measure evaluation batches independently before launching the full corpus:
+
+```bash
+"$GRAFT_GS_PYTHON" scripts/autotune_evaluation_batch.py \
+  --gpus 0,2,3,5 --candidates 1 2 4 8 \
+  --output outputs/batch_tuning/evaluation --launch -- \
+  /data/MeshFleet_TRELLIS data_manifests/meshfleet_server.jsonl \
+  outputs/phase_f/final.pt outputs/evaluation --splits test
+```
+
+The measured view sweep, allocator-ownership check, headroom criterion, and
+exact commands are in `docs/A800_VALIDATION_PROTOCOL.md`.
 
 Phases B--F use the configured fixed TRELLIS structure generator as a
 Beta-Bernoulli hidden-surface prior. Its checkpoint and sampling/uncertainty

@@ -28,6 +28,7 @@ from ..optimization.gradient_purification import (
     Gradient,
     GradientPurificationConfig,
     HilbertGradientPurifier,
+    gradient_linear_combination,
 )
 from ..optimization.quantization import (
     QuantizationConfig,
@@ -58,6 +59,7 @@ class TrainerConfig:
     phase: TrainingPhase = TrainingPhase.EVIDENCE_CALIBRATION
     learning_rate: float = 1.0e-4
     weight_decay: float = 1.0e-2
+    object_batch_size: int = 1
     gradient_accumulation_steps: int = 1
     maximum_gradient_norm: float = 1.0
     gradient_purification_enabled: bool = True
@@ -128,6 +130,8 @@ class TrainerConfig:
             float32_matmul_precision=self.precision_float32_matmul,
             allow_tf32=self.precision_allow_tf32,
         )
+        if self.object_batch_size < 1:
+            raise ValueError("object_batch_size must be positive")
         if self.gradient_accumulation_steps < 1:
             raise ValueError("gradient_accumulation_steps must be positive")
         if self.maximum_gradient_norm <= 0:
@@ -1008,6 +1012,7 @@ class GraftGSTrainer:
         self.output_directory.mkdir(parents=True, exist_ok=True)
         self.log_path = self.output_directory / "metrics.jsonl"
         self._mesh_supervisor: Optional[object] = None
+        self.last_train_metrics: Optional[dict[str, float]] = None
 
     @staticmethod
     def _seed_everything(seed: int) -> None:
@@ -1577,46 +1582,68 @@ class GraftGSTrainer:
             self.loss.weights,
             self.loss.learned_perceptual,
         )
-        flat_reliability = per_view.reliability.reshape(-1)
-        valid = torch.nonzero(flat_reliability > 0, as_tuple=False).flatten()
-        if valid.numel() < 2:
-            raise RuntimeError(
-                "Phase-F gradient purification requires at least two valid rendered views"
-            )
         maximum = self.gradient_purifier.config.maximum_views
-        if valid.numel() > maximum:
-            order = torch.argsort(flat_reliability[valid], descending=True, stable=True)
-            valid = valid[order[:maximum]]
-        local_objective = per_view.objective.reshape(-1)[valid]
-        artifact_delta = per_view.artifact_delta.reshape(-1)[valid]
-        reliability = flat_reliability[valid]
-        view_gradients: list[Gradient] = []
-        artifact_gradients: list[Gradient] = []
-        for index in range(local_objective.numel()):
-            view_gradients.append(
-                tuple(
-                    torch.autograd.grad(
-                        local_objective[index],
-                        self.trainable_parameters,
-                        retain_graph=True,
-                        allow_unused=True,
+        purified_objects: list[Gradient] = []
+        diagnostics_rows = []
+        objective_rows = []
+        for batch_index in range(per_view.objective.shape[0]):
+            reliability_row = per_view.reliability[batch_index]
+            valid = torch.nonzero(
+                reliability_row > 0, as_tuple=False
+            ).flatten()
+            if valid.numel() < 2:
+                raise RuntimeError(
+                    "Phase-F gradient purification requires at least two "
+                    "valid rendered views per object"
+                )
+            if valid.numel() > maximum:
+                order = torch.argsort(
+                    reliability_row[valid],
+                    descending=True,
+                    stable=True,
+                )
+                valid = valid[order[:maximum]]
+            local_objective = per_view.objective[batch_index, valid]
+            artifact_delta = per_view.artifact_delta[batch_index, valid]
+            reliability = reliability_row[valid]
+            view_gradients: list[Gradient] = []
+            artifact_gradients: list[Gradient] = []
+            for index in range(local_objective.numel()):
+                view_gradients.append(
+                    tuple(
+                        torch.autograd.grad(
+                            local_objective[index],
+                            self.trainable_parameters,
+                            retain_graph=True,
+                            allow_unused=True,
+                        )
                     )
                 )
-            )
-            artifact_gradients.append(
-                tuple(
-                    torch.autograd.grad(
-                        artifact_delta[index],
-                        self.trainable_parameters,
-                        retain_graph=True,
-                        allow_unused=True,
+                artifact_gradients.append(
+                    tuple(
+                        torch.autograd.grad(
+                            artifact_delta[index],
+                            self.trainable_parameters,
+                            retain_graph=True,
+                            allow_unused=True,
+                        )
                     )
                 )
+            purified, diagnostics = self.gradient_purifier.purify(
+                view_gradients,
+                reliability,
+                artifact_gradients,
             )
-        purified, diagnostics = self.gradient_purifier.purify(
-            view_gradients,
-            reliability,
-            artifact_gradients,
+            purified_objects.append(purified)
+            diagnostics_rows.append(diagnostics)
+            objective_rows.append(local_objective)
+        object_weight = per_view.objective.new_full(
+            (len(purified_objects),),
+            1.0 / len(purified_objects),
+        )
+        purified = gradient_linear_combination(
+            purified_objects,
+            object_weight,
         )
         (stable_objective / self.config.gradient_accumulation_steps).backward()
         for parameter, component in zip(self.trainable_parameters, purified):
@@ -1628,23 +1655,51 @@ class GraftGSTrainer:
             else:
                 parameter.grad.add_(contribution.detach())
         return {
-            "gradient_purification/retained_views": float(diagnostics.retained_views),
-            "gradient_purification/consensus_rank": float(diagnostics.consensus_rank),
-            "gradient_purification/artifact_rank": float(diagnostics.artifact_rank),
+            "gradient_purification/retained_views": float(
+                sum(value.retained_views for value in diagnostics_rows)
+                / len(diagnostics_rows)
+            ),
+            "gradient_purification/consensus_rank": float(
+                sum(value.consensus_rank for value in diagnostics_rows)
+                / len(diagnostics_rows)
+            ),
+            "gradient_purification/artifact_rank": float(
+                sum(value.artifact_rank for value in diagnostics_rows)
+                / len(diagnostics_rows)
+            ),
             "gradient_purification/cone_acceptance": float(
-                diagnostics.cone_acceptance_fraction.detach().cpu()
+                torch.stack(
+                    [
+                        value.cone_acceptance_fraction
+                        for value in diagnostics_rows
+                    ]
+                )
+                .mean()
+                .detach()
+                .cpu()
             ),
             "gradient_purification/median_residual": float(
-                diagnostics.median_residual.detach().cpu()
+                torch.stack(
+                    [value.median_residual for value in diagnostics_rows]
+                )
+                .mean()
+                .detach()
+                .cpu()
             ),
             "gradient_purification/fisher_norm": float(
-                diagnostics.fisher_norm.detach().cpu()
+                torch.stack([value.fisher_norm for value in diagnostics_rows])
+                .mean()
+                .detach()
+                .cpu()
             ),
             "gradient_purification/fisher_scale": float(
-                diagnostics.fisher_scale.detach().cpu()
+                torch.stack([value.fisher_scale for value in diagnostics_rows])
+                .mean()
+                .detach()
+                .cpu()
             ),
             "gradient_purification/raw_view_objective": float(
-                local_objective.mean().detach().cpu()
+                torch.cat(objective_rows).mean().detach().cpu()
             ),
         }
 
@@ -1792,6 +1847,10 @@ class GraftGSTrainer:
 
         if not self.config.synchronize_object_atlas or not self.context.distributed:
             return images, valid_mask, dict(view_supervision)
+        if images.shape[0] != 1:
+            raise ValueError(
+                "same-object view-sharded DDP requires one object per rank"
+            )
         has_cameras = {
             "extrinsics_world_to_camera",
             "intrinsics",
@@ -1841,12 +1900,21 @@ class GraftGSTrainer:
         return bounds
 
     @staticmethod
-    def _trellis_prior_seed(batch: Mapping[str, object]) -> int:
-        """Stable object-level seed shared by all ranks and teacher/student."""
+    def _trellis_prior_seed(
+        batch: Mapping[str, object],
+    ) -> int | tuple[int, ...]:
+        """Stable object-level seeds shared by all ranks and teacher/student."""
 
         value = batch.get("object_id", "graft-gs-unidentified-object")
         if isinstance(value, (list, tuple)):
-            value = "\x1f".join(str(item) for item in value)
+            return tuple(
+                int.from_bytes(
+                    hashlib.sha256(str(item).encode("utf8")).digest()[:8],
+                    "little",
+                )
+                % (2**31 - 1)
+                for item in value
+            )
         digest = hashlib.sha256(str(value).encode("utf8")).digest()
         return int.from_bytes(digest[:8], "little") % (2**31 - 1)
 
@@ -1864,16 +1932,35 @@ class GraftGSTrainer:
         }
         if not self.config.derive_mesh_depth_normals or not render_phase:
             return {}
-        paths = batch.get("modality_paths")
-        mesh_path = paths.get("render_mesh") if isinstance(paths, Mapping) else None
         cameras_available = {
             "extrinsics_world_to_camera",
             "intrinsics",
         }.issubset(view_supervision)
-        if mesh_path is None or not cameras_available:
+        if not cameras_available:
             if self.config.require_mesh_depth_normals:
                 raise ValueError(
                     "configured mesh depth/normal supervision requires render_mesh path and audited cameras"
+                )
+            return {}
+        extrinsics = view_supervision["extrinsics_world_to_camera"]
+        intrinsics = view_supervision["intrinsics"]
+        paths = batch.get("modality_paths")
+        if isinstance(paths, Mapping):
+            mesh_paths = [paths.get("render_mesh")] * int(extrinsics.shape[0])
+        elif isinstance(paths, (list, tuple)):
+            mesh_paths = [
+                row.get("render_mesh") if isinstance(row, Mapping) else None
+                for row in paths
+            ]
+        else:
+            mesh_paths = []
+        if len(mesh_paths) != extrinsics.shape[0] or any(
+            path is None for path in mesh_paths
+        ):
+            if self.config.require_mesh_depth_normals:
+                raise ValueError(
+                    "configured mesh depth/normal supervision requires one "
+                    "render_mesh path per object"
                 )
             return {}
         if self._mesh_supervisor is None:
@@ -1883,24 +1970,33 @@ class GraftGSTrainer:
                 self.context.device,
                 view_chunk_size=self.config.mesh_supervision_view_chunk_size,
             )
-        extrinsics = view_supervision["extrinsics_world_to_camera"]
-        intrinsics = view_supervision["intrinsics"]
-        if extrinsics.shape[0] != 1:
-            raise ValueError("mesh-derived reference path expects one variable-topology object per rank")
         with torch.no_grad():
-            target = self._mesh_supervisor(
-                mesh_path,
-                extrinsics[0],
-                intrinsics[0],
-                int(image_size[0]),
-                int(image_size[1]),
-            )
+            targets = [
+                self._mesh_supervisor(
+                    mesh_path,
+                    extrinsics[index],
+                    intrinsics[index],
+                    int(image_size[0]),
+                    int(image_size[1]),
+                )
+                for index, mesh_path in enumerate(mesh_paths)
+            ]
         return {
-            "mesh_depth_target": target.depth[None],
-            "mesh_normal_target": target.normal[None],
-            "mesh_visibility_mask": target.visibility[None],
-            "mesh_normal_validity": target.normal_validity[None],
-            "mesh_normal_provenance": target.normal_provenance,
+            "mesh_depth_target": torch.stack(
+                [target.depth for target in targets]
+            ),
+            "mesh_normal_target": torch.stack(
+                [target.normal for target in targets]
+            ),
+            "mesh_visibility_mask": torch.stack(
+                [target.visibility for target in targets]
+            ),
+            "mesh_normal_validity": torch.stack(
+                [target.normal_validity for target in targets]
+            ),
+            "mesh_normal_provenance": [
+                target.normal_provenance for target in targets
+            ],
         }
 
     def fit(
@@ -1916,12 +2012,15 @@ class GraftGSTrainer:
             sampler = getattr(train_loader, "sampler", None)
             if sampler is not None and hasattr(sampler, "set_epoch"):
                 sampler.set_epoch(self.epoch)
+            batch_sampler = getattr(train_loader, "batch_sampler", None)
+            if batch_sampler is not None and hasattr(batch_sampler, "set_epoch"):
+                batch_sampler.set_epoch(self.epoch)
             completed_epoch = True
             for batch_index, batch in enumerate(train_loader):
                 if batch_index < self.batches_consumed_in_epoch:
                     continue
                 previous_step = self.global_step
-                self.train_step(batch, self.microstep)
+                self.last_train_metrics = self.train_step(batch, self.microstep)
                 self.microstep += 1
                 self.batches_consumed_in_epoch = batch_index + 1
                 stepped = self.global_step != previous_step
@@ -2021,7 +2120,7 @@ class GraftGSTrainer:
     def load_checkpoint(self, path: str | Path) -> None:
         payload = torch.load(path, map_location=self.context.device, weights_only=False)
         format_version = payload.get("format_version")
-        if format_version not in {1, 2, 3, 4, 5, 6, 7}:
+        if format_version not in {1, 2, 3, 4, 5, 6, 7, 8}:
             raise ValueError("unsupported checkpoint format")
         if payload["phase"] != self.config.phase.value:
             raise ValueError("checkpoint phase does not match the configured trainer phase")
@@ -2066,6 +2165,7 @@ class GraftGSTrainer:
             ):
                 raise ValueError("checkpoint dataset manifest digest differs from current training data")
             resume_policy_fields = (
+                "object_batch_size",
                 "gradient_accumulation_steps",
                 "maximum_gradient_norm",
                 "find_unused_parameters",
@@ -2122,6 +2222,7 @@ class GraftGSTrainer:
                 if field_name not in checkpoint_trainer:
                     current_value = getattr(self.config, field_name)
                     legacy_default = {
+                        "object_batch_size": 1,
                         "teacher_distillation_confidence": 1.0,
                         "mesh_supervision_view_chunk_size": 2,
                         "renderer_checkpoint_views": True,
@@ -2133,7 +2234,9 @@ class GraftGSTrainer:
                         "precision_allow_tf32": False,
                     }.get(field_name, object())
                     introduced_format = (
-                        7
+                        8
+                        if field_name == "object_batch_size"
+                        else 7
                         if field_name
                         in {
                             "mesh_supervision_view_chunk_size",

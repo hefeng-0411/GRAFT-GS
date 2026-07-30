@@ -11,11 +11,13 @@ import time
 
 import torch
 import torch.distributed as dist
+from torch.utils.data import DataLoader
 
 from graft_gs.data import (
     MeshFleetDatasetConfig,
     MeshFleetObjectDataset,
-    meshfleet_single_object_collate,
+    meshfleet_object_collate,
+    ViewCountBatchSampler,
 )
 from graft_gs.engine import (
     load_graft_checkpoint,
@@ -60,6 +62,14 @@ def main() -> None:
     parser.add_argument("--object-id-file", type=Path)
     parser.add_argument("--view-set", default="renders")
     parser.add_argument("--maximum-views", type=int, default=12)
+    parser.add_argument("--object-batch-size", type=int, default=1)
+    parser.add_argument("--dataloader-workers", type=int)
+    parser.add_argument("--dataloader-prefetch-factor", type=int)
+    parser.add_argument(
+        "--maximum-batches-per-rank",
+        type=int,
+        help="stop after this many local batches (used by isolated batch probes)",
+    )
     parser.add_argument("--vggt-checkpoint")
     parser.add_argument("--trellis-checkpoint")
     parser.add_argument("--disable-trellis-prior", action="store_true")
@@ -70,7 +80,7 @@ def main() -> None:
     args = parser.parse_args()
     args.vggt_checkpoint = resolve_vggt_checkpoint(args.vggt_checkpoint)
 
-    model_config, _, _, dataset_config = load_server_config(args.config)
+    model_config, training_config, _, dataset_config = load_server_config(args.config)
     precision_policy = load_precision_policy(args.config)
     precision_policy.apply()
     prior_config = load_trellis_prior_config(args.config)
@@ -87,6 +97,27 @@ def main() -> None:
     device = torch.device("cuda", local_rank)
     if world_size > 1 and not dist.is_initialized():
         dist.init_process_group(backend="nccl", init_method="env://")
+    if args.object_batch_size < 1:
+        raise ValueError("--object-batch-size must be positive")
+    if (
+        args.maximum_batches_per_rank is not None
+        and args.maximum_batches_per_rank < 1
+    ):
+        raise ValueError("--maximum-batches-per-rank must be positive")
+    dataloader_workers = int(
+        args.dataloader_workers
+        if args.dataloader_workers is not None
+        else training_config.get("dataloader_workers", 8)
+    )
+    prefetch_factor = int(
+        args.dataloader_prefetch_factor
+        if args.dataloader_prefetch_factor is not None
+        else training_config.get("dataloader_prefetch_factor", 4)
+    )
+    if dataloader_workers < 0 or prefetch_factor < 1:
+        raise ValueError(
+            "dataloader workers must be non-negative and prefetch positive"
+        )
 
     use_prior = bool(prior_config["enabled_after_phase_a"]) and not args.disable_trellis_prior
     if use_prior:
@@ -143,6 +174,8 @@ def main() -> None:
     manifest_digest = hashlib.sha256(args.manifest.read_bytes()).hexdigest()
     failed = False
     total_admitted = 0
+    local_batches = 0
+    stop_after_probe = False
 
     for split in args.splits:
         dataset = MeshFleetObjectDataset(
@@ -205,22 +238,61 @@ def main() -> None:
             ):
                 raise ValueError("evaluation object catalog differs from checkpoint provenance")
 
-        for index in range(rank, len(dataset), world_size):
-            object_id = dataset.records[index].object_id
+        local_indices = tuple(range(rank, len(dataset), world_size))
+        batch_sampler = ViewCountBatchSampler(
+            dataset,
+            args.object_batch_size,
+            indices=local_indices,
+            shuffle=False,
+        )
+        loader = DataLoader(
+            dataset,
+            batch_sampler=batch_sampler,
+            num_workers=dataloader_workers,
+            pin_memory=True,
+            prefetch_factor=(
+                prefetch_factor if dataloader_workers > 0 else None
+            ),
+            persistent_workers=dataloader_workers > 0,
+            collate_fn=meshfleet_object_collate,
+        )
+        for batch in loader:
+            object_value = batch["object_id"]
+            object_ids = (
+                [str(value) for value in object_value]
+                if isinstance(object_value, (list, tuple))
+                else [str(object_value)]
+            )
             try:
-                sample = dataset[index]
-                batch = meshfleet_single_object_collate([sample])
-                images = batch["images"].to(device=device, dtype=torch.float32)
-                evidence_mask = batch["evidence_mask"].to(device=device)
+                images = batch["images"].to(
+                    device=device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                )
+                evidence_mask = batch["evidence_mask"].to(
+                    device=device,
+                    non_blocking=True,
+                )
                 extrinsics = batch["extrinsics_world_to_camera"].to(
-                    device=device, dtype=torch.float32
+                    device=device,
+                    dtype=torch.float32,
+                    non_blocking=True,
                 )
                 intrinsics = batch["intrinsics"].to(
-                    device=device, dtype=torch.float32
+                    device=device,
+                    dtype=torch.float32,
+                    non_blocking=True,
                 )
-                prior_seed = int.from_bytes(
-                    hashlib.sha256(object_id.encode("ascii")).digest()[:8], "little"
-                ) % (2**31 - 1)
+                prior_seed = tuple(
+                    int.from_bytes(
+                        hashlib.sha256(
+                            object_id.encode("utf8")
+                        ).digest()[:8],
+                        "little",
+                    )
+                    % (2**31 - 1)
+                    for object_id in object_ids
+                )
                 torch.cuda.reset_peak_memory_stats(device)
                 start = time.perf_counter()
                 with torch.no_grad():
@@ -230,53 +302,109 @@ def main() -> None:
                         render_input_views=False,
                         ground_truth_extrinsics=extrinsics,
                         ground_truth_intrinsics=intrinsics,
-                        atlas_root_bounds=batch["atlas_root_bounds"].to(device),
+                        atlas_root_bounds=batch["atlas_root_bounds"].to(
+                            device=device,
+                            non_blocking=True,
+                        ),
                         trellis_prior_seed=prior_seed,
                     )
                 torch.cuda.synchronize(device)
-                scene = output.scenes[0]
-                object_output = args.output_directory / split / object_id
-                ply, glb = scene.export(object_output, object_id)
-                target = sample["surface_voxel_centers"].to(
-                    device=device, dtype=scene.gaussians.means.dtype
-                )
-                metric = {
-                    "status": "ok",
-                    "object_id": object_id,
-                    "split": split,
-                    "rank": rank,
-                    "seconds": time.perf_counter() - start,
-                    "peak_memory_bytes": torch.cuda.max_memory_allocated(device),
-                    "surface_chamfer_squared": float(
-                        symmetric_surface_chamfer(scene.gaussians.means, target)
-                        .detach()
-                        .cpu()
-                    ),
-                    "active_charts": scene.atlas.num_active,
-                    "transport_edges": scene.mapping.graph.num_edges,
-                    "selected_topology": scene.topology.selected.identifier,
-                    "betti": scene.topology.selected.betti,
-                    "gaussians": scene.gaussians.means.shape[0],
-                    "mesh_faces": scene.mesh.faces.shape[0],
-                    "ply": str(ply),
-                    "glb": str(glb),
-                    "checkpoint": checkpoint_report.__dict__,
-                }
+                batch_seconds = time.perf_counter() - start
+                peak_allocated = torch.cuda.max_memory_allocated(device)
+                peak_reserved = torch.cuda.max_memory_reserved(device)
+                driver_free, device_memory = torch.cuda.mem_get_info(device)
+                surface_value = batch["surface_voxel_centers"]
+                if isinstance(surface_value, (list, tuple)):
+                    surfaces = list(surface_value)
+                else:
+                    dense_surface = torch.as_tensor(surface_value)
+                    surfaces = (
+                        [dense_surface]
+                        if dense_surface.ndim == 2 and len(object_ids) == 1
+                        else [
+                            dense_surface[index]
+                            for index in range(len(object_ids))
+                        ]
+                    )
+                batch_metrics = []
+                for index, (object_id, scene) in enumerate(
+                    zip(object_ids, output.scenes)
+                ):
+                    object_output = args.output_directory / split / object_id
+                    ply, glb = scene.export(object_output, object_id)
+                    target = torch.as_tensor(surfaces[index]).to(
+                        device=device,
+                        dtype=scene.gaussians.means.dtype,
+                        non_blocking=True,
+                    )
+                    batch_metrics.append(
+                        {
+                            "status": "ok",
+                            "object_id": object_id,
+                            "split": split,
+                            "rank": rank,
+                            "seconds": batch_seconds / len(object_ids),
+                            "batch_seconds": batch_seconds,
+                            "object_batch_size": len(object_ids),
+                            "peak_memory_bytes": peak_allocated,
+                            "peak_reserved_memory_bytes": peak_reserved,
+                            "device_memory_bytes": device_memory,
+                            "peak_allocated_fraction": (
+                                peak_allocated / device_memory
+                            ),
+                            "peak_reserved_fraction": (
+                                peak_reserved / device_memory
+                            ),
+                            "ending_driver_free_fraction": (
+                                driver_free / device_memory
+                            ),
+                            "surface_chamfer_squared": float(
+                                symmetric_surface_chamfer(
+                                    scene.gaussians.means, target
+                                )
+                                .detach()
+                                .cpu()
+                            ),
+                            "active_charts": scene.atlas.num_active,
+                            "transport_edges": scene.mapping.graph.num_edges,
+                            "selected_topology": scene.topology.selected.identifier,
+                            "betti": scene.topology.selected.betti,
+                            "gaussians": scene.gaussians.means.shape[0],
+                            "mesh_faces": scene.mesh.faces.shape[0],
+                            "ply": str(ply),
+                            "glb": str(glb),
+                            "checkpoint": checkpoint_report.__dict__,
+                        }
+                    )
             except Exception as error:
                 failed = True
-                metric = {
-                    "status": "error",
-                    "object_id": object_id,
-                    "split": split,
-                    "rank": rank,
-                    "error_type": type(error).__name__,
-                    "error": str(error),
-                }
-                _append_jsonl(rank_metrics, metric)
+                for object_id in object_ids:
+                    _append_jsonl(
+                        rank_metrics,
+                        {
+                            "status": "error",
+                            "object_id": object_id,
+                            "split": split,
+                            "rank": rank,
+                            "object_batch_size": len(object_ids),
+                            "error_type": type(error).__name__,
+                            "error": str(error),
+                        },
+                    )
                 if not args.continue_on_error:
                     raise
             else:
-                _append_jsonl(rank_metrics, metric)
+                for metric in batch_metrics:
+                    _append_jsonl(rank_metrics, metric)
+            local_batches += 1
+            if (
+                args.maximum_batches_per_rank is not None
+                and local_batches >= args.maximum_batches_per_rank
+            ):
+                stop_after_probe = True
+                break
+        if stop_after_probe:
+            break
 
     if world_size > 1:
         failure = torch.tensor([int(failed)], dtype=torch.int64, device=device)
@@ -309,6 +437,8 @@ def main() -> None:
             "manifest_sha256": manifest_digest,
             "splits": list(args.splits),
             "world_size": world_size,
+            "maximum_object_batch_size_per_rank": args.object_batch_size,
+            "maximum_batches_per_rank": args.maximum_batches_per_rank,
             "admitted_count": total_admitted,
             "evaluated_count": len(all_metrics),
             "success_count": ok,

@@ -265,6 +265,7 @@ class TrellisPriorAdapter:
             offload_cuda_pipeline_after_sampling
         )
         self._pipeline_device: Optional[torch.device] = None
+        self._sampling_session_depth = 0
         self._sample_cache: OrderedDict[str, TrellisStructurePrior] = OrderedDict()
         self.last_cuda_cache_release: dict[str, int | bool] = {
             "performed": False,
@@ -285,6 +286,32 @@ class TrellisPriorAdapter:
             "available": 0,
             "selected": 0,
         }
+
+    @contextmanager
+    def sampling_session(self) -> Iterator[None]:
+        """Defer CUDA offload/cache release across consecutive object samples.
+
+        The pipeline remains frozen and every posterior call is unchanged. A
+        multi-object forward merely avoids moving the same weights CPU→CUDA→CPU
+        between adjacent samples, then restores the original lifetime boundary
+        before VGGT begins.
+        """
+
+        self._sampling_session_depth += 1
+        try:
+            yield
+        finally:
+            self._sampling_session_depth -= 1
+            if self._sampling_session_depth < 0:
+                raise RuntimeError("TRELLIS sampling session depth underflow")
+            if (
+                self._sampling_session_depth == 0
+                and self._pipeline_device is not None
+                and self._pipeline_device.type == "cuda"
+            ):
+                device = self._pipeline_device
+                self._offload_cuda_pipeline(device)
+                self._release_inactive_cuda_cache(device)
 
     @staticmethod
     def _validate_upstream_contract(pipeline: object) -> None:
@@ -493,8 +520,9 @@ class TrellisPriorAdapter:
         del condition
         if "coordinates" in locals():
             del coordinates
-        self._offload_cuda_pipeline(scene_images.device)
-        self._release_inactive_cuda_cache(scene_images.device)
+        if self._sampling_session_depth == 0:
+            self._offload_cuda_pipeline(scene_images.device)
+            self._release_inactive_cuda_cache(scene_images.device)
         return prior
 
     def _select_conditioning_views(self, scene_images: Tensor) -> Tensor:

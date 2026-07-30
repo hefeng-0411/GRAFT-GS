@@ -85,6 +85,67 @@ class ViewConditionedObjectives:
     reliability: Tensor
 
 
+def _variable_surface_batch(
+    value: object,
+    batch_size: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    field_name: str,
+) -> list[Tensor]:
+    """Normalize dense or variable-length point sets without padding surfaces."""
+
+    if isinstance(value, (list, tuple)):
+        if len(value) != batch_size:
+            raise ValueError(
+                f"{field_name} must contain one point set per object"
+            )
+        surfaces = [
+            torch.as_tensor(item, device=device, dtype=dtype) for item in value
+        ]
+    else:
+        dense = torch.as_tensor(value, device=device, dtype=dtype)
+        if dense.ndim == 2 and batch_size == 1:
+            surfaces = [dense]
+        elif dense.ndim == 3 and dense.shape[0] == batch_size:
+            surfaces = [dense[index] for index in range(batch_size)]
+        else:
+            raise ValueError(
+                f"{field_name} must have shape [N,3], [B,N,3], or be a "
+                "length-B sequence"
+            )
+    if any(surface.ndim != 2 or surface.shape[1] != 3 for surface in surfaces):
+        raise ValueError(f"{field_name} point sets must each have shape [N,3]")
+    return surfaces
+
+
+def _object_batch_view(
+    batch: Mapping[str, object],
+    index: int,
+    batch_size: int,
+) -> dict[str, object]:
+    """Select one object from a collated mapping for variable-size objectives."""
+
+    selected: dict[str, object] = {}
+    for name, value in batch.items():
+        if isinstance(value, Tensor) and value.ndim > 0 and value.shape[0] == batch_size:
+            selected[name] = value[index]
+        elif (
+            isinstance(value, (list, tuple))
+            and len(value) == batch_size
+            and name
+            not in {
+                "dataset_warnings",
+                "available_modalities",
+                "missing_optional_modalities",
+            }
+        ):
+            selected[name] = value[index]
+        else:
+            selected[name] = value
+    return selected
+
+
 class LearnedPerceptualPyramid(nn.Module):
     """Frozen, hash-pinned VGG16 feature metric with no network download path."""
 
@@ -1583,32 +1644,36 @@ class GraftGSLoss(nn.Module):
         )
         surface_target = batch.get("surface_voxel_centers")
         if surface_target is not None:
-            surface = torch.as_tensor(surface_target, device=device, dtype=output.vggt.depth.dtype)
-            if surface.ndim == 2:
-                surface = surface[None]
-            if surface.ndim != 3 or surface.shape[0] != len(output.scenes):
-                raise ValueError("surface_voxel_centers must have shape [N,3] or [B,N,3]")
+            surfaces = _variable_surface_batch(
+                surface_target,
+                len(output.scenes),
+                device=device,
+                dtype=output.vggt.depth.dtype,
+                field_name="surface_voxel_centers",
+            )
             terms["surface"] = torch.stack(
                 [
-                    symmetric_surface_chamfer(scene.gaussians.means, surface[index])
+                    symmetric_surface_chamfer(scene.gaussians.means, surfaces[index])
                     for index, scene in enumerate(output.scenes)
                 ]
             ).mean()
             cell_size_value = batch.get("surface_cell_size", 1.0 / 64.0)
-            if isinstance(cell_size_value, Tensor):
-                unique_cell_size = torch.as_tensor(cell_size_value).reshape(-1)
-                if unique_cell_size.numel() != 1:
-                    raise ValueError("one object batch must provide one surface_cell_size")
-                cell_size = float(unique_cell_size[0])
-            else:
-                cell_size = float(cell_size_value)
+            cell_sizes = torch.as_tensor(cell_size_value).reshape(-1)
+            if cell_sizes.numel() not in {1, len(output.scenes)}:
+                raise ValueError(
+                    "surface_cell_size must be scalar or one value per object"
+                )
             calibration = [
                 evidence_surface_calibration(
                     scene.evidence.positions,
                     scene.evidence.covariance,
                     scene.evidence.confidence,
-                    surface[index],
-                    cell_size,
+                    surfaces[index],
+                    float(
+                        cell_sizes[
+                            0 if cell_sizes.numel() == 1 else index
+                        ]
+                    ),
                 )
                 for index, scene in enumerate(output.scenes)
             ]
@@ -1671,19 +1736,19 @@ class GraftGSLoss(nn.Module):
             output,
             batch,
         )
-        if len(output.scenes) != 1 and (
-            batch.get("trellis_patchtokens") is not None
-            or batch.get("trellis_latent_features") is not None
-        ):
-            raise ValueError("variable-size pseudo-label distillation requires one object per rank")
-        if len(output.scenes) == 1:
-            dino_relational, trellis_relational = surface_pseudo_relational_distillation(
-                output.scenes[0], batch
+        relational = [
+            surface_pseudo_relational_distillation(
+                scene,
+                _object_batch_view(batch, index, len(output.scenes)),
             )
-        else:
-            dino_relational, trellis_relational = zero, zero
-        terms["dino_relational"] = dino_relational
-        terms["trellis_latent_relational"] = trellis_relational
+            for index, scene in enumerate(output.scenes)
+        ]
+        terms["dino_relational"] = torch.stack(
+            [value[0] for value in relational]
+        ).mean()
+        terms["trellis_latent_relational"] = torch.stack(
+            [value[1] for value in relational]
+        ).mean()
         terms["sheet"] = torch.stack(sheet_losses).mean()
         terms["opacity"] = torch.stack(opacity_losses).mean()
         terms["metric_spd"] = torch.stack(spd_losses).mean()
@@ -1960,19 +2025,17 @@ class GraftGSLoss(nn.Module):
                 raise ValueError(
                     "Phase C requires target_states or direct surface_voxel_centers"
                 )
-            surface = torch.as_tensor(
+            surfaces = _variable_surface_batch(
                 surface_target,
+                len(output.scenes),
                 device=device,
                 dtype=output.vggt.depth.dtype,
+                field_name="Phase C surface targets",
             )
-            if surface.ndim == 2:
-                surface = surface[None]
-            if surface.ndim != 3 or surface.shape[0] != len(output.scenes):
-                raise ValueError("Phase C surface targets must have shape [B,N,3]")
             target_states = [
                 derive_feasible_surface_target(
                     scene.initial_state,
-                    surface[index],
+                    surfaces[index],
                     model.config.barrier,
                 )[0]
                 for index, scene in enumerate(output.scenes)
@@ -1982,13 +2045,26 @@ class GraftGSLoss(nn.Module):
             )
         else:
             provenance = batch.get("target_state_provenance")
-            if provenance == "explicit_serialized_manifold_target":
+            provenance_values = (
+                list(provenance)
+                if isinstance(provenance, (list, tuple))
+                else [provenance] * len(output.scenes)
+            )
+            if len(provenance_values) != len(output.scenes):
+                raise ValueError("Phase-C target-state provenance has incompatible shape")
+            if all(
+                value == "explicit_serialized_manifold_target"
+                for value in provenance_values
+            ):
                 target_confidence = torch.as_tensor(
                     batch.get("target_state_confidence", 1.0),
                     device=device,
                     dtype=output.vggt.depth.dtype,
                 ).reshape(-1)
-            elif provenance == "teacher_refined_fixed_stratum":
+            elif all(
+                value == "teacher_refined_fixed_stratum"
+                for value in provenance_values
+            ):
                 if target_confidence_value is None or target_mask_value is None:
                     raise ValueError(
                         "teacher Phase-C states require confidence and activation mask"
@@ -2052,15 +2128,13 @@ class GraftGSLoss(nn.Module):
         surface_value = batch.get("surface_voxel_centers")
         if surface_value is None:
             raise ValueError("Phase A requires direct surface_voxel_centers supervision")
-        surface = torch.as_tensor(
+        surfaces = _variable_surface_batch(
             surface_value,
+            len(output.evidence_particles),
             device=output.vggt.images.device,
             dtype=output.vggt.depth.dtype,
+            field_name="Phase A surface_voxel_centers",
         )
-        if surface.ndim == 2:
-            surface = surface[None]
-        if surface.shape[0] != len(output.evidence_particles):
-            raise ValueError("Phase A surface batch and evidence batch disagree")
         cell_size_value = batch.get("surface_cell_size")
         if cell_size_value is None:
             raise ValueError("Phase A requires explicit surface_cell_size quantization metadata")
@@ -2077,7 +2151,7 @@ class GraftGSLoss(nn.Module):
                 evidence.positions,
                 evidence.covariance,
                 evidence.confidence,
-                surface[index],
+                surfaces[index],
                 cell_size,
             )
             nll_values.append(nll)

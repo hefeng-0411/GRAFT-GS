@@ -14,12 +14,18 @@ from .meshfleet import (
     load_meshfleet_manifest,
     load_meshfleet_object_ids,
     meshfleet_object_id_digest,
+    meshfleet_object_collate,
     meshfleet_record_admission_reasons,
     meshfleet_single_object_collate,
     opengl_c2w_to_opencv_c2w,
     topology_supervision_is_admissible,
 )
-from .multiview import FolderMultiviewDataset, single_object_collate
+from .multiview import (
+    FolderMultiviewDataset,
+    folder_object_collate,
+    single_object_collate,
+)
+from .batching import DistributedViewCountBatchSampler, ViewCountBatchSampler
 from .mesh_supervision import MeshDerivedTargets, MeshGroundTruthRasterizer, TriangleSoup
 
 __all__ = [
@@ -27,6 +33,7 @@ __all__ = [
     "DEFAULT_PRIMARY_MODALITIES",
     "DEFAULT_REQUIRED_MODALITIES",
     "FolderMultiviewDataset",
+    "DistributedViewCountBatchSampler",
     "MANIFEST_SCHEMA",
     "MESHFLEET_MODALITIES",
     "MeshFleetDatasetConfig",
@@ -40,9 +47,12 @@ __all__ = [
     "load_meshfleet_manifest",
     "load_meshfleet_object_ids",
     "meshfleet_object_id_digest",
+    "meshfleet_object_collate",
     "meshfleet_record_admission_reasons",
     "meshfleet_single_object_collate",
     "opengl_c2w_to_opencv_c2w",
     "topology_supervision_is_admissible",
+    "ViewCountBatchSampler",
+    "folder_object_collate",
     "single_object_collate",
 ]

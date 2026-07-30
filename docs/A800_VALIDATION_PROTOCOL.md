@@ -179,6 +179,52 @@ $GRAFT_GS_PYTHON -m unittest \
   -v
 ```
 
+For ordinary object-level DDP, tune the per-rank object batch independently
+for every training phase after the view budget is fixed. The tuner takes the
+physical indices/UUIDs explicitly, launches every candidate in a fresh process
+group, rejects allocator/driver headroom failures, and optionally launches the
+selected full run:
+
+```bash
+"$GRAFT_GS_PYTHON" scripts/autotune_object_batch.py \
+  --gpus "$CUDA_VISIBLE_DEVICES" \
+  --candidates 1 2 4 8 \
+  --output outputs/concurrency/object-batch-phase-d \
+  --maximum-allocated-fraction 0.85 \
+  --maximum-reserved-fraction 0.88 \
+  --minimum-driver-free-fraction 0.08 \
+  --launch -- \
+  "$GRAFT_GS_MESHFLEET_ROOT" --phase D --steps 100000 \
+  --manifest "$GRAFT_GS_MESHFLEET_MANIFEST" --split train \
+  --global-object-batch 32 \
+  --vggt-checkpoint "$VGGT_CHECKPOINT" \
+  --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
+  --initialize-from outputs/phase_c/final.pt --output outputs/phase_d
+```
+
+Do not reuse a selected batch across phases without measuring it: Phase E
+retains teacher/student state and Phase F replays a hardening forward. Do not
+enable multi-object batching with `--same-object-view-shards`; that mode
+constructs one global nonlinear UOT problem by definition. If a fixed global
+optimizer batch is part of the experiment, pass `--global-object-batch`; the
+trainer requires exact divisibility by physical objects times world size and
+adjusts accumulation without changing the optimizer batch.
+
+Use the corresponding fresh-process probe for full-corpus testing:
+
+```bash
+"$GRAFT_GS_PYTHON" scripts/autotune_evaluation_batch.py \
+  --gpus "$CUDA_VISIBLE_DEVICES" \
+  --candidates 1 2 4 8 \
+  --output outputs/concurrency/evaluation-batch \
+  --launch -- \
+  "$GRAFT_GS_MESHFLEET_ROOT" "$GRAFT_GS_MESHFLEET_MANIFEST" \
+  outputs/phase_f/final.pt outputs/evaluation --splits test
+```
+
+Both selection JSON files are execution evidence and should be retained with
+the checkpoint/evaluation report.
+
 Run the exact regressions for the two failures exposed by the first
 16/24/32/48/64 sweep before spending time on TRELLIS sampling:
 
