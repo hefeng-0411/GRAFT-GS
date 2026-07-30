@@ -179,7 +179,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path)
     args = parser.parse_args()
     if not torch.cuda.is_available():
-        raise RuntimeError("external-model validation requires an A800 CUDA device")
+        raise RuntimeError("external-model validation requires a CUDA device")
     precision = NativePrecisionPolicy()
     precision_record = precision.apply()
     torch.cuda.reset_peak_memory_stats()

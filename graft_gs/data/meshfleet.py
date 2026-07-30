@@ -1596,6 +1596,33 @@ class MeshFleetObjectDataset:
         maximum = self.config.maximum_views
         return available if maximum is None else min(available, int(maximum))
 
+    def estimated_work(self, index: int) -> float:
+        """Estimate Phase-B cost from audited geometry cardinalities.
+
+        The value only forms similar-cost DDP cohorts. It never changes sample
+        membership, a model input, a loss weight, or object probability.
+        """
+
+        record = self.records[index]
+        views = self.view_count(index)
+        render_elements = record.modalities.get("render_mesh", {}).get(
+            "elements", {}
+        )
+        faces = int(render_elements.get("face", 0))
+        surface_elements = record.modalities.get("surface_voxels", {}).get(
+            "elements", {}
+        )
+        surface_points = int(surface_elements.get("vertex", 0))
+        if surface_points < 1:
+            arrays = record.modalities.get("features", {}).get("arrays", {})
+            shape = arrays.get("patchtokens", {}).get("shape", ())
+            if isinstance(shape, (list, tuple)) and shape:
+                surface_points = int(shape[0])
+        return float(
+            views * (262_144 + max(faces, 0))
+            + 32 * max(surface_points, 0)
+        )
+
     def set_epoch(self, epoch: int) -> None:
         self.epoch = int(epoch)
 

@@ -1,15 +1,18 @@
-"""Six-phase native-precision DDP trainer for the A800 execution target."""
+"""Six-phase native-precision DDP trainer for Ampere execution targets."""
 
 from __future__ import annotations
 
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
+from datetime import timedelta
 from enum import Enum
 import hashlib
 import json
 import os
 from pathlib import Path
 import random
+import socket
+import threading
 import time
 from typing import Iterable, Mapping, Optional, Sequence
 
@@ -79,6 +82,10 @@ class TrainerConfig:
     log_every: int = 10
     output_directory: str = "outputs/training"
     find_unused_parameters: bool = True
+    distributed_backend: str = "nccl"
+    collective_timeout_seconds: int = 1800
+    ddp_bucket_cap_mb: int = 25
+    straggler_warning_seconds: int = 120
     synchronize_object_atlas: bool = False
     seed: int = 17
     dataset_manifest: Optional[str] = None
@@ -136,6 +143,14 @@ class TrainerConfig:
             raise ValueError("gradient_accumulation_steps must be positive")
         if self.maximum_gradient_norm <= 0:
             raise ValueError("maximum_gradient_norm must be positive")
+        if self.distributed_backend != "nccl":
+            raise ValueError("CUDA training requires the NCCL distributed backend")
+        if self.collective_timeout_seconds < 1:
+            raise ValueError("collective_timeout_seconds must be positive")
+        if self.ddp_bucket_cap_mb < 1:
+            raise ValueError("ddp_bucket_cap_mb must be positive")
+        if self.straggler_warning_seconds < 1:
+            raise ValueError("straggler_warning_seconds must be positive")
         GradientPurificationConfig(
             maximum_views=self.gradient_purification_maximum_views,
             consensus_cosine=self.gradient_consensus_cosine,
@@ -195,13 +210,64 @@ class DistributedContext:
     device: torch.device
 
     @classmethod
-    def initialize(cls) -> "DistributedContext":
+    def initialize(
+        cls,
+        *,
+        backend: str = "nccl",
+        timeout_seconds: int = 1800,
+    ) -> "DistributedContext":
+        if timeout_seconds < 1:
+            raise ValueError("distributed timeout must be positive")
         world_size = int(os.environ.get("WORLD_SIZE", "1"))
         rank = int(os.environ.get("RANK", "0"))
         local_rank = int(os.environ.get("LOCAL_RANK", "0"))
         device = bind_local_cuda_device()
+        initialized_here = False
         if world_size > 1 and not dist.is_initialized():
-            dist.init_process_group(backend="nccl", init_method="env://")
+            dist.init_process_group(
+                backend=backend,
+                init_method="env://",
+                timeout=timedelta(seconds=timeout_seconds),
+            )
+            initialized_here = True
+        if initialized_here:
+            assignment = {
+                "rank": rank,
+                "local_rank": local_rank,
+                "host": socket.gethostname(),
+                "logical_device": device.index,
+                "device_name": (
+                    torch.cuda.get_device_name(device)
+                    if device.type == "cuda"
+                    else "cpu"
+                ),
+                "cuda_visible_devices": os.environ.get("CUDA_VISIBLE_DEVICES"),
+            }
+            assignments: list[object] = [None for _ in range(world_size)]
+            dist.all_gather_object(assignments, assignment)
+            ownership = [
+                (str(value["host"]), int(value["local_rank"]))
+                for value in assignments
+                if isinstance(value, Mapping)
+            ]
+            if len(ownership) != world_size or len(set(ownership)) != world_size:
+                raise RuntimeError(
+                    "DDP requires exactly one process per host-local CUDA "
+                    f"device; observed assignments: {assignments}"
+                )
+            print(
+                "GRAFT_GS_DDP_INITIALIZED "
+                + json.dumps(
+                    {
+                        **assignment,
+                        "world_size": world_size,
+                        "backend": backend,
+                        "collective_timeout_seconds": timeout_seconds,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         return cls(rank, local_rank, world_size, device)
 
     @property
@@ -215,8 +281,8 @@ def bind_local_cuda_device(*, require_cuda: bool = False) -> torch.device:
     Loading a CUDA checkpoint before ``torch.cuda.set_device(LOCAL_RANK)`` can
     leave one process owning allocations on both logical device zero and its
     assigned rank.  That wastes memory, defeats process isolation, and can OOM
-    an otherwise lightly loaded A800.  This helper is intentionally safe to
-    call again when the trainer initializes the process group.
+    an otherwise lightly loaded accelerator. This helper is intentionally safe
+    to call again when the trainer initializes the process group.
     """
 
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
@@ -923,7 +989,10 @@ class GraftGSTrainer:
             raise ValueError(
                 "VGGT adapter backbone dtype differs from the trainer precision policy"
             )
-        self.context = DistributedContext.initialize()
+        self.context = DistributedContext.initialize(
+            backend=config.distributed_backend,
+            timeout_seconds=config.collective_timeout_seconds,
+        )
         assert_local_cuda_allocator_ownership(self.context.device)
         self._seed_everything(config.seed + self.context.rank)
         if config.phase in {
@@ -968,6 +1037,7 @@ class GraftGSTrainer:
                 broadcast_buffers=False,
                 find_unused_parameters=config.find_unused_parameters,
                 gradient_as_bucket_view=True,
+                bucket_cap_mb=config.ddp_bucket_cap_mb,
             )
         parameters = [parameter for parameter in self.module.parameters() if parameter.requires_grad]
         if not parameters:
@@ -1013,6 +1083,9 @@ class GraftGSTrainer:
         self.log_path = self.output_directory / "metrics.jsonl"
         self._mesh_supervisor: Optional[object] = None
         self.last_train_metrics: Optional[dict[str, float]] = None
+        self.last_optimizer_step_metrics: tuple[dict[str, float], ...] = ()
+        self._active_step_context: dict[str, object] = {}
+        self._stage_watchdog: Optional[threading.Timer] = None
 
     @staticmethod
     def _seed_everything(seed: int) -> None:
@@ -1037,7 +1110,7 @@ class GraftGSTrainer:
 
         # Build one asynchronous device indicator first. Converting every
         # parameter predicate to Python bool would serialize the CUDA stream
-        # hundreds of times per step and materially depress A800 utilization.
+        # hundreds of times per step and materially depress GPU utilization.
         failure = torch.zeros((), dtype=torch.int64, device=self.context.device)
         for name, value in tensors.items():
             inspected = value.coalesce().values() if value.is_sparse else value
@@ -1047,9 +1120,62 @@ class GraftGSTrainer:
                 dtype=torch.int64,
             )
             failure = torch.maximum(failure, indicator)
+        # A Phase-B forward contains object-dependent raster, sparse transport,
+        # topology, and rendering kernels. NCCL starts its Work timeout when an
+        # all-reduce is enqueued, even if its communication stream is still
+        # waiting on rank-local CUDA work. Complete that local stream first so
+        # the collective timeout measures communication rather than an
+        # unrelated tail object. DDP's gradient-bucket overlap is untouched.
+        if stage in {"backward", "final backward"}:
+            self._cancel_stage_watchdog()
+        timer: Optional[threading.Timer] = None
+        local_wait_started = time.perf_counter()
+        if self.context.distributed and self.context.device.type == "cuda":
+            timer = threading.Timer(
+                self.config.straggler_warning_seconds,
+                self._emit_local_cuda_stall,
+                args=(stage, local_wait_started),
+            )
+            timer.daemon = True
+            timer.start()
+        try:
+            local_failure = int(failure.item())
+        finally:
+            if timer is not None:
+                timer.cancel()
+        local_wait_seconds = time.perf_counter() - local_wait_started
+        if (
+            self.context.distributed
+            and (
+                local_wait_seconds >= self.config.straggler_warning_seconds
+                or (
+                    stage == "backward"
+                    and int(self._active_step_context.get("microstep", -1)) == 0
+                )
+            )
+        ):
+            print(
+                "GRAFT_GS_DDP_LOCAL_READY "
+                + json.dumps(
+                    {
+                        **self._active_step_context,
+                        "rank": self.context.rank,
+                        "collective_stage": stage,
+                        "local_cuda_wait_seconds": local_wait_seconds,
+                        "local_nonfinite": bool(local_failure),
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
         if self.context.distributed:
             dist.all_reduce(failure, op=dist.ReduceOp.MAX)
-        if not int(failure.item()):
+        global_failure = (
+            int(failure.item())
+            if self.context.distributed
+            else local_failure
+        )
+        if not global_failure:
             return
         bad = []
         for name, value in tensors.items():
@@ -1068,8 +1194,79 @@ class GraftGSTrainer:
             f"non-finite training tensors before {stage}: {gathered}"
         )
 
+    def _emit_local_cuda_stall(
+        self,
+        stage: str,
+        wait_started: float,
+    ) -> None:
+        """Report rank-local work that has not yet entered an NCCL collective."""
+
+        print(
+            "GRAFT_GS_DDP_LOCAL_CUDA_STALL "
+            + json.dumps(
+                {
+                    **self._active_step_context,
+                    "rank": self.context.rank,
+                    "collective_stage": stage,
+                    "elapsed_seconds": time.perf_counter() - wait_started,
+                    "collective_enqueued": False,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
+    def _arm_stage_watchdog(self, stage: str) -> None:
+        self._cancel_stage_watchdog()
+        if not self.context.distributed:
+            return
+        started = time.perf_counter()
+        timer = threading.Timer(
+            self.config.straggler_warning_seconds,
+            self._emit_stage_stall,
+            args=(stage, started),
+        )
+        timer.daemon = True
+        self._stage_watchdog = timer
+        timer.start()
+
+    def _cancel_stage_watchdog(self) -> None:
+        timer = getattr(self, "_stage_watchdog", None)
+        if timer is not None:
+            timer.cancel()
+        self._stage_watchdog = None
+
+    def _emit_stage_stall(self, stage: str, started: float) -> None:
+        print(
+            "GRAFT_GS_DDP_STAGE_STALL "
+            + json.dumps(
+                {
+                    **self._active_step_context,
+                    "rank": self.context.rank,
+                    "local_stage": stage,
+                    "elapsed_seconds": time.perf_counter() - started,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
+        )
+
     def train_step(self, batch: Mapping[str, object], microstep: int = 0) -> dict[str, float]:
         self.model.train()
+        object_value = batch.get("object_id")
+        if isinstance(object_value, (list, tuple)):
+            object_ids = [str(value) for value in object_value]
+        elif object_value is None:
+            object_ids = []
+        else:
+            object_ids = [str(object_value)]
+        self._active_step_context = {
+            "global_step": self.global_step,
+            "microstep": microstep,
+            "object_ids": object_ids,
+            "phase": self.config.phase.value,
+        }
+        self._arm_stage_watchdog("forward_and_loss")
         # In same-object DDP the collated CPU sample contains the union of all
         # rank views. Select the deterministic local shard before transferring
         # tensors, otherwise every process briefly materializes the entire
@@ -1139,9 +1336,14 @@ class GraftGSTrainer:
         # manifests. Render them before the trainable forward graph exists so
         # nvdiffrast's transient binning/geometry workspace cannot overlap the
         # model's peak activation state.
-        mesh_targets = self._derive_mesh_targets(
-            batch, view_supervision, images.shape[-2:]
-        )
+        if _phase_renders_input_views(self.config.phase):
+            mesh_targets = self._derive_mesh_targets(
+                batch, view_supervision, images.shape[-2:]
+            )
+        else:
+            # Phases A/C return before every rendered mesh objective. Avoid
+            # scheduling immutable nvdiffrast work that cannot enter their loss.
+            mesh_targets = {}
 
         def forward_model() -> GraftGSOutput:
             return self.model(
@@ -1222,6 +1424,7 @@ class GraftGSTrainer:
                 if forward_rng_state is None:
                     raise RuntimeError("scale adversary lost the forward RNG snapshot")
                 self._restore_forward_rng(forward_rng_state)
+                self._arm_stage_watchdog("adversarial_forward_and_loss")
                 output = forward_model()
                 total, terms = self.loss(
                     self.module, output, loss_batch, self.config.phase.value
@@ -1240,15 +1443,17 @@ class GraftGSTrainer:
                     else 0.0,
                     "hardening/relative_margin": self.config.topology_hardening_relative_margin,
                 }
-            self._assert_finite_tensors(
-                "final backward",
-                {"total": total, **terms},
-            )
+            if scale_adversaries:
+                self._assert_finite_tensors(
+                    "final backward",
+                    {"total": total, **terms},
+                )
             purification_metrics: dict[str, float] = {}
             self.module._record_cuda_memory_stage(
                 "trainer/before_backward",
                 self.context.device,
             )
+            self._arm_stage_watchdog("backward")
             try:
                 if self.gradient_purifier is not None:
                     purification_metrics = self._backward_with_gradient_purification(
@@ -1266,6 +1471,8 @@ class GraftGSTrainer:
                 )
                 self._emit_cuda_failure_diagnostics(error)
                 raise
+            finally:
+                self._cancel_stage_watchdog()
             self.module._record_cuda_memory_stage(
                 "trainer/after_backward",
                 self.context.device,
@@ -1287,21 +1494,35 @@ class GraftGSTrainer:
                 for name, parameter in self.module.named_parameters()
                 if parameter.requires_grad and parameter.grad is not None
             }
-            self._assert_finite_tensors("gradient clipping", named_gradient)
             named_parameter = {
                 name: parameter
                 for name, parameter in self.module.named_parameters()
                 if parameter.requires_grad
             }
-            self._assert_finite_tensors("optimizer step", named_parameter)
-            gradient_norm = float(
-                _clip_grad_norm_high_precision(
-                    self.trainable_parameters,
-                    self.config.maximum_gradient_norm,
-                ).cpu()
+            self._assert_finite_tensors(
+                "gradient clipping and optimizer step",
+                {
+                    **{
+                        f"gradient.{name}": value
+                        for name, value in named_gradient.items()
+                    },
+                    **{
+                        f"parameter.{name}": value
+                        for name, value in named_parameter.items()
+                    },
+                },
             )
-            self.optimizer.step()
-            self._assert_finite_tensors("post-step parameter state", named_parameter)
+            self._arm_stage_watchdog("gradient_clip_and_optimizer")
+            try:
+                gradient_norm = float(
+                    _clip_grad_norm_high_precision(
+                        self.trainable_parameters,
+                        self.config.maximum_gradient_norm,
+                    ).cpu()
+                )
+                self.optimizer.step()
+            finally:
+                self._cancel_stage_watchdog()
             optimizer_tensor = {
                 f"parameter_{parameter_index}.{state_name}": state_value
                 for parameter_index, parameter in enumerate(self.trainable_parameters)
@@ -1309,7 +1530,17 @@ class GraftGSTrainer:
                 if isinstance(state_value, Tensor)
             }
             self._assert_finite_tensors(
-                "post-step optimizer state", optimizer_tensor
+                "post-step optimizer state",
+                {
+                    **{
+                        f"parameter.{name}": value
+                        for name, value in named_parameter.items()
+                    },
+                    **{
+                        f"optimizer.{name}": value
+                        for name, value in optimizer_tensor.items()
+                    },
+                },
             )
             self.optimizer.zero_grad(set_to_none=True)
             self.global_step += 1
@@ -1796,9 +2027,12 @@ class GraftGSTrainer:
             }
             atlas_root_bounds = self._atlas_root_bounds(batch)
             trellis_prior_seed = self._trellis_prior_seed(batch)
-            mesh_targets = self._derive_mesh_targets(
-                batch, view_supervision, images.shape[-2:]
-            )
+            if _phase_renders_input_views(self.config.phase):
+                mesh_targets = self._derive_mesh_targets(
+                    batch, view_supervision, images.shape[-2:]
+                )
+            else:
+                mesh_targets = {}
             output = self.model(
                 images,
                 valid_mask=valid_mask,
@@ -2005,6 +2239,7 @@ class GraftGSTrainer:
         steps: int,
         validation_loader: Optional[Iterable[Mapping[str, object]]] = None,
     ) -> None:
+        pending_optimizer_metrics: list[dict[str, float]] = []
         while self.global_step < steps:
             dataset = getattr(train_loader, "dataset", None)
             if dataset is not None and hasattr(dataset, "set_epoch"):
@@ -2020,10 +2255,17 @@ class GraftGSTrainer:
                 if batch_index < self.batches_consumed_in_epoch:
                     continue
                 previous_step = self.global_step
-                self.last_train_metrics = self.train_step(batch, self.microstep)
+                metrics = self.train_step(batch, self.microstep)
+                self.last_train_metrics = metrics
+                pending_optimizer_metrics.append(metrics)
                 self.microstep += 1
                 self.batches_consumed_in_epoch = batch_index + 1
                 stepped = self.global_step != previous_step
+                if stepped:
+                    self.last_optimizer_step_metrics = tuple(
+                        pending_optimizer_metrics
+                    )
+                    pending_optimizer_metrics.clear()
                 if stepped and self.global_step % self.config.checkpoint_every == 0:
                     self.save_checkpoint(self.output_directory / f"step-{self.global_step:08d}.pt")
                 if (

@@ -818,3 +818,20 @@ sweep's intentional OOM classifier was excluded from that contamination scan.
   non-server environment (deep-copy leaf tensors, two numerical thresholds,
   and TRELLIS diagnostic wording). No A800 memory, throughput, accuracy, or OOM
   claim is made locally; the new autotuners are the required server evidence.
+
+## 2026-07-30 Phase-B DDP watchdog validation
+
+- Python compilation passed for the modified trainer, samplers, MeshFleet
+  loader, training/evaluation entry points, validators, and regressions.
+  `compileall`, `git diff --check`, and both launcher `bash -n` checks pass.
+- The dependency-independent static suite ran 69 tests: 67 passed and 2
+  dataset-mount skips. It covers the exact environment, manifest handoff,
+  production trace, view-budget selector, and new Ampere accelerator contract.
+- A dependency-isolated sampler smoke verified deterministic cross-rank
+  batch-one cost pairing, complete non-duplicated coverage when divisible, and
+  equal-total greedy evaluation sharding.
+- A real four-rank optimizer smoke was not started on this host: `nvidia-smi`
+  showed RTX A6000 devices 2 and 3 already using approximately 43.8 GiB each,
+  and the pinned CRAFT interpreter used by the remote launcher is not installed
+  here. The required external closures are one fresh four-A6000 Phase-B probe
+  and a separately tuned four-A100 production rerun.

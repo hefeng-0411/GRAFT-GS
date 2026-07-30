@@ -5,14 +5,18 @@ beside the unmodified `vggt/` and `TRELLIS/` baseline trees.
 
 ## Server target
 
-- Linux, six NVIDIA A800 80 GB GPUs
+- Linux, one DDP process per explicitly selected NVIDIA Ampere GPU
+- test execution profile: four RTX A6000 48 GB GPUs
+- production training profile: four A100 80 GB GPUs (A800 remains supported)
 - PyTorch 2.4 or newer with CUDA/NCCL
 - native BF16 VGGT aggregation
 - FP32 OT, charts, manifold state, barriers, analytical solves, and export
 - optional FP64 invariant diagnostics
 - a server-built `diff_gaussian_rasterization` extension for training renders
 
-The local RTX 2060 environment is not a validation target.
+The launcher derives its world size from `CUDA_VISIBLE_DEVICES`; historical
+script/config names retain `a800` for compatibility and do not force that GPU
+model or a six-rank world.
 
 ## Tensor path
 
@@ -84,7 +88,7 @@ python scripts/infer_multiview.py /data/object/views outputs/object \
   --render-input-views
 ```
 
-## Staged six-GPU training
+## Staged visible-GPU training
 
 First audit the physical MeshFleet data. The manifest stores relative paths,
 reconciles declared/available views, and gates topology labels:
@@ -131,7 +135,7 @@ are read from `configs/graft_gs_a800_native.yaml` and can be replaced with
 `--config`.
 
 The launcher derives one process per GPU from the active
-`CUDA_VISIBLE_DEVICES`; it never assumes that all six A800s are idle. Use
+`CUDA_VISIBLE_DEVICES`; it never assumes a fixed GPU count. Use
 `--maximum-views N` for the ordinary object-level per-rank view budget. For the
 same-object overfit diagnostic, use `--views-per-rank N`; its global sample
 contains `N * WORLD_SIZE` views and is sharded before CUDA transfer. Do not add
@@ -145,6 +149,16 @@ their mean reduction, precision policy, complete view set, and per-object
 TRELLIS seed. Same-object view-sharded DDP deliberately remains batch size one.
 When `--minimum-global-object-batch` is used, accumulation is reduced as the
 physical object batch grows.
+
+Every ordinary DDP batch, including batch size one, is also cohort-balanced by
+the manifest's render-face and sparse-surface cardinalities. This prevents one
+rank from receiving a tail-complexity Phase-B object while peers wait. Before a
+scalar finite-state health collective, each rank completes its own queued CUDA
+work; therefore NCCL's timeout measures communication rather than mesh/atlas
+kernel latency. The default process-group timeout is 1800 seconds and can be
+overridden with `--collective-timeout-seconds`. A rank/object warning is emitted
+after 120 seconds of local CUDA delay, configurable with
+`--straggler-warning-seconds`.
 
 Select a training batch on the exact phase, dataset, and explicit GPU IDs with
 fresh-process probes:
@@ -161,9 +175,11 @@ export GRAFT_GS_PYTHON=/mnt/sda1/miniforge3/envs/CRAFT/bin/python
   --initialize-from outputs/phase_c/final.pt --output outputs/phase_d
 ```
 
-Each candidate gets a new process group and allocator. The selector rejects
-OOMs and candidates outside allocated, reserved, or driver-free headroom, then
-chooses the largest batch within 3% of the best measured object throughput.
+Each candidate gets a new process group and allocator and starts with the
+largest estimated-work cohort. All accumulation microsteps contribute to the
+memory and throughput report. The selector rejects OOMs and candidates outside
+allocated, reserved, or driver-free headroom, then chooses the largest batch
+within 3% of the best measured object throughput.
 The selected physical batch and resulting global batch are checkpointed.
 Changing the global optimizer batch can change optimization statistics. Use
 `--global-object-batch N` to retain an exact existing optimizer batch; tuner

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import timedelta
 import hashlib
 import json
 import os
@@ -14,6 +15,7 @@ import torch.distributed as dist
 from torch.utils.data import DataLoader
 
 from graft_gs.data import (
+    cost_balanced_distributed_indices,
     MeshFleetDatasetConfig,
     MeshFleetObjectDataset,
     meshfleet_object_collate,
@@ -80,7 +82,12 @@ def main() -> None:
     args = parser.parse_args()
     args.vggt_checkpoint = resolve_vggt_checkpoint(args.vggt_checkpoint)
 
-    model_config, training_config, _, dataset_config = load_server_config(args.config)
+    (
+        model_config,
+        training_config,
+        distributed_config,
+        dataset_config,
+    ) = load_server_config(args.config)
     precision_policy = load_precision_policy(args.config)
     precision_policy.apply()
     prior_config = load_trellis_prior_config(args.config)
@@ -92,11 +99,19 @@ def main() -> None:
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     if not torch.cuda.is_available():
-        raise RuntimeError("MeshFleet evaluation requires the A800 CUDA environment")
+        raise RuntimeError("MeshFleet evaluation requires a CUDA environment")
     torch.cuda.set_device(local_rank)
     device = torch.device("cuda", local_rank)
     if world_size > 1 and not dist.is_initialized():
-        dist.init_process_group(backend="nccl", init_method="env://")
+        dist.init_process_group(
+            backend=str(distributed_config.get("backend", "nccl")),
+            init_method="env://",
+            timeout=timedelta(
+                seconds=int(
+                    distributed_config.get("collective_timeout_seconds", 1800)
+                )
+            ),
+        )
     if args.object_batch_size < 1:
         raise ValueError("--object-batch-size must be positive")
     if (
@@ -238,12 +253,17 @@ def main() -> None:
             ):
                 raise ValueError("evaluation object catalog differs from checkpoint provenance")
 
-        local_indices = tuple(range(rank, len(dataset), world_size))
+        local_indices = cost_balanced_distributed_indices(
+            dataset,
+            num_replicas=world_size,
+            rank=rank,
+        )
         batch_sampler = ViewCountBatchSampler(
             dataset,
             args.object_batch_size,
             indices=local_indices,
             shuffle=False,
+            largest_first=args.maximum_batches_per_rank is not None,
         )
         loader = DataLoader(
             dataset,
@@ -407,6 +427,9 @@ def main() -> None:
             break
 
     if world_size > 1:
+        # Do not let the final scalar status collective inherit outstanding
+        # rank-local evaluation/export CUDA work.
+        torch.cuda.synchronize(device)
         failure = torch.tensor([int(failed)], dtype=torch.int64, device=device)
         dist.all_reduce(failure, op=dist.ReduceOp.MAX)
         failed = bool(failure.item())

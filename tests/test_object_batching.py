@@ -8,6 +8,7 @@ from unittest import mock
 import torch
 
 from graft_gs.data import (
+    cost_balanced_distributed_indices,
     DistributedViewCountBatchSampler,
     meshfleet_object_collate,
     ViewCountBatchSampler,
@@ -20,14 +21,26 @@ from graft_gs.integration.trellis_prior import TrellisPriorAdapter
 
 
 class _ViewDataset:
-    def __init__(self, counts: list[int]) -> None:
+    def __init__(
+        self,
+        counts: list[int],
+        work: list[float] | None = None,
+    ) -> None:
         self.counts = counts
+        self.work = work
 
     def __len__(self) -> int:
         return len(self.counts)
 
     def view_count(self, index: int) -> int:
         return self.counts[index]
+
+    def estimated_work(self, index: int) -> float:
+        return (
+            self.work[index]
+            if self.work is not None
+            else float(self.counts[index])
+        )
 
 
 def _meshfleet_item(object_id: str, views: int, surface_points: int) -> dict[str, object]:
@@ -105,6 +118,102 @@ class ObjectBatchCollateTest(unittest.TestCase):
                 {dataset.view_count(index) for index in left},
                 {dataset.view_count(index) for index in right},
             )
+
+    def test_distributed_batch_one_pairs_similar_cost_objects(self) -> None:
+        dataset = _ViewDataset(
+            [4] * 8,
+            [1.0, 100.0, 2.0, 99.0, 3.0, 98.0, 4.0, 97.0],
+        )
+        rank_batches = [
+            list(
+                DistributedViewCountBatchSampler(
+                    dataset,
+                    1,
+                    num_replicas=2,
+                    rank=rank,
+                    shuffle=True,
+                    seed=13,
+                )
+            )
+            for rank in range(2)
+        ]
+        observed = []
+        for left, right in zip(*rank_batches):
+            left_cost = dataset.estimated_work(left[0])
+            right_cost = dataset.estimated_work(right[0])
+            self.assertLessEqual(abs(left_cost - right_cost), 1.0)
+            observed.extend((left[0], right[0]))
+        self.assertEqual(sorted(observed), list(range(8)))
+
+    def test_probe_starts_with_largest_distributed_cost_cohort(self) -> None:
+        dataset = _ViewDataset([4] * 6, [1.0, 2.0, 3.0, 40.0, 50.0, 60.0])
+        rank_batches = [
+            list(
+                DistributedViewCountBatchSampler(
+                    dataset,
+                    1,
+                    num_replicas=2,
+                    rank=rank,
+                    shuffle=False,
+                    seed=13,
+                    largest_first=True,
+                )
+            )
+            for rank in range(2)
+        ]
+        first_cost = sum(
+            dataset.estimated_work(rank_batches[rank][0][0])
+            for rank in range(2)
+        )
+        self.assertEqual(first_cost, 110.0)
+
+    def test_multi_object_batches_flatten_tail_work(self) -> None:
+        dataset = _ViewDataset(
+            [4] * 8,
+            [100.0, 99.0, 98.0, 97.0, 4.0, 3.0, 2.0, 1.0],
+        )
+        rank_batches = [
+            list(
+                DistributedViewCountBatchSampler(
+                    dataset,
+                    2,
+                    num_replicas=2,
+                    rank=rank,
+                    shuffle=False,
+                    seed=13,
+                )
+            )
+            for rank in range(2)
+        ]
+        totals = [
+            sum(dataset.estimated_work(index) for index in batch)
+            for rank in rank_batches
+            for batch in rank
+        ]
+        self.assertEqual(totals, [101.0, 101.0, 101.0, 101.0])
+
+    def test_independent_evaluation_shards_balance_total_work(self) -> None:
+        dataset = _ViewDataset(
+            [4] * 8,
+            [10.0, 9.0, 8.0, 7.0, 6.0, 5.0, 4.0, 3.0],
+        )
+        shards = [
+            cost_balanced_distributed_indices(
+                dataset,
+                num_replicas=2,
+                rank=rank,
+            )
+            for rank in range(2)
+        ]
+        self.assertEqual(
+            sorted(index for shard in shards for index in shard),
+            list(range(8)),
+        )
+        totals = [
+            sum(dataset.estimated_work(index) for index in shard)
+            for shard in shards
+        ]
+        self.assertEqual(totals, [26.0, 26.0])
 
 
 class MaskedCameraAlignmentTest(unittest.TestCase):

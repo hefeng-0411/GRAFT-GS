@@ -1,4 +1,4 @@
-"""Visible-rank A800 environment and same-object DDP reference validation."""
+"""Visible-rank Ampere environment and same-object DDP reference validation."""
 
 from __future__ import annotations
 
@@ -49,7 +49,9 @@ def _distributed_contract_errors(
     if visible_device_mask is None or not visible_device_mask.strip():
         errors.append("CUDA_VISIBLE_DEVICES must explicitly identify the assigned GPU subset")
     if world_size < 1:
-        errors.append(f"A800 validation requires a positive WORLD_SIZE, received {world_size}")
+        errors.append(
+            f"distributed validation requires a positive WORLD_SIZE, received {world_size}"
+        )
     if visible_device_count != world_size:
         errors.append(
             "torchrun world size must equal the CUDA_VISIBLE_DEVICES-resolved "
@@ -67,8 +69,6 @@ def _distributed_contract_errors(
     ]
     if len(set(rank_keys)) != world_size:
         errors.append("multiple ranks resolve to the same host/local CUDA device")
-    if any("A800" not in str(device["name"]).upper() for device in devices):
-        errors.append("every distributed rank must execute on an NVIDIA A800")
     if any(int(device["current_device"]) != int(device["local_rank"]) for device in devices):
         errors.append("at least one rank did not bind its declared local CUDA device")
     return errors
@@ -88,7 +88,7 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
 
     if not torch.cuda.is_available():
-        raise RuntimeError("visible-rank A800 validation requires CUDA")
+        raise RuntimeError("visible-rank Ampere validation requires CUDA")
     visible_device_count = torch.cuda.device_count()
     visible_device_mask = os.environ.get("CUDA_VISIBLE_DEVICES")
     torch.cuda.set_device(local_rank)

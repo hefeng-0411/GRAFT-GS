@@ -25,7 +25,11 @@ from .multiview import (
     folder_object_collate,
     single_object_collate,
 )
-from .batching import DistributedViewCountBatchSampler, ViewCountBatchSampler
+from .batching import (
+    cost_balanced_distributed_indices,
+    DistributedViewCountBatchSampler,
+    ViewCountBatchSampler,
+)
 from .mesh_supervision import MeshDerivedTargets, MeshGroundTruthRasterizer, TriangleSoup
 
 __all__ = [
@@ -34,6 +38,7 @@ __all__ = [
     "DEFAULT_REQUIRED_MODALITIES",
     "FolderMultiviewDataset",
     "DistributedViewCountBatchSampler",
+    "cost_balanced_distributed_indices",
     "MANIFEST_SCHEMA",
     "MESHFLEET_MODALITIES",
     "MeshFleetDatasetConfig",

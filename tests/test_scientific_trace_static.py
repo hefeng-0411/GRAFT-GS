@@ -593,6 +593,7 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         training = source("scripts/train_a800.py")
         launcher = source("scripts/launch_a800_6gpu.sh")
         config = source("configs/graft_gs_a800_native.yaml")
+        batching = source("graft_gs/data/batching.py")
         self.assertIn("def bind_local_cuda_device", trainer)
         self.assertIn("def assert_local_cuda_allocator_ownership", trainer)
         self.assertIn("assert_local_cuda_allocator_ownership(self.context.device)", trainer)
@@ -695,10 +696,25 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("--minimum-global-object-batch", training)
         self.assertIn("args.minimum_global_object_batch + world_size - 1", training)
         self.assertIn("find_unused_parameters: false", config)
+        self.assertIn("collective_timeout_seconds: 1800", config)
+        self.assertIn("bucket_cap_mb: 25", config)
         self.assertIn("dataloader_workers: 8", config)
         self.assertIn("dataloader_prefetch_factor: 4", config)
+        self.assertIn("def _estimated_work", batching)
+        self.assertIn("DistributedViewCountBatchSampler(", training)
+        self.assertIn("largest_first=args.batch_probe is not None", training)
+        finite_guard = trainer[
+            trainer.index("def _assert_finite_tensors"):
+            trainer.index("def train_step")
+        ]
+        self.assertLess(
+            finite_guard.index("local_failure = int(failure.item())"),
+            finite_guard.index("dist.all_reduce(failure, op=dist.ReduceOp.MAX)"),
+        )
         self.assertIn("CUDA_VISIBLE_DEVICES must name the scheduler-assigned idle GPU subset", launcher)
         self.assertIn("TORCH_NCCL_ASYNC_ERROR_HANDLING", launcher)
+        self.assertIn("TORCH_NCCL_DESYNC_DEBUG", launcher)
+        self.assertIn("TORCH_NCCL_DUMP_ON_TIMEOUT", launcher)
         self.assertIn("unset NCCL_ASYNC_ERROR_HANDLING", launcher)
         self.assertIn('--nproc-per-node="$NPROC_PER_NODE"', launcher)
         self.assertNotIn("--nproc-per-node=6", launcher)

@@ -1271,3 +1271,34 @@ The full conditional validity domain is maintained in
 - Restored the repository's documented 444-entry unconditional server lock
   after later ranged/missing entries made the fail-closed launcher reject the
   requirements file before any CUDA work.
+
+## 2026-07-30 Phase-B DDP straggler and watchdog repair
+
+- Replaced batch-one random `DistributedSampler` sharding with the same
+  exact-view distributed batch path used for larger object batches. MeshFleet
+  exposes a manifest-only cost estimate from view, render-face, and sparse
+  surface cardinalities; greedy local-batch placement across each view bucket
+  followed by adjacent global cohorts minimizes tail memory and rank-to-rank
+  Phase-B work skew without changing samples, precision, supervision, or
+  losses.
+- Scalar finite-state collectives now begin only after their rank-local CUDA
+  dependency has completed. This separates object-local raster/atlas/topology
+  latency from NCCL communication time while retaining normal DDP gradient
+  bucket overlap. The three scientific gates are coalesced to pre-backward,
+  pre-clip/update, and post-Adam parameter/state checks.
+- Added a configurable 1800-second process-group timeout, explicit 25-MiB DDP
+  buckets, unique host/local-rank ownership validation, per-rank initialization
+  records, rank/object forward/backward/local-CUDA stall records, and bounded
+  NCCL desync flight recording.
+- Batch probes now execute the largest estimated-work cohort first and
+  aggregate peak memory and synchronous throughput across every accumulation
+  microstep. Independent evaluation uses deterministic greedy cost sharding,
+  the same process-group timeout, and a local-CUDA fence before its terminal
+  status collective.
+- Phase A evidence calibration and Phase C flow pretraining now skip audited
+  mesh depth/normal rasterization entirely because both loss paths return
+  before rendered-asset objectives; Phases B/D/E/F retain the exact immutable
+  targets before their trainable forward.
+- Accelerator validation now admits the stated RTX A6000 test and A100/A800
+  production profiles while retaining the pinned CUDA 11.8 and native-BF16
+  contracts.

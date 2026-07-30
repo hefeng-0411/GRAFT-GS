@@ -1,4 +1,4 @@
-"""torchrun entry point for native-precision visible-A800 staged training."""
+"""torchrun entry point for native-precision visible-GPU staged training."""
 
 from __future__ import annotations
 
@@ -10,7 +10,6 @@ from pathlib import Path
 
 import torch.distributed as dist
 from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
 
 from graft_gs.data import (
     DistributedViewCountBatchSampler,
@@ -74,6 +73,24 @@ def main() -> None:
     )
     parser.add_argument("--dataloader-workers", type=int)
     parser.add_argument("--dataloader-prefetch-factor", type=int)
+    parser.add_argument(
+        "--collective-timeout-seconds",
+        type=int,
+        help=(
+            "NCCL process-group timeout; rank-local CUDA work is fenced before "
+            "health collectives so this measures communication"
+        ),
+    )
+    parser.add_argument(
+        "--ddp-bucket-cap-mb",
+        type=int,
+        help="DDP gradient bucket capacity in MiB",
+    )
+    parser.add_argument(
+        "--straggler-warning-seconds",
+        type=int,
+        help="emit rank/object diagnostics while local CUDA completion is delayed",
+    )
     parser.add_argument(
         "--object-batch-size",
         type=int,
@@ -300,6 +317,24 @@ def main() -> None:
             maximum_gradient_norm=float(training_config.get("maximum_gradient_norm", 1.0)),
             find_unused_parameters=bool(
                 distributed_config.get("find_unused_parameters", False)
+            ),
+            distributed_backend=str(
+                distributed_config.get("backend", "nccl")
+            ),
+            collective_timeout_seconds=int(
+                args.collective_timeout_seconds
+                if args.collective_timeout_seconds is not None
+                else distributed_config.get("collective_timeout_seconds", 1800)
+            ),
+            ddp_bucket_cap_mb=int(
+                args.ddp_bucket_cap_mb
+                if args.ddp_bucket_cap_mb is not None
+                else distributed_config.get("bucket_cap_mb", 25)
+            ),
+            straggler_warning_seconds=int(
+                args.straggler_warning_seconds
+                if args.straggler_warning_seconds is not None
+                else distributed_config.get("straggler_warning_seconds", 120)
             ),
             gradient_purification_enabled=bool(
                 training_config.get("gradient_purification_enabled", True)
@@ -556,28 +591,23 @@ def main() -> None:
     sampler = None
     batch_sampler = None
     same_object = trainer.config.synchronize_object_atlas
-    if object_batch_size > 1 and trainer.context.distributed:
+    if trainer.context.distributed and not same_object:
         batch_sampler = DistributedViewCountBatchSampler(
             dataset,
             object_batch_size,
             num_replicas=trainer.context.world_size,
             rank=trainer.context.rank,
-            shuffle=True,
+            shuffle=args.batch_probe is None,
             seed=trainer.config.seed,
+            largest_first=args.batch_probe is not None,
         )
     elif object_batch_size > 1:
         batch_sampler = ViewCountBatchSampler(
             dataset,
             object_batch_size,
-            shuffle=not same_object,
+            shuffle=not same_object and args.batch_probe is None,
             seed=trainer.config.seed,
-        )
-    elif trainer.context.distributed and not same_object:
-        sampler = DistributedSampler(
-            dataset,
-            num_replicas=trainer.context.world_size,
-            rank=trainer.context.rank,
-            shuffle=True,
+            largest_first=args.batch_probe is not None,
         )
     dataloader_workers = int(
         args.dataloader_workers
@@ -618,11 +648,14 @@ def main() -> None:
         trainer.fit(loader, trainer.global_step + 1)
         if trainer.last_train_metrics is None:
             raise RuntimeError("batch probe completed without training metrics")
+        optimizer_metrics = list(trainer.last_optimizer_step_metrics)
+        if not optimizer_metrics:
+            optimizer_metrics = [trainer.last_train_metrics]
         local_probe = {
             "rank": trainer.context.rank,
             "logical_device": trainer.context.local_rank,
             "object_batch_size": object_batch_size,
-            **trainer.last_train_metrics,
+            "microsteps": optimizer_metrics,
         }
         if trainer.context.distributed:
             probes: list[object] = [
@@ -635,12 +668,30 @@ def main() -> None:
             typed_probes = [
                 value for value in probes if isinstance(value, dict)
             ]
-            maximum_seconds = max(float(value["seconds"]) for value in typed_probes)
+            microstep_count = len(typed_probes[0]["microsteps"])
+            if microstep_count < 1 or any(
+                len(value["microsteps"]) != microstep_count
+                for value in typed_probes
+            ):
+                raise RuntimeError(
+                    "DDP batch probe ranks reported inconsistent microstep counts"
+                )
+            optimizer_seconds = sum(
+                max(
+                    float(value["microsteps"][microstep]["seconds"])
+                    for value in typed_probes
+                )
+                for microstep in range(microstep_count)
+            )
             processed_objects = sum(
-                int(value["local_scenes"]) for value in typed_probes
+                sum(
+                    int(metric["local_scenes"])
+                    for metric in value["microsteps"]
+                )
+                for value in typed_probes
             )
             payload = {
-                "schema": "graft-gs-object-batch-probe-v1",
+                "schema": "graft-gs-object-batch-probe-v2",
                 "world_size": trainer.context.world_size,
                 "object_batch_size": object_batch_size,
                 "global_objects_per_optimizer_step": (
@@ -650,25 +701,32 @@ def main() -> None:
                 ),
                 "gradient_accumulation_steps": gradient_accumulation_steps,
                 "minimum_realized_object_batch_size": min(
-                    int(value["local_scenes"]) for value in typed_probes
+                    int(metric["local_scenes"])
+                    for value in typed_probes
+                    for metric in value["microsteps"]
                 ),
                 "maximum_realized_object_batch_size": max(
-                    int(value["local_scenes"]) for value in typed_probes
+                    int(metric["local_scenes"])
+                    for value in typed_probes
+                    for metric in value["microsteps"]
                 ),
                 "aggregate_objects_per_second": (
-                    processed_objects / max(maximum_seconds, 1.0e-12)
+                    processed_objects / max(optimizer_seconds, 1.0e-12)
                 ),
                 "maximum_peak_allocated_fraction": max(
-                    float(value["peak_allocated_fraction"])
+                    float(metric["peak_allocated_fraction"])
                     for value in typed_probes
+                    for metric in value["microsteps"]
                 ),
                 "maximum_peak_reserved_fraction": max(
-                    float(value["peak_reserved_fraction"])
+                    float(metric["peak_reserved_fraction"])
                     for value in typed_probes
+                    for metric in value["microsteps"]
                 ),
                 "minimum_ending_driver_free_fraction": min(
-                    float(value["ending_driver_free_fraction"])
+                    float(metric["ending_driver_free_fraction"])
                     for value in typed_probes
+                    for metric in value["microsteps"]
                 ),
                 "ranks": typed_probes,
             }

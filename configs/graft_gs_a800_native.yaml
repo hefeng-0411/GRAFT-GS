@@ -7,6 +7,17 @@ precision:
   allow_tf32: false
 distributed:
   backend: nccl
+  # The PyTorch/NCCL default is 600 seconds. Phase-B object complexity is
+  # data-dependent, especially on 48-GiB A6000 test devices. Rank-local CUDA
+  # work is completed before health collectives, and this longer bound remains
+  # available for genuine gradient communication and checkpoint collectives.
+  collective_timeout_seconds: 1800
+  # Retain PyTorch's well-tested overlap-oriented default while making the
+  # bucket policy explicit and checkpoint-visible.
+  bucket_cap_mb: 25
+  # A daemon-side log identifies the exact rank/object before a long local CUDA
+  # tail can be mistaken for an NCCL desynchronization.
+  straggler_warning_seconds: 120
   synchronize_object_atlas: false
   # Phase-specific trainability makes every selected parameter part of the
   # graph. Avoid DDP's extra autograd traversal unless a future optional branch

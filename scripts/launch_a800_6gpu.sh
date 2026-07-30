@@ -26,6 +26,12 @@ fi
 # while avoiding the deprecated alias warning on every rank.
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=${TORCH_NCCL_ASYNC_ERROR_HANDLING:-${NCCL_ASYNC_ERROR_HANDLING:-1}}
 unset NCCL_ASYNC_ERROR_HANDLING
+# Preserve a bounded NCCL flight recorder so any genuine future collective
+# mismatch reports the first desynchronized rank instead of only rank zero's
+# terminal watchdog exception.
+export TORCH_NCCL_DESYNC_DEBUG=${TORCH_NCCL_DESYNC_DEBUG:-1}
+export TORCH_NCCL_DUMP_ON_TIMEOUT=${TORCH_NCCL_DUMP_ON_TIMEOUT:-1}
+export TORCH_NCCL_TRACE_BUFFER_SIZE=${TORCH_NCCL_TRACE_BUFFER_SIZE:-2000}
 
 # Bind server training to explicit upstream source checkouts. Environment
 # overrides support relocated mirrors; the declared paths are the defaults.

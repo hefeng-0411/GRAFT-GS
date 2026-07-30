@@ -359,3 +359,25 @@ checkpoints, data, or a compiled server dependency.
 - Remaining external gate: rerun the Phase-B command at 16 maximum global views
   on an idle 2–4×A100 80-GB allocation. Capture the first feasibility report,
   per-stage/peak/ending memory metrics, optimizer completion, and checkpoint.
+
+## 2026-07-30 Phase-B DDP watchdog correction
+
+- The reported rank-zero `ALLREDUCE NumelIn=1` timeout is the trainer's scalar
+  finite-state gate after Phase-B forward work, not evidence of a large
+  gradient collective or an NCCL bandwidth limit. The process-group default
+  expired at exactly 600 seconds while rank zero's sequence 38 waited for at
+  least one peer.
+- Ordinary batch-one DDP previously used random `DistributedSampler` sharding,
+  so ranks could receive meshes with very different face/support cardinality.
+  CUDA work was asynchronous: the scalar NCCL work timer could start while a
+  peer's raster/atlas/topology stream was still processing its tail object.
+- The implementation now cost-cohorts all ordinary distributed batches,
+  completes local CUDA dependencies before scalar health collectives, uses a
+  configurable 1800-second process-group timeout, records rank/GPU ownership,
+  and emits rank/object local-stall diagnostics. Gradient-bucket overlap during
+  backward is unchanged.
+- External closure still requires one idle four-GPU A6000 smoke and the
+  production four-A100 rerun. A pass consists of all four
+  `GRAFT_GS_DDP_INITIALIZED` records, no ownership duplicates, finite optimizer
+  completion, and no NCCL watchdog/desynchronization dump. Batch tuning must be
+  performed independently on 48-GB A6000 and 80-GB A100 allocations.

@@ -23,6 +23,7 @@ DEFAULT_SERVER_VGGT_ROOT = Path("/mnt/sda2/hef/Base/vggt")
 DEFAULT_SERVER_TRELLIS_ROOT = Path("/mnt/sda2/hef/Base/TRELLIS")
 EXPECTED_MESHFLEET_SCHEMA = "meshfleet-trellis-object-v2"
 EXPECTED_DISCOVERY_REQUIRED_MODALITIES = ("renders", "latents", "mesh_normalized")
+SUPPORTED_AMPERE_ACCELERATORS = ("RTX A6000", "A100", "A800")
 ALLOWED_REFERENCE_SKIP_REASONS = (
     "launch with torchrun",
     "set GRAFT_GS_REAL_IMAGE_DIR on the server",
@@ -48,7 +49,7 @@ def _run(command: list[str], environment: dict[str, str] | None = None) -> dict[
 
 
 def _accelerator_contract_errors(details: dict[str, object]) -> list[str]:
-    """Validate the native A800 reference precision/runtime boundary."""
+    """Validate the native Ampere reference precision/runtime boundary."""
 
     errors: list[str] = []
     if details.get("cuda_available") is not True:
@@ -61,10 +62,17 @@ def _accelerator_contract_errors(details: dict[str, object]) -> list[str]:
     if not isinstance(devices, list) or not devices:
         errors.append("no CUDA device is visible to the reference process")
     elif any(
-        not isinstance(device, dict) or "A800" not in str(device.get("name", "")).upper()
+        not isinstance(device, dict)
+        or not any(
+            supported in str(device.get("name", "")).upper()
+            for supported in SUPPORTED_AMPERE_ACCELERATORS
+        )
         for device in devices
     ):
-        errors.append("every visible reference device must be an NVIDIA A800")
+        errors.append(
+            "every visible reference device must be an NVIDIA RTX A6000, "
+            "A100, or A800"
+        )
     return errors
 
 

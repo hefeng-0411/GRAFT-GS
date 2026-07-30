@@ -155,19 +155,30 @@ class ServerManifestHandoffTest(unittest.TestCase):
         self.assertFalse(audit["valid"])
         self.assertTrue(any("summary is unreadable" in error for error in audit["errors"]))
 
-    def test_a800_cuda118_bf16_contract_is_explicit(self) -> None:
+    def test_ampere_cuda118_bf16_contract_is_explicit(self) -> None:
         valid = {
             "cuda_available": True,
             "torch_cuda": "11.8",
             "bf16_supported": True,
-            "devices": [{"name": "NVIDIA A800-SXM4-80GB"}],
+            "devices": [{"name": "NVIDIA RTX A6000"}],
         }
         self.assertEqual(VALIDATOR._accelerator_contract_errors(valid), [])
+        for name in ("NVIDIA A100-SXM4-80GB", "NVIDIA A800-SXM4-80GB"):
+            with self.subTest(name=name):
+                self.assertEqual(
+                    VALIDATOR._accelerator_contract_errors(
+                        {**valid, "devices": [{"name": name}]}
+                    ),
+                    [],
+                )
         cases = (
             ({**valid, "cuda_available": False}, "CUDA is unavailable"),
             ({**valid, "torch_cuda": "12.1"}, "CUDA 11.8"),
             ({**valid, "bf16_supported": False}, "BF16"),
-            ({**valid, "devices": [{"name": "NVIDIA RTX 2060"}]}, "A800"),
+            (
+                {**valid, "devices": [{"name": "NVIDIA RTX 2060"}]},
+                "RTX A6000",
+            ),
         )
         for details, fragment in cases:
             with self.subTest(fragment=fragment):
