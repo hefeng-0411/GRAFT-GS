@@ -308,6 +308,11 @@ class GaugeCovariantSparseTransportAttention(nn.Module):
         q2 = l2_to_matrix(self.q2(fields.tensor))
         k2 = l2_to_matrix(self.k2(fields.tensor))
         value2 = l2_to_matrix(self.v2(fields.tensor))
+        # One indexed scalar value tensor is shared by every tensor-product
+        # path.  Repeating this gather kept multiple edge-by-channel
+        # activations alive for backward; on the logged batch-8 failure each
+        # duplicate was roughly the requested 68 MiB allocation.
+        target_value0 = value0[target]
         transported_k1 = torch.einsum("eij,ecj->eci", connection, k1[target])
         transported_v1 = torch.einsum("eij,ecj->eci", connection, value1[target])
         transported_k2 = connection[:, None] @ k2[target] @ connection[:, None].transpose(-1, -2)
@@ -346,34 +351,79 @@ class GaugeCovariantSparseTransportAttention(nn.Module):
                 )
             logits = logits - cfg.uncertainty_bias_weight * edge_uncertainty[:, None]
         attention = segment_softmax(logits, source, v)
-        attention0 = attention.repeat_interleave(c0, dim=1)
-        attention1 = attention.repeat_interleave(c1, dim=1)
-        attention2 = attention.repeat_interleave(c2, dim=1)
 
         y2 = l2_to_matrix(direction_l2(direction))
         coeff00 = self._radial_coeff(self.path_00, radial)
-        scalar_edge = coeff00 * value0[target]
+        scalar_edge = coeff00 * target_value0
         vector_dot = torch.sum(transported_v1 * direction[:, None], dim=-1)
         tensor_contract = torch.einsum("ecij,eij->ec", transported_v2, y2)
-        scalar_edge = scalar_edge + self._radial_coeff(self.path_11_to_0, radial) * vector_dot.mean(1, keepdim=True)
-        scalar_edge = scalar_edge + self._radial_coeff(self.path_22_to_0, radial) * tensor_contract.mean(1, keepdim=True)
+        scalar_edge = scalar_edge + self._radial_coeff(
+            self.path_11_to_0, radial
+        ) * vector_dot.mean(1, keepdim=True)
+        scalar_edge = scalar_edge + self._radial_coeff(
+            self.path_22_to_0, radial
+        ) * tensor_contract.mean(1, keepdim=True)
 
-        vector_edge = self._radial_coeff(self.path_11, radial)[:, :, None] * transported_v1
-        scalar_for_vector = value0[target].mean(-1, keepdim=True)
-        vector_edge = vector_edge + self._radial_coeff(self.path_01_to_1, radial)[:, :, None] * scalar_for_vector[:, :, None] * direction[:, None]
+        vector_edge = (
+            self._radial_coeff(self.path_11, radial)[:, :, None]
+            * transported_v1
+        )
+        scalar_target_mean = target_value0.mean(-1, keepdim=True)
+        vector_edge = (
+            vector_edge
+            + self._radial_coeff(self.path_01_to_1, radial)[:, :, None]
+            * scalar_target_mean[:, :, None]
+            * direction[:, None]
+        )
         tensor_direction = torch.einsum("ecij,ej->eci", transported_v2, direction)
-        vector_edge = vector_edge + self._radial_coeff(self.path_21_to_1, radial)[:, :, None] * tensor_direction.mean(1, keepdim=True)
+        vector_edge = vector_edge + self._radial_coeff(
+            self.path_21_to_1, radial
+        )[:, :, None] * tensor_direction.mean(1, keepdim=True)
 
-        tensor_edge = self._radial_coeff(self.path_22, radial)[:, :, None, None] * transported_v2
-        scalar_for_tensor = value0[target].mean(-1, keepdim=True)
-        tensor_edge = tensor_edge + self._radial_coeff(self.path_02_to_2, radial)[:, :, None, None] * scalar_for_tensor[:, :, None, None] * y2[:, None]
+        tensor_edge = (
+            self._radial_coeff(self.path_22, radial)[:, :, None, None]
+            * transported_v2
+        )
+        tensor_edge = (
+            tensor_edge
+            + self._radial_coeff(self.path_02_to_2, radial)[:, :, None, None]
+            * scalar_target_mean[:, :, None, None]
+            * y2[:, None]
+        )
         vector_mean = transported_v1.mean(1)
         mixed_tensor = symmetric_traceless_outer(direction, vector_mean)
-        tensor_edge = tensor_edge + self._radial_coeff(self.path_11_to_2, radial)[:, :, None, None] * mixed_tensor[:, None]
+        tensor_edge = tensor_edge + self._radial_coeff(
+            self.path_11_to_2, radial
+        )[:, :, None, None] * mixed_tensor[:, None]
 
-        message0 = segment_sum(attention0 * scalar_edge, source, v)
-        message1 = segment_sum(attention1[:, :, None] * vector_edge, source, v)
-        message2_matrix = segment_sum(attention2[:, :, None, None] * tensor_edge, source, v)
+        # Broadcast heads over their multiplicities during multiplication.
+        # ``repeat_interleave`` materialized three additional dense edge
+        # tensors that carried no information and inflated both forward memory
+        # traffic and the retained autograd graph.
+        edge_count = attention.shape[0]
+        message0 = segment_sum(
+            (attention[:, :, None] * scalar_edge.reshape(edge_count, h, c0)).reshape(
+                edge_count, h * c0
+            ),
+            source,
+            v,
+        )
+        message1 = segment_sum(
+            (
+                attention[:, :, None, None]
+                * vector_edge.reshape(edge_count, h, c1, 3)
+            ).reshape(edge_count, h * c1, 3),
+            source,
+            v,
+        )
+        message2_matrix = segment_sum(
+            (
+                attention[:, :, None, None, None]
+                * tensor_edge.reshape(edge_count, h, c2, 3, 3)
+            ).reshape(edge_count, h * c2, 3, 3),
+            source,
+            v,
+        )
         message2 = matrix_to_l2(message2_matrix)
         invariant = fields.scalar
         gate0 = torch.sigmoid(self.gate0(invariant))

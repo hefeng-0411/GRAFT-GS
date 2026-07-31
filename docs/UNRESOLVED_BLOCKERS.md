@@ -381,3 +381,27 @@ checkpoints, data, or a compiled server dependency.
   `GRAFT_GS_DDP_INITIALIZED` records, no ownership duplicates, finite optimizer
   completion, and no NCCL watchdog/desynchronization dump. Batch tuning must be
   performed independently on 48-GB A6000 and 80-GB A100 allocations.
+
+## 2026-07-31 Phase-B object-batch probe failure localization
+
+- The supplied batch-8 log is from four A800-SXM4-80GB devices. Rank 3 fails in
+  the trainable GSTA forward at `gsta.py`'s scalar-to-tensor path: 77.49 GiB is
+  live PyTorch allocation, only 55 MiB is driver-free, and only 237.65 MiB is
+  reserved-but-unallocated when a further 68 MiB is requested. This is a real
+  capacity failure, not allocator fragmentation and not an NCCL fault.
+- The batch-4 record has no collective timeout or OOM. All four ranks emit a
+  local `backward` stage warning after 120 seconds. The variable-atlas scene
+  graphs are processed locally and remain live for backward; a stage warning
+  is diagnostic and does not prove deadlock, but an unbounded probe is not an
+  admissible production selector.
+- Object-batch probes now execute one optimizer-bearing microbatch instead of
+  replaying the production global batch for every candidate. The real launch
+  retains `--global-object-batch` exactly. OOM terminates the whole candidate
+  process group immediately, larger candidates are skipped by default, and a
+  wall timeout bounds forward/backward stalls. Direct torchrun probes also
+  translate the deprecated NCCL environment name.
+- GSTA now shares the exact target scalar gather across its three coupling
+  paths and broadcasts head attention over multiplicities without materialized
+  `repeat_interleave` tensors. Forward values, reduction order, precision, and
+  the training objective are unchanged; the remote numerical suite and fresh
+  A6000/A100 probes remain the external validation boundary.

@@ -7,7 +7,7 @@
 git add .
 
 # 提交（请根据实际改动内容修改 commit message）
-git commit -m "feat: update engine precision, training scripts and validation docs"
+git commit -m "Fix OOM"
 
 # 2. 验证切换结果（确认输出为 https 开头）
 git remote -v

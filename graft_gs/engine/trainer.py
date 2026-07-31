@@ -1363,7 +1363,16 @@ class GraftGSTrainer:
             )
 
         with context:
-            output = forward_model()
+            try:
+                output = forward_model()
+            except RuntimeError as error:
+                self.module._record_cuda_memory_stage(
+                    "trainer/forward_failure",
+                    self.context.device,
+                )
+                self._emit_cuda_failure_diagnostics(error)
+                self._cancel_stage_watchdog()
+                raise
             loss_batch = dict(batch)
             loss_batch["valid_mask"] = valid_mask
             loss_batch["evidence_mask"] = valid_mask
@@ -1745,6 +1754,7 @@ class GraftGSTrainer:
             return
         free, total = torch.cuda.mem_get_info(self.context.device)
         payload = {
+            **self._active_step_context,
             "rank": self.context.rank,
             "error": str(error),
             "allocated_bytes": int(

@@ -193,6 +193,7 @@ selected full run:
   --maximum-allocated-fraction 0.85 \
   --maximum-reserved-fraction 0.88 \
   --minimum-driver-free-fraction 0.08 \
+  --probe-timeout-seconds 1800 \
   --launch -- \
   "$GRAFT_GS_MESHFLEET_ROOT" --phase D --steps 100000 \
   --manifest "$GRAFT_GS_MESHFLEET_MANIFEST" --split train \
@@ -209,6 +210,25 @@ constructs one global nonlinear UOT problem by definition. If a fixed global
 optimizer batch is part of the experiment, pass `--global-object-batch`; the
 trainer requires exact divisibility by physical objects times world size and
 adjusts accumulation without changing the optimizer batch.
+
+Object-batch capacity probes deliberately replace the accumulation policy with
+one optimizer-bearing microbatch. This still creates DDP gradient buckets and
+AdamW state, while avoiding repeated frozen-prior sampling solely to reach the
+production global batch. The selected launch uses the original argument list,
+so `--global-object-batch 32` remains exactly 32. On the first OOM the tuner
+terminates the entire torchrun process group and skips larger physical batches
+by default; `--continue-after-oom` is an explicit diagnostic escape hatch. A
+candidate with no completion is process-group terminated at the probe timeout.
+
+Repeated upstream `Sampling: 12/12` bars count TRELLIS posterior draws (eight
+per object under the server configuration), not training iterations and not an
+OOM retry. Use the structured `GRAFT_GS_AUTOTUNE_CANDIDATE_START`, `_END`, and
+`GRAFT_GS_AUTOTUNE_PROBE_CONTROL` records to distinguish sampler work from a
+candidate transition or forced termination.
+
+Repeat this exact procedure in every deployment pool. In particular, an A6000
+selection is not admissible evidence for an A100 run, and A100 capacity must be
+recorded because 40-GiB and 80-GiB variants require different candidates.
 
 Use the corresponding fresh-process probe for full-corpus testing:
 

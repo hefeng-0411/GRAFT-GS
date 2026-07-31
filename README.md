@@ -167,6 +167,7 @@ fresh-process probes:
 export GRAFT_GS_PYTHON=/mnt/sda1/miniforge3/envs/CRAFT/bin/python
 "$GRAFT_GS_PYTHON" scripts/autotune_object_batch.py \
   --gpus 0,2,3,5 --candidates 1 2 4 8 \
+  --probe-timeout-seconds 1800 \
   --output outputs/batch_tuning/phase_d --launch -- \
   /data/MeshFleet_TRELLIS --phase D --steps 100000 \
   --manifest data_manifests/meshfleet_server.jsonl --split train \
@@ -175,16 +176,39 @@ export GRAFT_GS_PYTHON=/mnt/sda1/miniforge3/envs/CRAFT/bin/python
   --initialize-from outputs/phase_c/final.pt --output outputs/phase_d
 ```
 
-Each candidate gets a new process group and allocator and starts with the
-largest estimated-work cohort. All accumulation microsteps contribute to the
-memory and throughput report. The selector rejects OOMs and candidates outside
-allocated, reserved, or driver-free headroom, then chooses the largest batch
-within 3% of the best measured object throughput.
+Each candidate gets a new process group and allocator, starts with the largest
+estimated-work cohort, and executes one optimizer-bearing physical microbatch.
+That step materializes activations, DDP buckets, gradients, and AdamW state
+without replaying enough TRELLIS samples to fill the production accumulated
+batch. The real launch retains the original accumulation argument, including
+an exact `--global-object-batch`; the probe-only override therefore does not
+change training optimization or checkpoint semantics.
+
+The selector rejects OOMs and candidates outside allocated, reserved, or
+driver-free headroom, then chooses the largest batch within 3% of the best
+measured object throughput. The first detected CUDA allocation failure
+terminates the complete candidate process group immediately. Larger physical
+batches are skipped after that monotonic capacity failure unless
+`--continue-after-oom` is explicitly supplied. A silent or exceptionally slow
+candidate is terminated after `--probe-timeout-seconds` (1800 seconds by
+default), so tuning cannot wait forever in a local forward/backward kernel.
+
+TRELLIS emits one `Sampling: 12/12` progress display for each posterior draw;
+with the default eight draws it is normal to see eight displays per object and
+rank. These displays are frozen-prior work, not optimizer steps or an OOM retry
+loop. `GRAFT_GS_AUTOTUNE_CANDIDATE_START`, `_END`, and
+`GRAFT_GS_AUTOTUNE_PROBE_CONTROL` delimit the actual candidate lifecycle.
 The selected physical batch and resulting global batch are checkpointed.
 Changing the global optimizer batch can change optimization statistics. Use
 `--global-object-batch N` to retain an exact existing optimizer batch; tuner
 candidates that do not divide that global batch are rejected. Use
 `--minimum-global-object-batch` only when rounding upward is acceptable.
+
+Tune independently on each hardware pool. An A6000 result must not be copied to
+an A100 pool (or between 40-GiB and 80-GiB A100 variants): use the exact visible
+GPU IDs, phase, manifest, view budget, and checkpoint with a fresh output
+directory on each server. The resulting production launch still uses one DDP
+rank per visible GPU.
 
 Evaluation uses the same exact-view batching and deterministic per-object
 sharding. It can be launched directly on predetermined GPUs:
