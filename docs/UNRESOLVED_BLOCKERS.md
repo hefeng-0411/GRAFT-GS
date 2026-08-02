@@ -394,14 +394,41 @@ checkpoints, data, or a compiled server dependency.
   graphs are processed locally and remain live for backward; a stage warning
   is diagnostic and does not prove deadlock, but an unbounded probe is not an
   admissible production selector.
-- Object-batch probes now execute one optimizer-bearing microbatch instead of
-  replaying the production global batch for every candidate. The real launch
-  retains `--global-object-batch` exactly. OOM terminates the whole candidate
-  process group immediately, larger candidates are skipped by default, and a
-  wall timeout bounds forward/backward stalls. Direct torchrun probes also
-  translate the deprecated NCCL environment name.
+- This historical revision used one optimizer-bearing microbatch and a total
+  wall timeout. The 2026-08-02 incident below supersedes that policy: the real
+  launch still retains `--global-object-batch` exactly and OOM remains
+  process-group-fatal, but timing now uses warmup/measurement and liveness is
+  bounded by semantic stage progress rather than total wall time.
 - GSTA now shares the exact target scalar gather across its three coupling
   paths and broadcasts head attention over multiplicities without materialized
   `repeat_interleave` tensors. Forward values, reduction order, precision, and
   the training objective are unchanged; the remote numerical suite and fresh
   A6000/A100 probes remain the external validation boundary.
+
+## 2026-08-02 legacy probe-timeout resolution
+
+- The latest supplied log has four finite `backward` local-ready records after
+  long Phase-B forwards. Its next candidate is terminated by the parent record
+  `reason=probe_timeout` while TRELLIS sampling still advances; no preceding
+  CUDA OOM, non-finite marker, NCCL failure, or worker traceback establishes a
+  child failure. `scripts/analyze_training_log.py` classifies it as
+  `supervisor.legacy_fixed_wall_timeout`.
+- Workers now emit semantic rank/stage/workload progress through model load,
+  sampling, VGGT, atlas/UOT/GSTA/topology/render, loss, backward sentinels,
+  optimizer, collectives, and checkpointing. Heartbeats are non-semantic.
+  Tuning and `--launch` supervise lack of progress by stage, dump rank state
+  plus Python stacks, and then terminate the complete group. There is no total
+  candidate or production wall deadline.
+- Probes use one warmup plus two steady-state optimizer steps by default;
+  memory gates include all steps, throughput excludes warmup, and variance plus
+  cross-rank skew are admission criteria. Exact TRELLIS caches are atomic,
+  provenance-namespaced, bounded, and candidate-local by default so timings are
+  comparable.
+- Local CRAFT validation passes the focused 87-test DDP/sampler/telemetry suite,
+  a one-GPU NCCL/progress smoke, a two-GPU NCCL/progress smoke, and all five
+  two-rank differentiable evidence/RNG/prior collectives. Four-GPU validation
+  was not run because GPUs 0 and 1 are occupied by unrelated processes. The
+  local environment also differs from the pinned 444-package server lock.
+- External closure remains a fresh four-A6000 candidate sweep plus 200-step
+  soak and an independent four-A100/A800 sweep plus soak. No batch result may
+  be transferred between those pools.

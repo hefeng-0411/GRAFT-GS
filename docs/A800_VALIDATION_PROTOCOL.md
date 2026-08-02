@@ -179,6 +179,19 @@ $GRAFT_GS_PYTHON -m unittest \
   -v
 ```
 
+Before a full model sweep, the lightweight progress/NCCL path can be checked
+without loading VGGT or TRELLIS:
+
+```bash
+CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --standalone --nproc-per-node=4 \
+  scripts/validate_progress_ddp.py \
+  --iterations 4 \
+  --output outputs/validation/progress_ddp_4gpu.json
+```
+
+This is a communication and observability smoke only; it does not validate
+Phase-B memory, throughput, gradients, or accuracy.
+
 For ordinary object-level DDP, tune the per-rank object batch independently
 for every training phase after the view budget is fixed. The tuner takes the
 physical indices/UUIDs explicitly, launches every candidate in a fresh process
@@ -194,6 +207,9 @@ selected full run:
   --maximum-reserved-fraction 0.88 \
   --minimum-driver-free-fraction 0.08 \
   --probe-timeout-seconds 1800 \
+  --probe-no-progress-timeout-seconds 900 \
+  --probe-warmup-steps 1 \
+  --probe-measurement-steps 2 \
   --launch -- \
   "$GRAFT_GS_MESHFLEET_ROOT" --phase D --steps 100000 \
   --manifest "$GRAFT_GS_MESHFLEET_MANIFEST" --split train \
@@ -211,24 +227,100 @@ optimizer batch is part of the experiment, pass `--global-object-batch`; the
 trainer requires exact divisibility by physical objects times world size and
 adjusts accumulation without changing the optimizer batch.
 
-Object-batch capacity probes deliberately replace the accumulation policy with
-one optimizer-bearing microbatch. This still creates DDP gradient buckets and
-AdamW state, while avoiding repeated frozen-prior sampling solely to reach the
-production global batch. The selected launch uses the original argument list,
-so `--global-object-batch 32` remains exactly 32. On the first OOM the tuner
+Object-batch probes deliberately replace the accumulation policy with one
+microbatch per optimizer step. A warmup materializes buckets and AdamW state;
+later optimizer steps provide steady-state throughput, while memory admission
+uses all steps. This avoids sampling solely to fill the production accumulated
+batch. The selected launch uses the original argument list, so
+`--global-object-batch 32` remains exactly 32. On the first OOM the tuner
 terminates the entire torchrun process group and skips larger physical batches
-by default; `--continue-after-oom` is an explicit diagnostic escape hatch. A
-candidate with no completion is process-group terminated at the probe timeout.
+by default; `--continue-after-oom` is an explicit diagnostic escape hatch.
+
+`--probe-timeout-seconds` is now only the bootstrap bound before any semantic
+worker record. There is no total candidate wall deadline. Every later stage has
+a no-progress budget, and meaningful stage/draw/layer/backward advancement
+resets it. After three completed observations, the active threshold is the
+larger of the configured stage minimum and empirical Q99 + 6×MAD. Heartbeats
+never reset it. Before terminating a frozen stage the tuner writes a rank-state
+table to `GRAFT_GS_AUTOTUNE_PROGRESS_TIMEOUT`.
 
 Repeated upstream `Sampling: 12/12` bars count TRELLIS posterior draws (eight
-per object under the server configuration), not training iterations and not an
-OOM retry. Use the structured `GRAFT_GS_AUTOTUNE_CANDIDATE_START`, `_END`, and
+per uncached object under the server configuration), not training iterations
+and not an OOM retry. Exact conditioning/seed/checkpoint hits are retained in a
+bounded atomic cache; probes use candidate-local scope by default so timing
+remains comparable. Use `GRAFT_GS_PROGRESS` together
+with the structured `GRAFT_GS_AUTOTUNE_CANDIDATE_START`, `_END`, and
 `GRAFT_GS_AUTOTUNE_PROBE_CONTROL` records to distinguish sampler work from a
 candidate transition or forced termination.
 
 Repeat this exact procedure in every deployment pool. In particular, an A6000
 selection is not admissible evidence for an A100 run, and A100 capacity must be
 recorded because 40-GiB and 80-GiB variants require different candidates.
+
+After selection, require a fresh 200-optimizer-step Phase-B soak on that exact
+pool before starting 50,000 steps:
+
+```bash
+TUNING_ROOT=outputs/concurrency/object-batch-phase-b
+SELECTED_BATCH=$(
+  "$GRAFT_GS_PYTHON" -c \
+  'import json,sys; print(json.load(open(sys.argv[1]))["selected_object_batch_size"])' \
+  "$TUNING_ROOT/selection.json"
+)
+RUN_TAG=$(date -u +%Y%m%dT%H%M%SZ)
+SOAK_ROOT="outputs/validation/phase-b-200-${RUN_TAG}"
+
+"$GRAFT_GS_PYTHON" -m torch.distributed.run \
+  --standalone --nnodes=1 --nproc-per-node="$GRAFT_GS_NPROC_PER_NODE" \
+  scripts/train_a800.py \
+  "$GRAFT_GS_MESHFLEET_ROOT" --phase B --steps 200 \
+  --manifest "$GRAFT_GS_MESHFLEET_MANIFEST" --split train \
+  --global-object-batch 32 --object-batch-size "$SELECTED_BATCH" \
+  --vggt-checkpoint "$VGGT_CHECKPOINT" \
+  --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
+  --trellis-cache-directory "$TUNING_ROOT/production_trellis_exact_cache" \
+  --initialize-from outputs/phase_a/final.pt --output "$SOAK_ROOT" \
+  2>&1 | tee "$SOAK_ROOT.log"
+
+test -f "$SOAK_ROOT/final.pt"
+test "$(tail -n 1 "$SOAK_ROOT/metrics.jsonl" | \
+  "$GRAFT_GS_PYTHON" -c 'import json,sys; print(json.load(sys.stdin)["step"])')" \
+  -eq 200
+! grep -E "GRAFT_GS_NONFINITE|GRAFT_GS_TRAINING_PROGRESS_TIMEOUT|OutOfMemoryError|Watchdog caught collective operation timeout" \
+  "$SOAK_ROOT.log"
+```
+
+Retain the selection, initial CUDA inventory, every candidate log/probe, the
+soak log, metrics, precision policy, dataset coverage, and final checkpoint.
+Repeat from a fresh tuning/soak root on four A6000s and on four production
+A100/A800s; do not transfer the selected physical batch between pools.
+
+Capture a short per-rank PyTorch profiler trace with the already selected batch
+and the same Phase-B workload. This is a separate fresh output because it adds
+intentional profiling overhead:
+
+```bash
+PROFILE_TAG=$(date -u +%Y%m%dT%H%M%SZ)
+PROFILE_ROOT="outputs/validation/phase-b-profile-${PROFILE_TAG}"
+
+"$GRAFT_GS_PYTHON" -m torch.distributed.run \
+  --standalone --nnodes=1 --nproc-per-node="$GRAFT_GS_NPROC_PER_NODE" \
+  scripts/train_a800.py \
+  "$GRAFT_GS_MESHFLEET_ROOT" --phase B --steps 6 \
+  --manifest "$GRAFT_GS_MESHFLEET_MANIFEST" --split train \
+  --global-object-batch 32 --object-batch-size "$SELECTED_BATCH" \
+  --vggt-checkpoint "$VGGT_CHECKPOINT" \
+  --trellis-checkpoint "$TRELLIS_CHECKPOINT" \
+  --trellis-cache-directory "$TUNING_ROOT/production_trellis_exact_cache" \
+  --initialize-from outputs/phase_a/final.pt --output "$PROFILE_ROOT" \
+  --profile --profile-output "$PROFILE_ROOT/profiler" \
+  2>&1 | tee "$PROFILE_ROOT.log"
+```
+
+The default bounded schedule is wait 1, warmup 1, active 3, repeat 1. Retain
+all four trace files and compare rank-local data wait, frozen sampling,
+forward/recompute, backward/NCCL overlap, optimizer, and allocator peaks before
+making any kernel or DDP-bucket claim.
 
 Use the corresponding fresh-process probe for full-corpus testing:
 

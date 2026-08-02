@@ -134,6 +134,10 @@ process different objects and only model gradients synchronize. Server defaults
 are read from `configs/graft_gs_a800_native.yaml` and can be replaced with
 `--config`.
 
+The released geometry model on this path is `vggt.models.vggt.VGGT`—VGGT,
+not “VGDT”. Phase B freezes its upstream backbone while retaining the declared
+trainable GRAFT-GS evidence, mapping, attention, and topology modules.
+
 The launcher derives one process per GPU from the active
 `CUDA_VISIBLE_DEVICES`; it never assumes a fixed GPU count. Use
 `--maximum-views N` for the ordinary object-level per-rank view budget. For the
@@ -168,6 +172,8 @@ export GRAFT_GS_PYTHON=/mnt/sda1/miniforge3/envs/CRAFT/bin/python
 "$GRAFT_GS_PYTHON" scripts/autotune_object_batch.py \
   --gpus 0,2,3,5 --candidates 1 2 4 8 \
   --probe-timeout-seconds 1800 \
+  --probe-no-progress-timeout-seconds 900 \
+  --probe-warmup-steps 1 --probe-measurement-steps 2 \
   --output outputs/batch_tuning/phase_d --launch -- \
   /data/MeshFleet_TRELLIS --phase D --steps 100000 \
   --manifest data_manifests/meshfleet_server.jsonl --split train \
@@ -176,27 +182,56 @@ export GRAFT_GS_PYTHON=/mnt/sda1/miniforge3/envs/CRAFT/bin/python
   --initialize-from outputs/phase_c/final.pt --output outputs/phase_d
 ```
 
-Each candidate gets a new process group and allocator, starts with the largest
-estimated-work cohort, and executes one optimizer-bearing physical microbatch.
-That step materializes activations, DDP buckets, gradients, and AdamW state
-without replaying enough TRELLIS samples to fill the production accumulated
+Each candidate gets a new process group and allocator and starts with the
+largest estimated-work cohort. One optimizer step warms model/optimizer/DDP
+state and two later steps measure steady-state throughput by default; all three
+participate in peak-memory admission. The probe uses one physical microbatch
+per optimizer step, so it materializes activations, buckets, gradients, and
+AdamW state without replaying enough objects to fill the production accumulated
 batch. The real launch retains the original accumulation argument, including
 an exact `--global-object-batch`; the probe-only override therefore does not
 change training optimization or checkpoint semantics.
+
+Each candidate has a bounded TRELLIS cache under the tuning output. A hit
+requires exact conditioning tensor bytes, seed, sampling policy, checkpoint
+identity, and upstream source digest. Files are atomically committed under a
+process lock and deterministically evicted at the configured byte bound. The
+default candidate-local scope preserves comparable end-to-end timings;
+`--probe-trellis-cache-scope shared` is available only when intentionally
+benchmarking a pre-cached workload.
 
 The selector rejects OOMs and candidates outside allocated, reserved, or
 driver-free headroom, then chooses the largest batch within 3% of the best
 measured object throughput. The first detected CUDA allocation failure
 terminates the complete candidate process group immediately. Larger physical
 batches are skipped after that monotonic capacity failure unless
-`--continue-after-oom` is explicitly supplied. A silent or exceptionally slow
-candidate is terminated after `--probe-timeout-seconds` (1800 seconds by
-default), so tuning cannot wait forever in a local forward/backward kernel.
+`--continue-after-oom` is explicitly supplied. There is no total-wall-time
+candidate kill. Structured per-rank events identify model load, data fetch,
+each TRELLIS draw, VGGT, atlas/transport/attention/topology/render, loss,
+backward sentinels, optimizer, collectives, and checkpointing. A stage is
+terminated only after its configured interval with no semantic advancement.
+That interval is a conservative minimum; after three completions the supervisor
+also evaluates empirical Q99 + 6×MAD latency and uses the larger budget.
+Heartbeats expose liveness and memory but do not reset that deadline. The
+timeout record contains the last state and workload of every rank.
+With `--launch`, the same semantic supervisor remains around the full training
+process and writes `production.log` plus `launch_result.json`; supervision does
+not stop after batch selection. Evaluated candidates expose `SUCCESS`, `OOM`,
+`NONFINITE`, `NO_PROGRESS`, `COLLECTIVE_FAILURE`, `DATA_FAILURE`,
+`MODEL_FAILURE`, or `EXTERNAL_TERMINATION` independently of detailed diagnosis.
+
+For a bounded first-step CPU/CUDA trace, add `--profile` to
+`scripts/train_a800.py`. The server profile waits one optimizer step, warms up
+one, records the next three with shapes and allocator activity, then stops
+collecting; each rank writes a separate Chrome/TensorBoard trace under
+`OUTPUT/profiler` (or `--profile-output PATH`). Ordinary training leaves this
+disabled.
 
 TRELLIS emits one `Sampling: 12/12` progress display for each posterior draw;
-with the default eight draws it is normal to see eight displays per object and
-rank. These displays are frozen-prior work, not optimizer steps or an OOM retry
-loop. `GRAFT_GS_AUTOTUNE_CANDIDATE_START`, `_END`, and
+with the default eight draws it is normal to see eight displays per uncached
+object and rank. These displays are frozen-prior work, not optimizer steps or
+an OOM retry loop. `GRAFT_GS_PROGRESS` records the draw index and cache result.
+`GRAFT_GS_AUTOTUNE_CANDIDATE_START`, `_END`, and
 `GRAFT_GS_AUTOTUNE_PROBE_CONTROL` delimit the actual candidate lifecycle.
 The selected physical batch and resulting global batch are checkpointed.
 Changing the global optimizer batch can change optimization statistics. Use
@@ -251,5 +286,7 @@ disabled for explicit ablations.
 - `docs/SPECIFICATION_TRACEABILITY.md`
 - `docs/UNRESOLVED_BLOCKERS.md`
 - `docs/A800_VALIDATION_PROTOCOL.md`
+- `docs/MULTI_GPU_EXECUTION_TOPOLOGY.md`
+- `docs/DDP_TRAINING_INCIDENT_ANALYSIS.md`
 - `IMPLEMENTATION_LEDGER.md`
 - `VALIDATION_LEDGER.md`

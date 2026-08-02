@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import List, Optional, Sequence
+from typing import Iterator, List, Optional, Sequence
 
 import torch
 from torch import Tensor, nn
@@ -34,6 +34,7 @@ from ..mapping.manifold_mapping import (
     finite_gradient_identity,
     sparse_view_reprojection_variance,
 )
+from ..observability import ProgressReporter
 from ..readout.assets import AnalyticalReadoutConfig, AnalyticalSurfaceReadout, GaussianAsset, MeshAsset, write_gaussian_ply, write_mesh_glb
 from ..readout.renderer import CameraBatch, CudaGaussianRenderer, ReferenceGaussianRenderer, RenderResult
 from ..topology.strata import TopologySelection, TopologySelector, TopologySelectorConfig
@@ -156,9 +157,47 @@ class GraftGS(nn.Module):
         else:
             raise ValueError("renderer_backend must be 'cuda' or 'reference'")
         self.trellis_prior = trellis_prior
+        self.progress_reporter: Optional[ProgressReporter] = None
         self.cuda_memory_stage_trace_enabled = False
         self.reset_cuda_peak_after_frozen_prior = False
         self.last_cuda_memory_stages: dict[str, dict[str, int | float]] = {}
+
+    def set_progress_reporter(
+        self,
+        reporter: Optional[ProgressReporter],
+    ) -> None:
+        """Attach the shared rank reporter to every long-running subpipeline."""
+
+        self.progress_reporter = reporter
+        if self.trellis_prior is not None:
+            self.trellis_prior.progress_reporter = reporter
+
+    @contextmanager
+    def _execution_stage(
+        self,
+        name: str,
+        **values: object,
+    ) -> Iterator[None]:
+        reporter_context = (
+            self.progress_reporter.stage(f"forward.{name}", **values)
+            if self.progress_reporter is not None
+            else nullcontext()
+        )
+        with reporter_context, record_function(f"graft_gs/{name}"):
+            yield
+
+    def _progress_event(
+        self,
+        stage: str,
+        event: str,
+        **values: object,
+    ) -> None:
+        if self.progress_reporter is not None:
+            self.progress_reporter.event(
+                f"forward.{stage}",
+                event,
+                **values,
+            )
 
     def forward(
         self,
@@ -216,6 +255,9 @@ class GraftGS(nn.Module):
                 for index in range(images.shape[0])
             )
         precomputed_prior_measures: Optional[list[TrellisPriorMeasure]] = None
+        # Stable profiler-label contract (the reporter adds semantic metadata):
+        # graft_gs/trellis_structure_prior_prefetch
+        # record_function("graft_gs/vggt_geometry")
         if atlas_root_bounds is not None:
             atlas_root_bounds = atlas_root_bounds.to(
                 device=images.device,
@@ -241,8 +283,10 @@ class GraftGS(nn.Module):
                 )
                 with sampling_session:
                     for batch_index in range(images.shape[0]):
-                        with record_function(
-                            "graft_gs/trellis_structure_prior_prefetch"
+                        with self._execution_stage(
+                            "trellis_structure_prior_prefetch",
+                            object_index=batch_index,
+                            view_slots=int(valid_views.shape[1]),
                         ):
                             precomputed_prior_measures.append(
                                 self._trellis_prior_measure(
@@ -266,7 +310,13 @@ class GraftGS(nn.Module):
                     # graph separately from the completed frozen prior
                     # lifetime. The adapter records that prior peak first.
                     torch.cuda.reset_peak_memory_stats(images.device)
-        with record_function("graft_gs/vggt_geometry"):
+        with self._execution_stage(
+            "vggt_geometry",
+            object_batch=int(images.shape[0]),
+            views=int(images.shape[1]),
+            image_height=int(images.shape[-2]),
+            image_width=int(images.shape[-1]),
+        ):
             vggt_output = self.vggt(images)
         self._record_cuda_memory_stage("vggt_geometry", images.device)
         if robustness is not None:
@@ -281,7 +331,7 @@ class GraftGS(nn.Module):
                 ground_truth_intrinsics,
                 valid_view_mask=valid_views,
             )
-        with record_function("graft_gs/evidence_lift"):
+        with self._execution_stage("evidence_lift"):
             particles = self.evidence_builder(
                 vggt_output.images,
                 vggt_output.depth,
@@ -352,7 +402,10 @@ class GraftGS(nn.Module):
                 if precomputed_prior_measures is not None:
                     prior_measure = precomputed_prior_measures[batch_index]
                 else:
-                    with record_function("graft_gs/trellis_structure_prior"):
+                    with self._execution_stage(
+                        "trellis_structure_prior",
+                        object_index=batch_index,
+                    ):
                         prior_measure = self._trellis_prior_measure(
                             vggt_output.images[
                                 batch_index, valid_views[batch_index]
@@ -361,7 +414,11 @@ class GraftGS(nn.Module):
                             distributed_synchronizer,
                             prior_seeds[batch_index],
                         )
-            with record_function("graft_gs/atlas_initialize"):
+            with self._execution_stage(
+                "atlas_initialize",
+                object_index=batch_index,
+                evidence_particles=int(atlas_position.shape[0]),
+            ):
                 atlas = PersistentOctreeAtlas.from_evidence(
                     atlas_position,
                     atlas_mass,
@@ -383,9 +440,20 @@ class GraftGS(nn.Module):
                 f"scene_{batch_index}/atlas",
                 images.device,
             )
-            with record_function("graft_gs/sparse_uot_mapping"):
+            self._progress_event(
+                "atlas_initialize",
+                "workload",
+                object_index=batch_index,
+                active_charts=int(atlas.active_indices.numel()),
+                evidence_particles=int(atlas_position.shape[0]),
+            )
+            with self._execution_stage(
+                "sparse_uot_mapping",
+                object_index=batch_index,
+                active_charts=int(atlas.active_indices.numel()),
+            ):
                 mapping = self._map_with_feature_fixed_point(atlas, evidence)
-            for _ in range(self.config.refinement_rounds):
+            for refinement_index in range(self.config.refinement_rounds):
                 occupancy_entropy, reprojection_variance = self._refinement_statistics(
                     atlas,
                     mapping,
@@ -399,7 +467,11 @@ class GraftGS(nn.Module):
                     split = distributed_synchronizer.synchronize_split_mask(split)
                 if not bool(torch.any(split)):
                     break
-                with record_function("graft_gs/atlas_refine"):
+                with self._execution_stage(
+                    "atlas_refine",
+                    object_index=batch_index,
+                    refinement_index=refinement_index,
+                ):
                     atlas.refine(
                         atlas_position,
                         atlas_mass,
@@ -416,7 +488,12 @@ class GraftGS(nn.Module):
                     )
                 if distributed_synchronizer is not None:
                     atlas = distributed_synchronizer.synchronize_atlas(atlas)
-                with record_function("graft_gs/sparse_uot_remap"):
+                with self._execution_stage(
+                    "sparse_uot_remap",
+                    object_index=batch_index,
+                    refinement_index=refinement_index,
+                    active_charts=int(atlas.active_indices.numel()),
+                ):
                     mapping = self._map_with_feature_fixed_point(atlas, evidence)
             self._record_cuda_memory_stage(
                 f"scene_{batch_index}/transport",
@@ -426,13 +503,25 @@ class GraftGS(nn.Module):
                 distributed_synchronizer, "maps_global_evidence", False
             ):
                 mapping = distributed_synchronizer.reduce_mapping_statistics(mapping, atlas)
-            with record_function("graft_gs/gauge_sparse_attention"):
+            self._progress_event(
+                "sparse_uot_mapping",
+                "workload",
+                object_index=batch_index,
+                transport_edges=int(mapping.graph.edge_index.shape[1]),
+                sparse_tokens=int(mapping.latent.shape[0]),
+            )
+            with self._execution_stage(
+                "gauge_sparse_attention",
+                object_index=batch_index,
+                sparse_tokens=int(mapping.latent.shape[0]),
+                encoder_layers=len(self.encoder),
+            ):
                 fields = IrrepTensor.from_packed(mapping.latent)
                 encoder_activations = [fields] if capture_distillation_activations else None
                 edge_ot_cost, edge_uncertainty = self._attention_edge_evidence(
                     atlas, mapping
                 )
-                for layer in self.encoder:
+                for layer_index, layer in enumerate(self.encoder):
                     fields = layer(
                         atlas,
                         fields,
@@ -441,6 +530,14 @@ class GraftGS(nn.Module):
                     )
                     if encoder_activations is not None:
                         encoder_activations.append(fields)
+                    self._progress_event(
+                        "gauge_sparse_attention",
+                        "layer_complete",
+                        object_index=batch_index,
+                        layer_index=layer_index,
+                        layer_count=len(self.encoder),
+                        sparse_tokens=int(mapping.latent.shape[0]),
+                    )
                 mapping.latent = fields.pack()
             self._record_cuda_memory_stage(
                 f"scene_{batch_index}/attention",
@@ -459,7 +556,11 @@ class GraftGS(nn.Module):
                     atlas, prior_measure.sample_count
                 )
                 occupancy = self.trellis_prior.combine_observed_probability(occupancy, prior_probability)
-            with record_function("graft_gs/topology_stratum"):
+            with self._execution_stage(
+                "topology_stratum",
+                object_index=batch_index,
+                active_charts=int(atlas.active_indices.numel()),
+            ):
                 topology = self.topology(
                     atlas,
                     occupancy.clamp(1.0e-6, 1.0 - 1.0e-6),
@@ -479,7 +580,11 @@ class GraftGS(nn.Module):
                 "full",
             }
             if run_continuous_flow:
-                with record_function("graft_gs/barrier_riemannian_flow"):
+                with self._execution_stage(
+                    "barrier_riemannian_flow",
+                    object_index=batch_index,
+                    flow_steps=self.config.flow.steps,
+                ):
                     final, integration_reports = self.integrator.integrate(
                         self.vector_field, atlas, initial, projector
                     )
@@ -493,7 +598,10 @@ class GraftGS(nn.Module):
             gaussians: Optional[GaussianAsset] = None
             mesh: Optional[MeshAsset] = None
             if execution_stage != "flow_pretraining":
-                with record_function("graft_gs/analytical_readout"):
+                with self._execution_stage(
+                    "analytical_readout",
+                    object_index=batch_index,
+                ):
                     gaussians, mesh = self.readout(atlas, final, mapping)
             self._record_cuda_memory_stage(
                 f"scene_{batch_index}/readout",
@@ -529,7 +637,11 @@ class GraftGS(nn.Module):
                     int(vggt_output.images.shape[-1]),
                 )
                 render_cameras = camera
-                with record_function("graft_gs/gaussian_render"):
+                with self._execution_stage(
+                    "gaussian_render",
+                    object_index=batch_index,
+                    render_views=int(render_extrinsics.shape[0]),
+                ):
                     render = self.renderer(gaussians, camera)
                 self._record_cuda_memory_stage(
                     f"scene_{batch_index}/render",

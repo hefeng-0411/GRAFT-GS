@@ -1302,3 +1302,37 @@ The full conditional validity domain is maintained in
 - Accelerator validation now admits the stated RTX A6000 test and A100/A800
   production profiles while retaining the pinned CUDA 11.8 and native-BF16
   contracts.
+
+## 2026-08-02 semantic DDP supervision and exact prior-cache repair
+
+- Replaced the object-batch tuner's fixed whole-process wall timeout with a
+  semantic-progress supervisor. Rank-local stage begin/end events, optimizer
+  advancement, sparse backward sentinels, per-rank last states, and
+  stage-specific budgets distinguish slow TRELLIS/VGGT/geometry work from a
+  true lack of progress. Heartbeats are diagnostic only and cannot extend a
+  deadline.
+- Before a liveness termination, the supervisor requests Python all-thread
+  stack dumps from every observed worker and records the complete rank state;
+  OOM, non-finite, collective, data, dependency, signal, and liveness failures
+  retain distinct classifications. It then terminates the complete process
+  group with a bounded TERM/KILL sequence.
+- The selected full training launch remains under the same supervisor and
+  writes `production.log` and `launch_result.json`. A slow but advancing run is
+  no longer killed by probe duration, while a stalled rank still cannot leave
+  peers waiting indefinitely in DDP.
+- Added bounded, atomic, process-locked TRELLIS posterior persistence keyed by
+  exact image bytes, sampling inputs, checkpoint identity, and pipeline source
+  digest. Candidate-local cache namespaces preserve fair cold/mixed batch
+  tuning; the production run uses a separate cache.
+- Probe selection now separates warmup from measurement steps, aggregates
+  rank-synchronous throughput and memory, rejects unstable timing/rank skew,
+  and preserves the requested exact global object batch. No dummy allocation
+  or memory-filling tensor was introduced.
+- Structured progress reporting uses nonblocking CUDA events and allocator
+  counters without synchronization or tensor scalar extraction. Optional NVTX
+  and PyTorch profiler ranges expose TRELLIS, VGGT, evidence, atlas, mapping,
+  topology, flow, render, loss, backward, collectives, and optimizer stages.
+- The semantic stage budget is the maximum of a configured cold-start minimum
+  and bounded empirical Q99 + 6×MAD history. Optional bounded PyTorch profiling
+  writes a unique CPU/CUDA trace per rank for the first five optimizer steps;
+  ordinary training keeps profiler collection disabled.

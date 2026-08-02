@@ -8,6 +8,7 @@ from pathlib import Path
 import yaml
 
 from ..integration.pipeline import GraftGSConfig
+from ..observability import ProgressConfig, TrainingProfilerConfig
 from .losses import LossWeights
 from .precision import NativePrecisionPolicy
 
@@ -41,6 +42,12 @@ def load_server_config(
         raise ValueError(
             "training.renderer_checkpoint_views must be a YAML Boolean"
         )
+    for key, default in (
+        ("dataloader_persistent_workers", False),
+        ("dataloader_pin_memory", True),
+    ):
+        if not isinstance(training.get(key, default), bool):
+            raise ValueError(f"training.{key} must be a YAML Boolean")
     solve_in_float64 = transport.get(
         "solve_in_float64", base.mapping.sinkhorn.solve_in_float64
     )
@@ -260,6 +267,15 @@ def load_trellis_prior_config(path: str | Path) -> dict[str, object]:
         raise TypeError(
             "trellis_prior.offload_cuda_pipeline_after_sampling must be Boolean"
         )
+    persistent_cache_enabled = value.get("persistent_cache_enabled", True)
+    if not isinstance(persistent_cache_enabled, bool):
+        raise TypeError("trellis_prior.persistent_cache_enabled must be Boolean")
+    cache_entries = int(value.get("memory_cache_entries", 64))
+    persistent_cache_maximum_gib = float(
+        value.get("persistent_cache_maximum_gib", 64.0)
+    )
+    if cache_entries < 0 or persistent_cache_maximum_gib <= 0:
+        raise ValueError("TRELLIS cache bounds are outside their domains")
     maximum_conditioning_views = value.get("maximum_conditioning_views")
     if (
         maximum_conditioning_views is not None
@@ -285,6 +301,11 @@ def load_trellis_prior_config(path: str | Path) -> dict[str, object]:
         "offload_cuda_pipeline_after_sampling": (
             offload_cuda_pipeline_after_sampling
         ),
+        "memory_cache_entries": cache_entries,
+        "persistent_cache_enabled": persistent_cache_enabled,
+        "persistent_cache_maximum_bytes": int(
+            persistent_cache_maximum_gib * 1024**3
+        ),
     }
     if int(config["samples"]) < 1 or int(config["sampler_steps"]) < 1:
         raise ValueError("TRELLIS prior samples/steps must be positive")
@@ -295,6 +316,90 @@ def load_trellis_prior_config(path: str | Path) -> dict[str, object]:
     ):
         raise ValueError("TRELLIS prior strength/threshold are outside their domains")
     return config
+
+
+def load_progress_config(path: str | Path) -> ProgressConfig:
+    """Load non-semantic telemetry/profiling controls."""
+
+    data = yaml.safe_load(Path(path).read_text(encoding="utf8"))
+    value = data.get("instrumentation", {}) if isinstance(data, dict) else {}
+    if not isinstance(value, dict):
+        raise ValueError("configuration section 'instrumentation' must be a mapping")
+    allowed = {
+        "enabled",
+        "heartbeat_interval_seconds",
+        "include_cuda_memory",
+        "nvtx",
+        "profiler_ranges",
+        "cuda_event_timing",
+    }
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError(f"unknown instrumentation keys: {unknown}")
+    boolean_fields = (
+        "enabled",
+        "include_cuda_memory",
+        "nvtx",
+        "profiler_ranges",
+        "cuda_event_timing",
+    )
+    for name in boolean_fields:
+        if name in value and not isinstance(value[name], bool):
+            raise TypeError(f"instrumentation.{name} must be Boolean")
+    return ProgressConfig(
+        enabled=bool(value.get("enabled", True)),
+        heartbeat_interval_seconds=float(
+            value.get("heartbeat_interval_seconds", 30.0)
+        ),
+        include_cuda_memory=bool(value.get("include_cuda_memory", True)),
+        nvtx=bool(value.get("nvtx", False)),
+        profiler_ranges=bool(value.get("profiler_ranges", True)),
+        cuda_event_timing=bool(value.get("cuda_event_timing", False)),
+    )
+
+
+def load_training_profiler_config(path: str | Path) -> TrainingProfilerConfig:
+    """Load the bounded first-optimizer-step profiling policy."""
+
+    data = yaml.safe_load(Path(path).read_text(encoding="utf8"))
+    value = data.get("profiling", {}) if isinstance(data, dict) else {}
+    if not isinstance(value, dict):
+        raise ValueError("configuration section 'profiling' must be a mapping")
+    allowed = {
+        "enabled",
+        "nvtx",
+        "torch_profiler",
+        "first_n_steps",
+        "wait_steps",
+        "warmup_steps",
+        "record_shapes",
+        "profile_memory",
+        "with_stack",
+    }
+    unknown = sorted(set(value) - allowed)
+    if unknown:
+        raise ValueError(f"unknown profiling keys: {unknown}")
+    for name in (
+        "enabled",
+        "nvtx",
+        "torch_profiler",
+        "record_shapes",
+        "profile_memory",
+        "with_stack",
+    ):
+        if name in value and not isinstance(value[name], bool):
+            raise TypeError(f"profiling.{name} must be Boolean")
+    return TrainingProfilerConfig(
+        enabled=bool(value.get("enabled", False)),
+        nvtx=bool(value.get("nvtx", False)),
+        torch_profiler=bool(value.get("torch_profiler", True)),
+        first_n_steps=int(value.get("first_n_steps", 5)),
+        wait_steps=int(value.get("wait_steps", 1)),
+        warmup_steps=int(value.get("warmup_steps", 1)),
+        record_shapes=bool(value.get("record_shapes", True)),
+        profile_memory=bool(value.get("profile_memory", True)),
+        with_stack=bool(value.get("with_stack", False)),
+    )
 
 
 def load_precision_policy(path: str | Path) -> NativePrecisionPolicy:
@@ -347,6 +452,8 @@ def load_loss_weights(path: str | Path) -> LossWeights:
 __all__ = [
     "load_loss_weights",
     "load_precision_policy",
+    "load_progress_config",
     "load_server_config",
+    "load_training_profiler_config",
     "load_trellis_prior_config",
 ]

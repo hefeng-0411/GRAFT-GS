@@ -11,7 +11,10 @@ from __future__ import annotations
 from collections import OrderedDict
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
+import fcntl
 import hashlib
+import json
+import os
 from pathlib import Path
 from typing import Iterator, Optional
 
@@ -19,6 +22,7 @@ import torch
 from torch import Tensor
 
 from ..geometry.atlas import PersistentOctreeAtlas
+from ..observability import ProgressReporter
 from .external import (
     external_module_provenance,
     import_external_module,
@@ -124,9 +128,27 @@ def _decoded_structure_resolution(value: object) -> int:
     spatial_shape = tuple(int(size) for size in value.shape[-3:])
     if min(spatial_shape) < 1 or len(set(spatial_shape)) != 1:
         raise ValueError(
-            "TRELLIS decoded sparse-structure output must use a non-empty cubic grid"
+            "TRELLIS decoder output must use a non-empty cubic grid"
         )
     return spatial_shape[0]
+
+
+def _python_source_tree_digest(root: Path) -> str:
+    """Hash the complete imported pipeline package, not only ``__init__.py``."""
+
+    digest = hashlib.sha256()
+    sources = sorted(
+        (path for path in root.rglob("*.py") if path.is_file()),
+        key=lambda path: path.relative_to(root).as_posix(),
+    )
+    if not sources:
+        return "unavailable"
+    for path in sources:
+        relative = path.relative_to(root).as_posix()
+        digest.update(relative.encode("utf8"))
+        digest.update(b"\0")
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
 
 
 def _explicit_decoder_resolution(decoder: object) -> Optional[int]:
@@ -227,6 +249,9 @@ class TrellisPriorAdapter:
         maximum_conditioning_views: Optional[int] = None,
         release_cuda_cache_after_sampling: bool = True,
         offload_cuda_pipeline_after_sampling: bool = True,
+        persistent_cache_directory: Optional[str | Path] = None,
+        persistent_cache_namespace: Optional[str] = None,
+        persistent_cache_maximum_bytes: int = 64 * 1024**3,
     ) -> None:
         if samples < 1 or sampler_steps < 1:
             raise ValueError("TRELLIS prior samples and sampler steps must be positive")
@@ -250,6 +275,14 @@ class TrellisPriorAdapter:
             raise TypeError("release_cuda_cache_after_sampling must be Boolean")
         if not isinstance(offload_cuda_pipeline_after_sampling, bool):
             raise TypeError("offload_cuda_pipeline_after_sampling must be Boolean")
+        if persistent_cache_maximum_bytes < 1:
+            raise ValueError("persistent TRELLIS cache byte bound must be positive")
+        if (persistent_cache_directory is None) != (
+            persistent_cache_namespace is None
+        ):
+            raise ValueError(
+                "persistent TRELLIS cache directory and namespace must be paired"
+            )
         self.pipeline = pipeline
         if pipeline is not None:
             self._validate_upstream_contract(pipeline)
@@ -265,8 +298,19 @@ class TrellisPriorAdapter:
             offload_cuda_pipeline_after_sampling
         )
         self._pipeline_device: Optional[torch.device] = None
+        self.progress_reporter: Optional[ProgressReporter] = None
         self._sampling_session_depth = 0
         self._sample_cache: OrderedDict[str, TrellisStructurePrior] = OrderedDict()
+        self.persistent_cache_maximum_bytes = persistent_cache_maximum_bytes
+        self._persistent_cache_namespace = persistent_cache_namespace
+        self._persistent_cache_directory = (
+            Path(persistent_cache_directory).expanduser().resolve()
+            / str(persistent_cache_namespace)
+            if persistent_cache_directory is not None
+            else None
+        )
+        if self._persistent_cache_directory is not None:
+            self._persistent_cache_directory.mkdir(parents=True, exist_ok=True)
         self.last_cuda_cache_release: dict[str, int | bool] = {
             "performed": False,
             "allocated_before_bytes": 0,
@@ -310,8 +354,22 @@ class TrellisPriorAdapter:
                 and self._pipeline_device.type == "cuda"
             ):
                 device = self._pipeline_device
-                self._offload_cuda_pipeline(device)
-                self._release_inactive_cuda_cache(device)
+                offload_context = (
+                    self.progress_reporter.stage("forward.trellis.offload")
+                    if self.progress_reporter is not None
+                    else nullcontext()
+                )
+                with offload_context:
+                    self._offload_cuda_pipeline(device)
+                release_context = (
+                    self.progress_reporter.stage(
+                        "forward.trellis.release_allocator_cache"
+                    )
+                    if self.progress_reporter is not None
+                    else nullcontext()
+                )
+                with release_context:
+                    self._release_inactive_cuda_cache(device)
 
     @staticmethod
     def _validate_upstream_contract(pipeline: object) -> None:
@@ -365,6 +423,8 @@ class TrellisPriorAdapter:
         maximum_conditioning_views: Optional[int] = None,
         release_cuda_cache_after_sampling: bool = True,
         offload_cuda_pipeline_after_sampling: bool = True,
+        persistent_cache_directory: Optional[str | Path] = None,
+        persistent_cache_maximum_bytes: int = 64 * 1024**3,
         device: Optional[torch.device | str] = None,
     ) -> "TrellisPriorAdapter":
         checkpoint = resolve_trellis_checkpoint(checkpoint)
@@ -383,6 +443,26 @@ class TrellisPriorAdapter:
             else target_device
         )
         pipeline.to(initial_device)
+        provenance = external_module_provenance(module, checkpoint)
+        module_path = Path(provenance["module_file"])
+        source_digest = (
+            _python_source_tree_digest(module_path.parent)
+            if module_path.is_file()
+            else "unavailable"
+        )
+        namespace_payload = {
+            **provenance,
+            "module_sha256": source_digest,
+            "samples": samples,
+            "sampler_steps": sampler_steps,
+        }
+        persistent_namespace = (
+            hashlib.sha256(
+                json.dumps(namespace_payload, sort_keys=True).encode("utf8")
+            ).hexdigest()
+            if persistent_cache_directory is not None
+            else None
+        )
         adapter = cls(
             pipeline,
             samples,
@@ -394,9 +474,13 @@ class TrellisPriorAdapter:
             maximum_conditioning_views,
             release_cuda_cache_after_sampling,
             offload_cuda_pipeline_after_sampling,
+            persistent_cache_directory,
+            persistent_namespace,
+            persistent_cache_maximum_bytes,
         )
         adapter._pipeline_device = initial_device
-        adapter.upstream_provenance = external_module_provenance(module, checkpoint)
+        adapter.upstream_provenance = provenance
+        adapter.persistent_cache_provenance = namespace_payload
         return adapter
 
     @torch.no_grad()
@@ -419,19 +503,71 @@ class TrellisPriorAdapter:
         }
         cache_key = self._sample_cache_key(scene_images, seed)
         if cache_key is not None and cache_key in self._sample_cache:
+            if self.progress_reporter is not None:
+                self.progress_reporter.event(
+                    "forward.trellis.cache",
+                    "hit",
+                    cache_key=cache_key,
+                    seed=seed,
+                    selected_views=int(scene_images.shape[0]),
+                )
             cached = self._sample_cache.pop(cache_key)
             self._sample_cache[cache_key] = cached
             return TrellisStructurePrior(
                 [value.to(device=scene_images.device).clone() for value in cached.coordinates],
                 cached.resolution,
             )
+        if cache_key is not None:
+            persistent = self._load_persistent_sample(cache_key)
+            if persistent is not None:
+                if self.progress_reporter is not None:
+                    self.progress_reporter.event(
+                        "forward.trellis.cache",
+                        "persistent_hit",
+                        cache_key=cache_key,
+                        seed=seed,
+                        selected_views=int(scene_images.shape[0]),
+                    )
+                self._remember_sample(cache_key, persistent)
+                return TrellisStructurePrior(
+                    [
+                        value.to(device=scene_images.device).clone()
+                        for value in persistent.coordinates
+                    ],
+                    persistent.resolution,
+                )
         if self.pipeline is None:
             raise RuntimeError(
                 "this synchronized TRELLIS proxy cannot sample; only the "
                 "designated distributed source rank may own the checkpoint"
             )
-        self._ensure_pipeline_device(scene_images.device)
-        condition = self.pipeline.get_cond(scene_images)
+        if self.progress_reporter is not None:
+            self.progress_reporter.event(
+                "forward.trellis.cache",
+                "miss",
+                cache_key=cache_key,
+                seed=seed,
+                selected_views=int(scene_images.shape[0]),
+                posterior_draws=self.samples,
+                sampler_steps=self.sampler_steps,
+            )
+        device_context = (
+            self.progress_reporter.stage("forward.trellis.device_load")
+            if self.progress_reporter is not None
+            else nullcontext()
+        )
+        with device_context:
+            self._ensure_pipeline_device(scene_images.device)
+        conditioning_context = (
+            self.progress_reporter.stage(
+                "forward.trellis.conditioning",
+                selected_views=int(scene_images.shape[0]),
+            )
+            if self.progress_reporter is not None
+            else nullcontext()
+        )
+        with conditioning_context:
+            condition = self.pipeline.get_cond(scene_images)
         if not isinstance(condition, dict) or not {"cond", "neg_cond"} <= set(condition):
             raise TypeError("TRELLIS get_cond must return cond and neg_cond tensors")
         condition["neg_cond"] = condition["neg_cond"][:1]
@@ -461,7 +597,18 @@ class TrellisPriorAdapter:
                     self.sampler_steps,
                     mode="multidiffusion",
                 ) if scene_images.shape[0] > 1 else nullcontext()
-                with context:
+                progress_context = (
+                    self.progress_reporter.stage(
+                        "forward.trellis.posterior_draw",
+                        draw_index=sample_index,
+                        draw_count=self.samples,
+                        sampler_steps=self.sampler_steps,
+                        seed=seed + sample_index,
+                    )
+                    if self.progress_reporter is not None
+                    else nullcontext()
+                )
+                with progress_context, context:
                     devices = [scene_images.device] if scene_images.is_cuda else []
                     # TRELLIS does not expose a generator argument. Isolate its
                     # sampling RNG so topology priors cannot perturb flow-time or
@@ -480,6 +627,14 @@ class TrellisPriorAdapter:
                             "one-sample TRELLIS structure contains a nonzero batch index"
                         )
                     structures.append(coordinates[:, 1:].to(torch.int64))
+                if self.progress_reporter is not None:
+                    self.progress_reporter.event(
+                        "forward.trellis.posterior_draw",
+                        "decoded",
+                        draw_index=sample_index,
+                        draw_count=self.samples,
+                        support_points=int(structures[-1].shape[0]),
+                    )
         finally:
             if hook_handle is not None:
                 hook_handle.remove()
@@ -492,7 +647,7 @@ class TrellisPriorAdapter:
                 )
             if len(set(decoded_resolutions)) != 1:
                 raise RuntimeError(
-                    "TRELLIS decoded structure changed grid resolution "
+                    "TRELLIS decoder changed grid resolution "
                     "between posterior draws"
                 )
             resolution = decoded_resolutions[0]
@@ -502,13 +657,21 @@ class TrellisPriorAdapter:
                 raise RuntimeError("TRELLIS decoded structure resolution is unavailable")
         prior = TrellisStructurePrior(structures, resolution)
         prior.validate()
+        if self.progress_reporter is not None:
+            self.progress_reporter.event(
+                "forward.trellis.sample",
+                "complete",
+                posterior_draws=len(structures),
+                decoded_resolution=resolution,
+                total_support_points=sum(int(value.shape[0]) for value in structures),
+            )
         if cache_key is not None:
-            self._sample_cache[cache_key] = TrellisStructurePrior(
+            cached_prior = TrellisStructurePrior(
                 [value.detach().to(device="cpu").clone() for value in prior.coordinates],
                 prior.resolution,
             )
-            while len(self._sample_cache) > self.cache_entries:
-                self._sample_cache.popitem(last=False)
+            self._remember_sample(cache_key, cached_prior)
+            self._store_persistent_sample(cache_key, cached_prior)
         # TRELLIS sampling is a frozen, no-grad upstream operation. Its diffusion
         # workspaces are dead here, but PyTorch's caching allocator otherwise
         # keeps those blocks reserved on the source DDP rank. That rank-local
@@ -655,6 +818,109 @@ class TrellisPriorAdapter:
         )
         digest.update(values.view(torch.uint8).numpy().tobytes(order="C"))
         return digest.hexdigest()
+
+    def _remember_sample(
+        self,
+        cache_key: str,
+        prior: TrellisStructurePrior,
+    ) -> None:
+        if self.cache_entries == 0:
+            return
+        self._sample_cache[cache_key] = TrellisStructurePrior(
+            [value.detach().to(device="cpu").clone() for value in prior.coordinates],
+            prior.resolution,
+        )
+        while len(self._sample_cache) > self.cache_entries:
+            self._sample_cache.popitem(last=False)
+
+    @contextmanager
+    def _persistent_cache_lock(self) -> Iterator[None]:
+        directory = self._persistent_cache_directory
+        if directory is None:
+            yield
+            return
+        lock_path = directory / ".cache.lock"
+        with lock_path.open("a+b") as lock:
+            fcntl.flock(lock.fileno(), fcntl.LOCK_EX)
+            try:
+                yield
+            finally:
+                fcntl.flock(lock.fileno(), fcntl.LOCK_UN)
+
+    def _load_persistent_sample(
+        self,
+        cache_key: str,
+    ) -> Optional[TrellisStructurePrior]:
+        directory = self._persistent_cache_directory
+        if directory is None:
+            return None
+        path = directory / f"{cache_key}.pt"
+        with self._persistent_cache_lock():
+            if not path.is_file():
+                return None
+            try:
+                payload = torch.load(path, map_location="cpu", weights_only=True)
+            except BaseException as error:
+                raise RuntimeError(
+                    f"invalid persistent TRELLIS cache entry {path}"
+                ) from error
+        if (
+            not isinstance(payload, dict)
+            or payload.get("schema") != "graft-gs-trellis-exact-cache-v1"
+            or payload.get("namespace") != self._persistent_cache_namespace
+            or payload.get("cache_key") != cache_key
+            or not isinstance(payload.get("coordinates"), list)
+        ):
+            raise RuntimeError(f"persistent TRELLIS cache provenance mismatch: {path}")
+        prior = TrellisStructurePrior(
+            coordinates=payload["coordinates"],
+            resolution=int(payload["resolution"]),
+        )
+        prior.validate()
+        return prior
+
+    def _store_persistent_sample(
+        self,
+        cache_key: str,
+        prior: TrellisStructurePrior,
+    ) -> None:
+        directory = self._persistent_cache_directory
+        if directory is None:
+            return
+        path = directory / f"{cache_key}.pt"
+        with self._persistent_cache_lock():
+            if path.is_file():
+                return
+            temporary = directory / f".{cache_key}.{os.getpid()}.tmp"
+            try:
+                torch.save(
+                    {
+                        "schema": "graft-gs-trellis-exact-cache-v1",
+                        "namespace": self._persistent_cache_namespace,
+                        "cache_key": cache_key,
+                        "resolution": prior.resolution,
+                        "coordinates": [
+                            value.detach().to(device="cpu").clone()
+                            for value in prior.coordinates
+                        ],
+                    },
+                    temporary,
+                )
+                os.replace(temporary, path)
+            finally:
+                if temporary.exists():
+                    temporary.unlink()
+            entries = sorted(
+                directory.glob("*.pt"),
+                key=lambda item: (item.stat().st_mtime_ns, item.name),
+            )
+            total_bytes = sum(item.stat().st_size for item in entries)
+            for entry in entries:
+                if total_bytes <= self.persistent_cache_maximum_bytes:
+                    break
+                size = entry.stat().st_size
+                entry.unlink()
+                total_bytes -= size
 
     def support_measure(
         self,

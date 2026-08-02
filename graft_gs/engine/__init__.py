@@ -19,7 +19,9 @@ from .checkpoints import (
 from .configuration import (
     load_loss_weights,
     load_precision_policy,
+    load_progress_config,
     load_server_config,
+    load_training_profiler_config,
     load_trellis_prior_config,
 )
 from .precision import NativePrecisionPolicy
@@ -49,6 +51,8 @@ __all__ = [
     "load_graft_checkpoint",
     "load_loss_weights",
     "load_precision_policy",
+    "load_progress_config",
+    "load_training_profiler_config",
     "load_teacher_bundle",
     "load_server_config",
     "load_trellis_prior_config",

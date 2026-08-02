@@ -835,3 +835,31 @@ sweep's intentional OOM classifier was excluded from that contamination scan.
   and the pinned CRAFT interpreter used by the remote launcher is not installed
   here. The required external closures are one fresh four-A6000 Phase-B probe
   and a separately tuned four-A100 production rerun.
+
+## 2026-08-02 semantic-supervision validation
+
+- Focused unit/static validation executed 90 tests successfully with five
+  distributed-only skips. Regressions prove that semantic advancement survives
+  beyond the bootstrap bound, heartbeat-only output cannot hide a stall, timeout
+  diagnostics retain rank state, OOM terminates immediately, and a second exact
+  TRELLIS adapter reads the persistent result without resampling.
+- Real NCCL/progress smokes completed four all-reduces on one idle RTX A6000 and
+  on two idle RTX A6000 devices. A separate two-rank distributed-evidence run
+  passed all five autograd/RNG/broadcast/reconstruction tests on both ranks.
+- Four-device execution was deliberately not attempted because two GPUs were
+  occupied by unrelated processes. Strict server validation also failed closed
+  before CUDA work because this editing environment does not match the exact
+  444-package production lock; neither limitation is reported as a model or DDP
+  success.
+- Repository discovery executed 225 tests with five failures and 11 skips. The
+  same five failures reproduce from an archived clean HEAD (three non-leaf
+  deepcopy fixtures and two existing numerical thresholds), so this change adds
+  no observed test regression.
+- The supplied 2026-08-02 log classifies as a legacy fixed supervisor wall
+  timeout: all four ranks reported finite pre-backward readiness and short local
+  CUDA waits, followed by stage warnings and `reason=probe_timeout`. It contains
+  no OOM or NCCL error. The earlier batch-8 80-GiB allocation failure remains a
+  separate capacity incident and must not be relabeled as liveness.
+- Still server-pending: fresh four-A6000 and four-A100/A800 sweeps, the selected
+  200-optimizer-step soak on each pool, strict pinned-environment validation,
+  and retained profiler/memory/checkpoint artifacts.

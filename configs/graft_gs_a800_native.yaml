@@ -23,6 +23,64 @@ distributed:
   # graph. Avoid DDP's extra autograd traversal unless a future optional branch
   # introduces a genuinely unused trainable parameter and its test proves it.
   find_unused_parameters: false
+  # Evenly spaced trainable parameters emit gradient-ready sentinels. Hooks
+  # return the exact gradient unchanged and provide semantic backward progress.
+  backward_progress_sentinels: 8
+instrumentation:
+  enabled: true
+  # Heartbeats describe liveness but never reset the semantic watchdog.
+  heartbeat_interval_seconds: 30
+  include_cuda_memory: true
+  # NVTX/CUDA-event timing can be enabled for short profiling runs. CUDA-event
+  # results are harvested by later main-thread events without synchronization.
+  nvtx: false
+  profiler_ranges: true
+  cuda_event_timing: false
+profiling:
+  # Disabled for ordinary training. `--profile` enables a bounded per-rank
+  # CPU/CUDA trace without changing the saved configuration.
+  enabled: false
+  nvtx: false
+  torch_profiler: true
+  first_n_steps: 5
+  wait_steps: 1
+  warmup_steps: 1
+  record_shapes: true
+  profile_memory: true
+  with_stack: false
+watchdog:
+  policy: semantic_progress
+  # Completed stage durations form a bounded history. The active budget is
+  # max(configured stage minimum, empirical Q99 + multiplier * MAD).
+  stage_timeout_policy: robust_q99_mad
+  stage_latency_mad_multiplier: 6.0
+  bootstrap_timeout_seconds: 1800
+  no_progress_timeout_seconds: 900
+  termination_grace_seconds: 15
+  stage_timeout_seconds:
+    model_load: 1800
+    data.fetch_batch: 900
+    forward.trellis.posterior_draw: 600
+    forward.vggt_geometry: 1200
+    forward.sparse_uot: 1800
+    forward.topology_stratum: 1800
+    forward.gaussian_render: 1800
+    train.backward: 3600
+    collective: 1800
+    checkpoint: 1800
+autotune:
+  # Memory checks include warmup and measurement; throughput excludes warmup.
+  warmup_optimizer_steps: 1
+  measurement_optimizer_steps: 2
+  # Candidate-local caches keep end-to-end throughput comparable. Set shared
+  # only when intentionally benchmarking a fully pre-cached workload.
+  probe_trellis_cache_scope: candidate
+  maximum_allocated_fraction: 0.85
+  maximum_reserved_fraction: 0.88
+  minimum_driver_free_fraction: 0.08
+  throughput_fraction: 0.97
+  maximum_throughput_cv: 0.25
+  maximum_rank_step_time_ratio: 3.0
 dataset:
   input_view_set: renders
   image_size: [518, 518]
@@ -132,6 +190,12 @@ trellis_prior:
   # Keep its exact weights in host memory between cache misses so they do not
   # permanently overlap VGGT/atlas/render activations on the A800.
   offload_cuda_pipeline_after_sampling: true
+  # Candidate processes share only exact tensor/seed/checkpoint cache hits.
+  # Atomic files, a process lock, and deterministic FIFO eviction keep it
+  # bounded; no approximate image or posterior reuse is admitted.
+  memory_cache_entries: 64
+  persistent_cache_enabled: true
+  persistent_cache_maximum_gib: 64
 training:
   phases: [A, B, C, D, E, F]
   learning_rate: 1.0e-4
@@ -143,6 +207,10 @@ training:
   # Per-rank host-side concurrency. These do not alter the mathematical batch.
   dataloader_workers: 8
   dataloader_prefetch_factor: 4
+  # Workers restart at epoch boundaries so deterministic random view subsets
+  # observe dataset.set_epoch; pinned memory remains enabled by the loader.
+  dataloader_persistent_workers: false
+  dataloader_pin_memory: true
   maximum_gradient_norm: 1.0
   # Phase F only: exact Gram-space view consensus, augmentation-artifact
   # rejection, and diagonal Fisher clipping. Global topology/barrier gradients

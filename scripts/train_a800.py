@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import argparse
+from dataclasses import replace
+import faulthandler
 import hashlib
 import json
 import os
 from pathlib import Path
+import signal
+import statistics
 
+import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader
 
@@ -33,10 +38,13 @@ from graft_gs.engine import (
     load_graft_checkpoint,
     load_loss_weights,
     load_precision_policy,
+    load_progress_config,
     load_server_config,
+    load_training_profiler_config,
     load_trellis_prior_config,
     validate_precision_policy,
 )
+from graft_gs.observability import ProgressReporter
 from graft_gs.integration import (
     GraftGS,
     TrellisPriorAdapter,
@@ -56,6 +64,24 @@ def main() -> None:
     parser.add_argument("--steps", type=int, required=True)
     parser.add_argument("--vggt-checkpoint")
     parser.add_argument("--trellis-checkpoint")
+    parser.add_argument(
+        "--profile",
+        action="store_true",
+        help="enable the bounded first-step CPU/CUDA profiler from the config",
+    )
+    parser.add_argument(
+        "--profile-output",
+        type=Path,
+        help="per-rank trace directory (defaults to OUTPUT/profiler)",
+    )
+    parser.add_argument(
+        "--trellis-cache-directory",
+        type=Path,
+        help=(
+            "bounded exact-input cache shared by isolated runs; cache entries "
+            "are namespaced by TRELLIS source/checkpoint/sampling provenance"
+        ),
+    )
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--initialize-from", type=Path)
     parser.add_argument("--teacher", type=Path)
@@ -107,6 +133,18 @@ def main() -> None:
             "and exit without saving a model checkpoint"
         ),
     )
+    parser.add_argument(
+        "--batch-probe-warmup-steps",
+        type=int,
+        default=1,
+        help="optimizer steps used only to reach allocator/optimizer steady state",
+    )
+    parser.add_argument(
+        "--batch-probe-measurement-steps",
+        type=int,
+        default=2,
+        help="steady-state optimizer steps included in throughput measurement",
+    )
     accumulation = parser.add_mutually_exclusive_group()
     accumulation.add_argument("--gradient-accumulation-steps", type=int)
     accumulation.add_argument(
@@ -128,14 +166,39 @@ def main() -> None:
     )
     parser.add_argument("--config", type=Path, default=Path("configs/graft_gs_a800_native.yaml"))
     args = parser.parse_args()
+    if args.batch_probe_warmup_steps < 0:
+        raise ValueError("--batch-probe-warmup-steps must be non-negative")
+    if args.batch_probe_measurement_steps < 1:
+        raise ValueError("--batch-probe-measurement-steps must be positive")
     local_device = bind_local_cuda_device(require_cuda=True)
     args.vggt_checkpoint = resolve_vggt_checkpoint(args.vggt_checkpoint)
     phase = TrainingPhase(args.phase)
     model_config, training_config, distributed_config, dataset_config = load_server_config(args.config)
+    progress_config = load_progress_config(args.config)
+    profiler_config = load_training_profiler_config(args.config)
+    profiling_enabled = bool(args.profile or profiler_config.enabled)
+    if profiling_enabled and profiler_config.nvtx and not progress_config.nvtx:
+        progress_config = replace(progress_config, nvtx=True)
     world_size = int(os.environ.get("WORLD_SIZE", "1"))
     if world_size < 1:
         raise ValueError("WORLD_SIZE must be positive")
     rank = int(os.environ.get("RANK", "0"))
+    progress = ProgressReporter(
+        progress_config,
+        rank=rank,
+        local_rank=int(os.environ.get("LOCAL_RANK", "0")),
+        world_size=world_size,
+        device=local_device,
+    )
+    progress.set_context(phase=args.phase)
+    faulthandler.enable(all_threads=True)
+    faulthandler.register(signal.SIGUSR2, all_threads=True, chain=False)
+    progress.event(
+        "process",
+        "start",
+        config=str(args.config),
+        batch_probe=args.batch_probe is not None,
+    )
     synchronize_object_atlas = args.same_object_view_shards or bool(
         distributed_config.get("synchronize_object_atlas", False)
     )
@@ -223,6 +286,7 @@ def main() -> None:
         "strength": float(prior_config["strength"]),
         "minimum_probability": float(prior_config["minimum_probability"]),
         "uncertainty_discount": float(prior_config["uncertainty_discount"]),
+        "cache_entries": int(prior_config["memory_cache_entries"]),
         "maximum_conditioning_views": prior_config[
             "maximum_conditioning_views"
         ],
@@ -233,25 +297,47 @@ def main() -> None:
             prior_config["offload_cuda_pipeline_after_sampling"]
         ),
     }
+    persistent_cache_directory = args.trellis_cache_directory
+    if (
+        persistent_cache_directory is None
+        and bool(prior_config["persistent_cache_enabled"])
+    ):
+        persistent_cache_directory = Path(args.output) / "trellis_exact_cache"
     owns_trellis_sampling = (
         not synchronize_object_atlas or world_size == 1 or rank == 0
     )
     if use_prior and owns_trellis_sampling:
-        prior = TrellisPriorAdapter.from_pretrained(
-            args.trellis_checkpoint,
-            **prior_kwargs,
-            device=local_device,
-        )
+        with progress.stage(
+            "model_load.trellis",
+            checkpoint=args.trellis_checkpoint,
+        ):
+            prior = TrellisPriorAdapter.from_pretrained(
+                args.trellis_checkpoint,
+                **prior_kwargs,
+                persistent_cache_directory=persistent_cache_directory,
+                persistent_cache_maximum_bytes=int(
+                    prior_config["persistent_cache_maximum_bytes"]
+                ),
+                device=local_device,
+            )
     elif use_prior:
         prior = TrellisPriorAdapter(pipeline=None, **prior_kwargs)
     else:
         prior = None
-    adapter = VGGTAdapter.from_pretrained(
-        args.vggt_checkpoint,
-        feature_dim=model_config.feature_dim,
-        backbone_dtype=precision_policy.backbone_dtype,
-    )
-    model = GraftGS(adapter, model_config, prior)
+    if prior is not None:
+        prior.progress_reporter = progress
+    with progress.stage(
+        "model_load.vggt",
+        checkpoint=args.vggt_checkpoint,
+    ):
+        adapter = VGGTAdapter.from_pretrained(
+            args.vggt_checkpoint,
+            feature_dim=model_config.feature_dim,
+            backbone_dtype=precision_policy.backbone_dtype,
+        )
+    with progress.stage("model_load.graft_gs"):
+        model = GraftGS(adapter, model_config, prior)
+        model.set_progress_reporter(progress)
     teacher = None
     if phase is TrainingPhase.QUANTIZATION_DISTILLATION:
         if args.teacher is None:
@@ -469,9 +555,21 @@ def main() -> None:
             precision_diagnostics=precision_policy.diagnostics,
             precision_float32_matmul=precision_policy.float32_matmul_precision,
             precision_allow_tf32=precision_policy.allow_tf32,
+            progress_enabled=progress_config.enabled,
+            progress_heartbeat_interval_seconds=(
+                progress_config.heartbeat_interval_seconds
+            ),
+            progress_include_cuda_memory=progress_config.include_cuda_memory,
+            progress_nvtx=progress_config.nvtx,
+            progress_profiler_ranges=progress_config.profiler_ranges,
+            progress_cuda_event_timing=progress_config.cuda_event_timing,
+            backward_progress_sentinels=int(
+                distributed_config.get("backward_progress_sentinels", 8)
+            ),
         ),
         loss_weights=loss_weights,
         teacher=teacher,
+        progress_reporter=progress,
     )
     if trainer.context.rank == 0:
         precision_path = Path(args.output) / "precision_policy.json"
@@ -621,14 +719,23 @@ def main() -> None:
     )
     if dataloader_workers < 0 or prefetch_factor < 1:
         raise ValueError("dataloader workers must be non-negative and prefetch positive")
+    persistent_workers = bool(
+        training_config.get("dataloader_persistent_workers", False)
+    )
+    if persistent_workers:
+        raise ValueError(
+            "persistent DataLoader workers are incompatible with exact "
+            "epoch-dependent view selection; keep "
+            "training.dataloader_persistent_workers=false"
+        )
     loader_options = dict(
         dataset=dataset,
         num_workers=dataloader_workers,
-        pin_memory=True,
+        pin_memory=bool(training_config.get("dataloader_pin_memory", True)),
         prefetch_factor=prefetch_factor if dataloader_workers > 0 else None,
         # Workers are recreated after dataset.set_epoch so deterministic random
         # view subsets actually change between epochs.
-        persistent_workers=False,
+        persistent_workers=persistent_workers,
         collate_fn=collate,
     )
     if batch_sampler is not None:
@@ -644,18 +751,78 @@ def main() -> None:
         trainer.load_checkpoint(args.resume)
     elif args.initialize_from:
         trainer.load_model_weights(args.initialize_from, strict=False)
+
+    def fit_with_optional_profiler(target_steps: int) -> None:
+        if not profiling_enabled or not profiler_config.torch_profiler:
+            trainer.fit(loader, target_steps)
+            return
+        trace_directory = (
+            args.profile_output
+            if args.profile_output is not None
+            else Path(args.output) / "profiler"
+        )
+        trace_directory.mkdir(parents=True, exist_ok=True)
+        progress.event(
+            "profiling",
+            "begin",
+            trace_directory=str(trace_directory),
+            first_n_optimizer_steps=profiler_config.first_n_steps,
+        )
+        schedule = torch.profiler.schedule(
+            wait=profiler_config.wait_steps,
+            warmup=profiler_config.warmup_steps,
+            active=profiler_config.active_steps,
+            repeat=1,
+        )
+        trace_handler = torch.profiler.tensorboard_trace_handler(
+            str(trace_directory),
+            worker_name=f"rank-{trainer.context.rank:03d}",
+        )
+        with torch.profiler.profile(
+            activities=(
+                torch.profiler.ProfilerActivity.CPU,
+                torch.profiler.ProfilerActivity.CUDA,
+            ),
+            schedule=schedule,
+            on_trace_ready=trace_handler,
+            record_shapes=profiler_config.record_shapes,
+            profile_memory=profiler_config.profile_memory,
+            with_stack=profiler_config.with_stack,
+            with_modules=True,
+        ) as training_profiler:
+            trainer.set_profiler_step_callback(training_profiler.step)
+            try:
+                trainer.fit(loader, target_steps)
+            finally:
+                trainer.set_profiler_step_callback(None)
+        progress.event(
+            "profiling",
+            "end",
+            trace_directory=str(trace_directory),
+        )
+
     if args.batch_probe is not None:
-        trainer.fit(loader, trainer.global_step + 1)
+        probe_optimizer_steps = (
+            args.batch_probe_warmup_steps
+            + args.batch_probe_measurement_steps
+        )
+        history_start = len(trainer.optimizer_step_metric_history)
+        fit_with_optional_profiler(trainer.global_step + probe_optimizer_steps)
         if trainer.last_train_metrics is None:
             raise RuntimeError("batch probe completed without training metrics")
-        optimizer_metrics = list(trainer.last_optimizer_step_metrics)
-        if not optimizer_metrics:
-            optimizer_metrics = [trainer.last_train_metrics]
+        optimizer_history = trainer.optimizer_step_metric_history[history_start:]
+        if len(optimizer_history) != probe_optimizer_steps:
+            raise RuntimeError(
+                "batch probe did not record the requested optimizer-step history"
+            )
+        warmup_history = optimizer_history[: args.batch_probe_warmup_steps]
+        measurement_history = optimizer_history[args.batch_probe_warmup_steps :]
         local_probe = {
             "rank": trainer.context.rank,
             "logical_device": trainer.context.local_rank,
             "object_batch_size": object_batch_size,
-            "microsteps": optimizer_metrics,
+            "warmup_optimizer_steps": warmup_history,
+            "measurement_optimizer_steps": measurement_history,
         }
         if trainer.context.distributed:
             probes: list[object] = [
@@ -668,32 +835,105 @@ def main() -> None:
             typed_probes = [
                 value for value in probes if isinstance(value, dict)
             ]
-            microstep_count = len(typed_probes[0]["microsteps"])
-            if microstep_count < 1 or any(
-                len(value["microsteps"]) != microstep_count
+            measurement_step_count = len(
+                typed_probes[0]["measurement_optimizer_steps"]
+            )
+            warmup_step_count = len(typed_probes[0]["warmup_optimizer_steps"])
+            if (
+                measurement_step_count != args.batch_probe_measurement_steps
+                or warmup_step_count != args.batch_probe_warmup_steps
+                or any(
+                    len(value["measurement_optimizer_steps"])
+                    != measurement_step_count
+                    or len(value["warmup_optimizer_steps"])
+                    != warmup_step_count
+                    for value in typed_probes
+                )
+            ):
+                raise RuntimeError(
+                    "DDP batch probe ranks reported inconsistent optimizer-step counts"
+                )
+            measurement_microstep_counts = [
+                len(typed_probes[0]["measurement_optimizer_steps"][step])
+                for step in range(measurement_step_count)
+            ]
+            if any(count < 1 for count in measurement_microstep_counts) or any(
+                len(value["measurement_optimizer_steps"][step])
+                != measurement_microstep_counts[step]
                 for value in typed_probes
+                for step in range(measurement_step_count)
             ):
                 raise RuntimeError(
                     "DDP batch probe ranks reported inconsistent microstep counts"
                 )
-            optimizer_seconds = sum(
-                max(
-                    float(value["microsteps"][microstep]["seconds"])
-                    for value in typed_probes
+            measurement_step_seconds = [
+                sum(
+                    max(
+                        float(
+                            value["measurement_optimizer_steps"][step][microstep][
+                                "seconds"
+                            ]
+                        )
+                        for value in typed_probes
+                    )
+                    for microstep in range(measurement_microstep_counts[step])
                 )
-                for microstep in range(microstep_count)
-            )
-            processed_objects = sum(
+                for step in range(measurement_step_count)
+            ]
+            measurement_step_objects = [
                 sum(
                     int(metric["local_scenes"])
-                    for metric in value["microsteps"]
+                    for value in typed_probes
+                    for metric in value["measurement_optimizer_steps"][step]
                 )
-                for value in typed_probes
+                for step in range(measurement_step_count)
+            ]
+            measurement_step_throughput = [
+                objects / max(seconds, 1.0e-12)
+                for objects, seconds in zip(
+                    measurement_step_objects,
+                    measurement_step_seconds,
+                )
+            ]
+            optimizer_seconds = sum(measurement_step_seconds)
+            processed_objects = sum(measurement_step_objects)
+            throughput_mean = statistics.fmean(measurement_step_throughput)
+            throughput_cv = (
+                statistics.pstdev(measurement_step_throughput) / throughput_mean
+                if len(measurement_step_throughput) > 1 and throughput_mean > 0
+                else 0.0
             )
+            rank_time_ratios = [
+                max(rank_seconds) / max(min(rank_seconds), 1.0e-12)
+                for step in range(measurement_step_count)
+                for microstep in range(measurement_microstep_counts[step])
+                for rank_seconds in [
+                    [
+                        float(
+                            value["measurement_optimizer_steps"][step][microstep][
+                                "seconds"
+                            ]
+                        )
+                        for value in typed_probes
+                    ]
+                ]
+            ]
+            all_probe_metrics = [
+                metric
+                for value in typed_probes
+                for key in (
+                    "warmup_optimizer_steps",
+                    "measurement_optimizer_steps",
+                )
+                for optimizer_step in value[key]
+                for metric in optimizer_step
+            ]
             payload = {
-                "schema": "graft-gs-object-batch-probe-v2",
+                "schema": "graft-gs-object-batch-probe-v3",
                 "world_size": trainer.context.world_size,
                 "object_batch_size": object_batch_size,
+                "warmup_optimizer_steps": warmup_step_count,
+                "measurement_optimizer_steps": measurement_step_count,
                 "global_objects_per_optimizer_step": (
                     object_batch_size
                     * trainer.context.world_size
@@ -701,32 +941,30 @@ def main() -> None:
                 ),
                 "gradient_accumulation_steps": gradient_accumulation_steps,
                 "minimum_realized_object_batch_size": min(
-                    int(metric["local_scenes"])
-                    for value in typed_probes
-                    for metric in value["microsteps"]
+                    int(metric["local_scenes"]) for metric in all_probe_metrics
                 ),
                 "maximum_realized_object_batch_size": max(
-                    int(metric["local_scenes"])
-                    for value in typed_probes
-                    for metric in value["microsteps"]
+                    int(metric["local_scenes"]) for metric in all_probe_metrics
                 ),
                 "aggregate_objects_per_second": (
                     processed_objects / max(optimizer_seconds, 1.0e-12)
                 ),
+                "measurement_step_objects_per_second": (
+                    measurement_step_throughput
+                ),
+                "measurement_throughput_coefficient_of_variation": throughput_cv,
+                "maximum_rank_step_time_ratio": max(rank_time_ratios),
                 "maximum_peak_allocated_fraction": max(
                     float(metric["peak_allocated_fraction"])
-                    for value in typed_probes
-                    for metric in value["microsteps"]
+                    for metric in all_probe_metrics
                 ),
                 "maximum_peak_reserved_fraction": max(
                     float(metric["peak_reserved_fraction"])
-                    for value in typed_probes
-                    for metric in value["microsteps"]
+                    for metric in all_probe_metrics
                 ),
                 "minimum_ending_driver_free_fraction": min(
                     float(metric["ending_driver_free_fraction"])
-                    for value in typed_probes
-                    for metric in value["microsteps"]
+                    for metric in all_probe_metrics
                 ),
                 "ranks": typed_probes,
             }
@@ -744,9 +982,16 @@ def main() -> None:
         if trainer.context.distributed:
             dist.barrier()
             dist.destroy_process_group()
+        trainer.close()
+        progress.close()
         return
-    trainer.fit(loader, args.steps)
+    fit_with_optional_profiler(args.steps)
     trainer.save_checkpoint(Path(args.output) / "final.pt")
+    if trainer.context.distributed:
+        dist.barrier()
+        dist.destroy_process_group()
+    trainer.close()
+    progress.close()
 
 
 if __name__ == "__main__":

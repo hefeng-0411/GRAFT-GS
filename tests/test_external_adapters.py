@@ -150,6 +150,37 @@ class _MockDecodedGridTrellisPipeline:
 
 
 class TrellisAdapterBoundaryTest(unittest.TestCase):
+    def test_persistent_cache_reuses_only_exact_namespaced_sample(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary:
+            images = torch.zeros(2, 3, 8, 8)
+            first_pipeline = _MockTrellisPipeline()
+            first = TrellisPriorAdapter(
+                first_pipeline,
+                samples=1,
+                sampler_steps=1,
+                persistent_cache_directory=temporary,
+                persistent_cache_namespace="checkpoint-source-policy",
+                persistent_cache_maximum_bytes=1024**2,
+            )
+            first_prior = first.sample(images, seed=19)
+            self.assertEqual(first_pipeline.sample_count, 1)
+
+            second_pipeline = _MockTrellisPipeline()
+            second = TrellisPriorAdapter(
+                second_pipeline,
+                samples=1,
+                sampler_steps=1,
+                persistent_cache_directory=temporary,
+                persistent_cache_namespace="checkpoint-source-policy",
+                persistent_cache_maximum_bytes=1024**2,
+            )
+            second_prior = second.sample(images.clone(), seed=19)
+            self.assertEqual(second_pipeline.sample_count, 0)
+            self.assertEqual(first_prior.resolution, second_prior.resolution)
+            self.assertTrue(
+                torch.equal(first_prior.coordinates[0], second_prior.coordinates[0])
+            )
+
     def test_dinov2_torch_hub_load_is_strictly_redirected_to_cache(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             hub_root = Path(directory)

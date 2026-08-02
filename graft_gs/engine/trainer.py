@@ -14,7 +14,7 @@ import random
 import socket
 import threading
 import time
-from typing import Iterable, Mapping, Optional, Sequence
+from typing import Callable, Iterable, Mapping, Optional, Sequence
 
 import numpy as np
 import torch
@@ -38,6 +38,7 @@ from ..optimization.quantization import (
     apply_equivariant_qat,
     quantization_scale_adversaries,
 )
+from ..observability import ProgressConfig, ProgressReporter
 from .losses import (
     GraftGSLoss,
     LearnedPerceptualPyramid,
@@ -127,6 +128,13 @@ class TrainerConfig:
     precision_diagnostics: str = "float64"
     precision_float32_matmul: str = "highest"
     precision_allow_tf32: bool = False
+    progress_enabled: bool = True
+    progress_heartbeat_interval_seconds: float = 30.0
+    progress_include_cuda_memory: bool = True
+    progress_nvtx: bool = False
+    progress_profiler_ranges: bool = True
+    progress_cuda_event_timing: bool = False
+    backward_progress_sentinels: int = 8
 
     def __post_init__(self) -> None:
         NativePrecisionPolicy(
@@ -151,6 +159,16 @@ class TrainerConfig:
             raise ValueError("ddp_bucket_cap_mb must be positive")
         if self.straggler_warning_seconds < 1:
             raise ValueError("straggler_warning_seconds must be positive")
+        ProgressConfig(
+            enabled=self.progress_enabled,
+            heartbeat_interval_seconds=self.progress_heartbeat_interval_seconds,
+            include_cuda_memory=self.progress_include_cuda_memory,
+            nvtx=self.progress_nvtx,
+            profiler_ranges=self.progress_profiler_ranges,
+            cuda_event_timing=self.progress_cuda_event_timing,
+        )
+        if self.backward_progress_sentinels < 0:
+            raise ValueError("backward progress sentinel count must be non-negative")
         GradientPurificationConfig(
             maximum_views=self.gradient_purification_maximum_views,
             consensus_cosine=self.gradient_consensus_cosine,
@@ -973,6 +991,7 @@ class GraftGSTrainer:
         config: TrainerConfig = TrainerConfig(),
         loss_weights: LossWeights = LossWeights(),
         teacher: Optional[GraftGS] = None,
+        progress_reporter: Optional[ProgressReporter] = None,
     ) -> None:
         self.config = config
         self.precision_policy = NativePrecisionPolicy(
@@ -992,6 +1011,31 @@ class GraftGSTrainer:
         self.context = DistributedContext.initialize(
             backend=config.distributed_backend,
             timeout_seconds=config.collective_timeout_seconds,
+        )
+        self._owns_progress_reporter = progress_reporter is None
+        self.progress = progress_reporter or ProgressReporter(
+            ProgressConfig(
+                enabled=config.progress_enabled,
+                heartbeat_interval_seconds=(
+                    config.progress_heartbeat_interval_seconds
+                ),
+                include_cuda_memory=config.progress_include_cuda_memory,
+                nvtx=config.progress_nvtx,
+                profiler_ranges=config.progress_profiler_ranges,
+                cuda_event_timing=config.progress_cuda_event_timing,
+            ),
+            rank=self.context.rank,
+            local_rank=self.context.local_rank,
+            world_size=self.context.world_size,
+            device=self.context.device,
+        )
+        self.progress.set_device(self.context.device)
+        self.progress.set_context(phase=config.phase.value)
+        self.progress.event(
+            "distributed.process_group",
+            "ready",
+            backend=config.distributed_backend,
+            collective_timeout_seconds=config.collective_timeout_seconds,
         )
         assert_local_cuda_allocator_ownership(self.context.device)
         self._seed_everything(config.seed + self.context.rank)
@@ -1024,8 +1068,10 @@ class GraftGSTrainer:
                 ),
             )
         self.module = model.to(self.context.device)
+        self.module.set_progress_reporter(self.progress)
         self.teacher = teacher.to(self.context.device).eval() if teacher is not None else None
         if self.teacher is not None:
+            self.teacher.set_progress_reporter(self.progress)
             for parameter in self.teacher.parameters():
                 parameter.requires_grad_(False)
         self.model: nn.Module = self.module
@@ -1043,6 +1089,8 @@ class GraftGSTrainer:
         if not parameters:
             raise RuntimeError(f"phase {config.phase.value} selected no trainable parameters")
         self.trainable_parameters = tuple(parameters)
+        self._backward_progress_handles: list[torch.utils.hooks.RemovableHandle] = []
+        self._install_backward_progress_sentinels()
         self.optimizer = torch.optim.AdamW(parameters, lr=config.learning_rate, weight_decay=config.weight_decay)
         learned_perceptual = (
             LearnedPerceptualPyramid.from_checkpoint(
@@ -1084,8 +1132,85 @@ class GraftGSTrainer:
         self._mesh_supervisor: Optional[object] = None
         self.last_train_metrics: Optional[dict[str, float]] = None
         self.last_optimizer_step_metrics: tuple[dict[str, float], ...] = ()
+        self.optimizer_step_metric_history: list[
+            tuple[dict[str, float], ...]
+        ] = []
         self._active_step_context: dict[str, object] = {}
         self._stage_watchdog: Optional[threading.Timer] = None
+        self._profiler_step_callback: Optional[Callable[[], None]] = None
+
+    def _install_backward_progress_sentinels(self) -> None:
+        """Report sparse autograd advancement without inspecting gradients."""
+
+        count = min(
+            self.config.backward_progress_sentinels,
+            len(self.trainable_parameters),
+        )
+        if not self.progress.enabled or count == 0:
+            return
+        named = [
+            (name, parameter)
+            for name, parameter in self.module.named_parameters()
+            if parameter.requires_grad
+        ]
+        if count == 1:
+            selected_indices = [len(named) - 1]
+        else:
+            selected_indices = sorted(
+                {
+                    round(index * (len(named) - 1) / (count - 1))
+                    for index in range(count)
+                }
+            )
+        for sentinel_index, parameter_index in enumerate(selected_indices):
+            name, parameter = named[parameter_index]
+
+            def gradient_ready(
+                gradient: Tensor,
+                *,
+                parameter_name: str = name,
+                index: int = sentinel_index,
+                total: int = len(selected_indices),
+            ) -> Tensor:
+                self.progress.event(
+                    "train.backward",
+                    "gradient_ready",
+                    parameter=parameter_name,
+                    sentinel_index=index,
+                    sentinel_count=total,
+                    gradient_elements=int(gradient.numel()),
+                )
+                return gradient
+
+            self._backward_progress_handles.append(
+                parameter.register_hook(gradient_ready)
+            )
+
+    def close(self) -> None:
+        self._cancel_stage_watchdog()
+        for handle in self._backward_progress_handles:
+            handle.remove()
+        self._backward_progress_handles.clear()
+        if self._owns_progress_reporter:
+            self.progress.close()
+
+    def _progress_event(
+        self,
+        stage: str,
+        event: str,
+        **values: object,
+    ) -> None:
+        reporter = getattr(self, "progress", None)
+        if reporter is not None:
+            reporter.event(stage, event, **values)
+
+    def set_profiler_step_callback(
+        self,
+        callback: Optional[Callable[[], None]],
+    ) -> None:
+        """Advance an optional profiler once per committed optimizer step."""
+
+        self._profiler_step_callback = callback
 
     @staticmethod
     def _seed_everything(seed: int) -> None:
@@ -1108,6 +1233,12 @@ class GraftGSTrainer:
         a later NCCL operation.
         """
 
+        self._progress_event(
+            "collective.finite_state",
+            "local_check_begin",
+            collective_stage=stage,
+            tensor_count=len(tensors),
+        )
         # Build one asynchronous device indicator first. Converting every
         # parameter predicate to Python bool would serialize the CUDA stream
         # hundreds of times per step and materially depress GPU utilization.
@@ -1144,6 +1275,13 @@ class GraftGSTrainer:
             if timer is not None:
                 timer.cancel()
         local_wait_seconds = time.perf_counter() - local_wait_started
+        self._progress_event(
+            "collective.finite_state",
+            "local_check_complete",
+            collective_stage=stage,
+            local_cuda_wait_seconds=local_wait_seconds,
+            local_nonfinite=bool(local_failure),
+        )
         if (
             self.context.distributed
             and (
@@ -1169,7 +1307,17 @@ class GraftGSTrainer:
                 flush=True,
             )
         if self.context.distributed:
+            self._progress_event(
+                "collective.finite_state",
+                "all_reduce_begin",
+                collective_stage=stage,
+            )
             dist.all_reduce(failure, op=dist.ReduceOp.MAX)
+            self._progress_event(
+                "collective.finite_state",
+                "all_reduce_complete",
+                collective_stage=stage,
+            )
         global_failure = (
             int(failure.item())
             if self.context.distributed
@@ -1190,9 +1338,21 @@ class GraftGSTrainer:
             )
         else:
             gathered = [{"rank": 0, "nonfinite": bad[:64], "count": len(bad)}]
-        raise FloatingPointError(
-            f"non-finite training tensors before {stage}: {gathered}"
+        message = f"non-finite training tensors before {stage}: {gathered}"
+        print(
+            "GRAFT_GS_NONFINITE "
+            + json.dumps(
+                {
+                    **getattr(self, "_active_step_context", {}),
+                    "rank": self.context.rank,
+                    "stage": stage,
+                    "details": gathered,
+                },
+                sort_keys=True,
+            ),
+            flush=True,
         )
+        raise FloatingPointError(message)
 
     def _emit_local_cuda_stall(
         self,
@@ -1266,6 +1426,12 @@ class GraftGSTrainer:
             "object_ids": object_ids,
             "phase": self.config.phase.value,
         }
+        self.progress.set_context(**self._active_step_context)
+        self.progress.event(
+            "train.microbatch",
+            "begin",
+            accumulation_steps=self.config.gradient_accumulation_steps,
+        )
         self._arm_stage_watchdog("forward_and_loss")
         # In same-object DDP the collated CPU sample contains the union of all
         # rank views. Select the deterministic local shard before transferring
@@ -1279,24 +1445,31 @@ class GraftGSTrainer:
         images, valid_mask, view_supervision = self._shard_object_views(
             images, valid_mask, view_supervision
         )
-        images = images.to(
-            device=self.context.device,
-            dtype=torch.float32,
-            non_blocking=True,
-        )
-        if valid_mask is not None:
-            valid_mask = valid_mask.to(
-                device=self.context.device,
-                non_blocking=True,
-            )
-        view_supervision = {
-            name: value.to(
+        with self.progress.stage(
+            "data.host_to_device",
+            object_batch=int(images.shape[0]),
+            views=int(images.shape[1]),
+            image_height=int(images.shape[-2]),
+            image_width=int(images.shape[-1]),
+        ):
+            images = images.to(
                 device=self.context.device,
                 dtype=torch.float32,
                 non_blocking=True,
             )
-            for name, value in view_supervision.items()
-        }
+            if valid_mask is not None:
+                valid_mask = valid_mask.to(
+                    device=self.context.device,
+                    non_blocking=True,
+                )
+            view_supervision = {
+                name: value.to(
+                    device=self.context.device,
+                    dtype=torch.float32,
+                    non_blocking=True,
+                )
+                for name, value in view_supervision.items()
+            }
         atlas_root_bounds = self._atlas_root_bounds(batch)
         trellis_prior_seed = self._trellis_prior_seed(batch)
         robustness = None
@@ -1337,9 +1510,14 @@ class GraftGSTrainer:
         # nvdiffrast's transient binning/geometry workspace cannot overlap the
         # model's peak activation state.
         if _phase_renders_input_views(self.config.phase):
-            mesh_targets = self._derive_mesh_targets(
-                batch, view_supervision, images.shape[-2:]
-            )
+            with self.progress.stage(
+                "forward.mesh_supervision_targets",
+                views=int(images.shape[0] * images.shape[1]),
+                view_chunk_size=self.config.mesh_supervision_view_chunk_size,
+            ):
+                mesh_targets = self._derive_mesh_targets(
+                    batch, view_supervision, images.shape[-2:]
+                )
         else:
             # Phases A/C return before every rendered mesh objective. Avoid
             # scheduling immutable nvdiffrast work that cannot enter their loss.
@@ -1364,7 +1542,11 @@ class GraftGSTrainer:
 
         with context:
             try:
-                output = forward_model()
+                with self.progress.stage(
+                    "train.forward",
+                    synchronize_gradients=not synchronize,
+                ):
+                    output = forward_model()
             except RuntimeError as error:
                 self.module._record_cuda_memory_stage(
                     "trainer/forward_failure",
@@ -1386,7 +1568,13 @@ class GraftGSTrainer:
                 loss_batch["feasibility_relative_temperature"] = (
                     self.config.topology_hardening_temperature
                 )
-            total, terms = self.loss(self.module, output, loss_batch, self.config.phase.value)
+            with self.progress.stage("train.loss"):
+                total, terms = self.loss(
+                    self.module,
+                    output,
+                    loss_batch,
+                    self.config.phase.value,
+                )
             if self.config.phase is TrainingPhase.QUANTIZATION_DISTILLATION:
                 if self.teacher is None:
                     raise RuntimeError("Phase E requires a frozen teacher")
@@ -1464,15 +1652,19 @@ class GraftGSTrainer:
             )
             self._arm_stage_watchdog("backward")
             try:
-                if self.gradient_purifier is not None:
-                    purification_metrics = self._backward_with_gradient_purification(
-                        total,
-                        terms,
-                        output,
-                        loss_batch,
-                    )
-                else:
-                    (total / self.config.gradient_accumulation_steps).backward()
+                with self.progress.stage(
+                    "train.backward",
+                    synchronize_gradients=not synchronize,
+                ):
+                    if self.gradient_purifier is not None:
+                        purification_metrics = self._backward_with_gradient_purification(
+                            total,
+                            terms,
+                            output,
+                            loss_batch,
+                        )
+                    else:
+                        (total / self.config.gradient_accumulation_steps).backward()
             except RuntimeError as error:
                 self.module._record_cuda_memory_stage(
                     "trainer/backward_failure",
@@ -1523,13 +1715,14 @@ class GraftGSTrainer:
             )
             self._arm_stage_watchdog("gradient_clip_and_optimizer")
             try:
-                gradient_norm = float(
-                    _clip_grad_norm_high_precision(
-                        self.trainable_parameters,
-                        self.config.maximum_gradient_norm,
-                    ).cpu()
-                )
-                self.optimizer.step()
+                with self.progress.stage("train.optimizer_step"):
+                    gradient_norm = float(
+                        _clip_grad_norm_high_precision(
+                            self.trainable_parameters,
+                            self.config.maximum_gradient_norm,
+                        ).cpu()
+                    )
+                    self.optimizer.step()
             finally:
                 self._cancel_stage_watchdog()
             optimizer_tensor = {
@@ -1735,6 +1928,16 @@ class GraftGSTrainer:
         )
         if should_step and self.global_step % self.config.log_every == 0:
             self._log(metrics)
+        self.progress.event(
+            "train.microbatch",
+            "end",
+            optimizer_stepped=should_step,
+            seconds=elapsed,
+            local_scenes=int(images.shape[0]),
+            local_views=int(images.shape[0] * images.shape[1]),
+            peak_allocated_fraction=metrics["peak_allocated_fraction"],
+            peak_reserved_fraction=metrics["peak_reserved_fraction"],
+        )
         return metrics
 
     def _emit_cuda_failure_diagnostics(self, error: RuntimeError) -> None:
@@ -2251,6 +2454,8 @@ class GraftGSTrainer:
     ) -> None:
         pending_optimizer_metrics: list[dict[str, float]] = []
         while self.global_step < steps:
+            self.progress.update_context(epoch=self.epoch)
+            self.progress.event("data.epoch", "begin", epoch=self.epoch)
             dataset = getattr(train_loader, "dataset", None)
             if dataset is not None and hasattr(dataset, "set_epoch"):
                 dataset.set_epoch(self.epoch)
@@ -2261,8 +2466,20 @@ class GraftGSTrainer:
             if batch_sampler is not None and hasattr(batch_sampler, "set_epoch"):
                 batch_sampler.set_epoch(self.epoch)
             completed_epoch = True
-            for batch_index, batch in enumerate(train_loader):
+            loader_iterator = iter(train_loader)
+            batch_index = 0
+            while True:
+                try:
+                    with self.progress.stage(
+                        "data.fetch_batch",
+                        epoch=self.epoch,
+                        batch_index=batch_index,
+                    ):
+                        batch = next(loader_iterator)
+                except StopIteration:
+                    break
                 if batch_index < self.batches_consumed_in_epoch:
+                    batch_index += 1
                     continue
                 previous_step = self.global_step
                 metrics = self.train_step(batch, self.microstep)
@@ -2275,6 +2492,11 @@ class GraftGSTrainer:
                     self.last_optimizer_step_metrics = tuple(
                         pending_optimizer_metrics
                     )
+                    self.optimizer_step_metric_history.append(
+                        self.last_optimizer_step_metrics
+                    )
+                    if len(self.optimizer_step_metric_history) > 64:
+                        self.optimizer_step_metric_history.pop(0)
                     pending_optimizer_metrics.clear()
                 if stepped and self.global_step % self.config.checkpoint_every == 0:
                     self.save_checkpoint(self.output_directory / f"step-{self.global_step:08d}.pt")
@@ -2284,10 +2506,14 @@ class GraftGSTrainer:
                     and self.global_step % self.config.validate_every == 0
                 ):
                     self.validate(validation_loader)
+                if stepped and self._profiler_step_callback is not None:
+                    self._profiler_step_callback()
                 if self.global_step >= steps:
                     completed_epoch = False
                     break
+                batch_index += 1
             if completed_epoch:
+                self.progress.event("data.epoch", "end", epoch=self.epoch)
                 self.epoch += 1
                 self.batches_consumed_in_epoch = 0
 
@@ -2297,6 +2523,12 @@ class GraftGSTrainer:
         # every process collapses those streams after resume and is not exact
         # DDP continuation.  Checkpointing is therefore a collective operation
         # in distributed mode; only serialization remains rank-zero-only.
+        self.progress.event(
+            "checkpoint.save",
+            "begin",
+            path=str(path),
+            checkpoint_step=self.global_step,
+        )
         local_rng_state = _capture_rng_state(self.context.rank)
         if self.context.distributed:
             rank_rng_states: list[object] = [None for _ in range(self.context.world_size)]
@@ -2368,6 +2600,12 @@ class GraftGSTrainer:
                 raise RuntimeError(f"distributed checkpoint commit failed: {message}")
         elif save_exception is not None:
             raise save_exception
+        self.progress.event(
+            "checkpoint.save",
+            "end",
+            path=str(path),
+            checkpoint_step=self.global_step,
+        )
 
     def load_checkpoint(self, path: str | Path) -> None:
         payload = torch.load(path, map_location=self.context.device, weights_only=False)

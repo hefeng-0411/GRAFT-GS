@@ -8,20 +8,25 @@ cannot leak into the launched training job.
 from __future__ import annotations
 
 import argparse
+from dataclasses import dataclass, field
 import json
 import os
 from pathlib import Path
 import queue
 import re
 import signal
+import statistics
 import subprocess
 import sys
 import threading
 import time
 from typing import Sequence
 
+import yaml
+
 
 ROOT = Path(__file__).resolve().parents[1]
+PROGRESS_PREFIX = "GRAFT_GS_PROGRESS "
 OOM_MARKERS = (
     "torch.outofmemoryerror",
     "cuda out of memory",
@@ -36,6 +41,368 @@ _ACCUMULATION_OPTIONS = (
     "--global-object-batch",
     "--minimum-global-object-batch",
 )
+
+NONFINITE_MARKERS = (
+    "graft_gs_nonfinite",
+    "non-finite training tensors",
+    "floatingpointerror",
+)
+COLLECTIVE_FAILURE_MARKERS = (
+    "processgroupnccl",
+    "nccl error",
+    "collective operation timeout",
+    "distbackenderror",
+    "ddp atlas key alignment failed",
+)
+DATA_FAILURE_MARKERS = (
+    "filenotfounderror",
+    "dataset contract",
+    "manifest",
+    "no vggt evidence lies inside",
+    "dataloader worker",
+)
+MODEL_FAILURE_MARKERS = (
+    "checkpoint",
+    "state_dict",
+    "upstream contract",
+    "requires declared",
+    "modulenotfounderror",
+    "importerror",
+)
+
+DEFAULT_STAGE_TIMEOUT_SECONDS = {
+    "model_load": 1800.0,
+    "data.fetch_batch": 900.0,
+    "forward.mesh_supervision_targets": 1200.0,
+    "forward.trellis.device_load": 1200.0,
+    "forward.trellis.conditioning": 900.0,
+    "forward.trellis.posterior_draw": 600.0,
+    "forward.vggt_geometry": 1200.0,
+    "forward.evidence_lift": 900.0,
+    "forward.atlas": 1200.0,
+    "forward.sparse_uot": 1800.0,
+    "forward.gauge_sparse_attention": 1200.0,
+    "forward.topology_stratum": 1800.0,
+    "forward.barrier_riemannian_flow": 1800.0,
+    "forward.analytical_readout": 900.0,
+    "forward.gaussian_render": 1800.0,
+    "train.loss": 1200.0,
+    "train.backward": 3600.0,
+    "train.optimizer_step": 1200.0,
+    "collective": 1800.0,
+    "checkpoint": 1800.0,
+}
+
+
+@dataclass
+class _RankProgress:
+    rank: int
+    pid: int | None = None
+    stage: str = "unreported"
+    event: str = "unreported"
+    sequence: int = 0
+    semantic_sequence: int = 0
+    last_record_monotonic: float = 0.0
+    last_semantic_monotonic: float = 0.0
+    context: dict[str, object] = field(default_factory=dict)
+
+
+class SemanticProgressMonitor:
+    """Track meaningful child advancement independently of total wall time."""
+
+    def __init__(
+        self,
+        *,
+        started: float,
+        bootstrap_timeout_seconds: float,
+        no_progress_timeout_seconds: float,
+        world_size: int | None = None,
+        stage_timeout_seconds: dict[str, float] | None = None,
+        stage_latency_mad_multiplier: float = 6.0,
+    ) -> None:
+        if bootstrap_timeout_seconds <= 0 or no_progress_timeout_seconds <= 0:
+            raise ValueError("semantic watchdog timeouts must be positive")
+        self.started = started
+        self.bootstrap_timeout_seconds = bootstrap_timeout_seconds
+        self.no_progress_timeout_seconds = no_progress_timeout_seconds
+        self.world_size = world_size
+        self.stage_timeout_seconds = {
+            **DEFAULT_STAGE_TIMEOUT_SECONDS,
+            **(stage_timeout_seconds or {}),
+        }
+        if stage_latency_mad_multiplier < 0:
+            raise ValueError("stage latency MAD multiplier must be non-negative")
+        self.stage_latency_mad_multiplier = stage_latency_mad_multiplier
+        self.last_semantic_monotonic: float | None = None
+        self.ranks: dict[int, _RankProgress] = {}
+        self.semantic_events = 0
+        self._active_stage_starts: dict[tuple[int, str], list[float]] = {}
+        self.stage_duration_seconds: dict[str, list[float]] = {}
+
+    def observe(self, line: str, now: float) -> bool:
+        marker = line.find(PROGRESS_PREFIX)
+        if marker < 0:
+            return False
+        raw = line[marker + len(PROGRESS_PREFIX) :].strip()
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            return False
+        if not isinstance(payload, dict) or payload.get("schema") != "graft-gs-progress-v1":
+            return False
+        try:
+            rank = int(payload["rank"])
+            sequence = int(payload["sequence"])
+            semantic_sequence = int(payload.get("semantic_sequence", 0))
+        except (KeyError, TypeError, ValueError):
+            return False
+        state = self.ranks.setdefault(rank, _RankProgress(rank=rank))
+        if sequence <= state.sequence:
+            return False
+        state.sequence = sequence
+        try:
+            state.pid = int(payload["pid"])
+        except (KeyError, TypeError, ValueError):
+            pass
+        state.semantic_sequence = semantic_sequence
+        state.stage = str(payload.get("stage", "unknown"))
+        state.event = str(payload.get("event", "unknown"))
+        state.last_record_monotonic = now
+        state.context = {
+            name: payload[name]
+            for name in (
+                "phase",
+                "epoch",
+                "global_step",
+                "microstep",
+                "object_ids",
+                "draw_index",
+                "draw_count",
+                "layer_index",
+                "layer_count",
+                "active_charts",
+                "sparse_tokens",
+                "transport_edges",
+                "cuda_allocated_bytes",
+                "cuda_reserved_bytes",
+            )
+            if name in payload
+        }
+        stage = state.stage
+        event = state.event
+        stage_key = (rank, stage)
+        if event == "begin":
+            self._active_stage_starts.setdefault(stage_key, []).append(now)
+        elif event in {"end", "failed"}:
+            starts = self._active_stage_starts.get(stage_key)
+            if starts:
+                duration = max(0.0, now - starts.pop())
+                history = self.stage_duration_seconds.setdefault(stage, [])
+                history.append(duration)
+                if len(history) > 128:
+                    del history[:-128]
+                if not starts:
+                    self._active_stage_starts.pop(stage_key, None)
+        semantic = payload.get("semantic_progress") is True
+        if semantic:
+            state.last_semantic_monotonic = now
+            self.last_semantic_monotonic = now
+            self.semantic_events += 1
+        return semantic
+
+    def _stage_budget(self, stage: str) -> float:
+        matches = [
+            (prefix, seconds)
+            for prefix, seconds in self.stage_timeout_seconds.items()
+            if stage.startswith(prefix)
+        ]
+        minimum = self.no_progress_timeout_seconds
+        if matches:
+            _, minimum = max(matches, key=lambda item: len(item[0]))
+        history = self.stage_duration_seconds.get(stage, [])
+        if len(history) < 3:
+            return float(minimum)
+        ordered = sorted(history)
+        quantile_index = min(
+            len(ordered) - 1,
+            max(0, int(0.99 * len(ordered))),
+        )
+        q99 = ordered[quantile_index]
+        median = statistics.median(ordered)
+        mad = statistics.median(abs(value - median) for value in ordered)
+        robust_budget = q99 + self.stage_latency_mad_multiplier * mad
+        return max(float(minimum), robust_budget)
+
+    def deadline_status(self, now: float) -> tuple[bool, str, float, float]:
+        if self.last_semantic_monotonic is None:
+            elapsed = now - self.started
+            return (
+                elapsed >= self.bootstrap_timeout_seconds,
+                "bootstrap_no_semantic_progress",
+                elapsed,
+                self.bootstrap_timeout_seconds,
+            )
+        elapsed = now - self.last_semantic_monotonic
+        active_budget = max(
+            [self._stage_budget(state.stage) for state in self.ranks.values()]
+            or [self.no_progress_timeout_seconds]
+        )
+        return (
+            elapsed >= active_budget,
+            "stage_no_semantic_progress",
+            elapsed,
+            active_budget,
+        )
+
+    def snapshot(self, now: float) -> dict[str, object]:
+        expired, reason, elapsed, budget = self.deadline_status(now)
+        expected = (
+            list(range(self.world_size)) if self.world_size is not None else []
+        )
+        missing = [rank for rank in expected if rank not in self.ranks]
+        return {
+            "schema": "graft-gs-semantic-watchdog-v1",
+            "expired": expired,
+            "reason": reason,
+            "seconds_since_semantic_progress": elapsed,
+            "active_budget_seconds": budget,
+            "stage_timeout_policy": "max_configured_minimum_q99_plus_mad",
+            "stage_latency_mad_multiplier": self.stage_latency_mad_multiplier,
+            "semantic_events": self.semantic_events,
+            "missing_ranks": missing,
+            "ranks": [
+                {
+                    "rank": state.rank,
+                    "pid": state.pid,
+                    "stage": state.stage,
+                    "event": state.event,
+                    "sequence": state.sequence,
+                    "semantic_sequence": state.semantic_sequence,
+                    "seconds_since_record": (
+                        now - state.last_record_monotonic
+                        if state.last_record_monotonic
+                        else None
+                    ),
+                    "seconds_since_rank_semantic_progress": (
+                        now - state.last_semantic_monotonic
+                        if state.last_semantic_monotonic
+                        else None
+                    ),
+                    **state.context,
+                }
+                for state in sorted(self.ranks.values(), key=lambda item: item.rank)
+            ],
+        }
+
+
+def _parse_stage_timeouts(values: Sequence[str]) -> dict[str, float]:
+    parsed: dict[str, float] = {}
+    for value in values:
+        if "=" not in value:
+            raise ValueError("stage timeout must have the form PREFIX=SECONDS")
+        prefix, raw_seconds = value.rsplit("=", 1)
+        prefix = prefix.strip().rstrip(".")
+        if not prefix:
+            raise ValueError("stage timeout prefix must be non-empty")
+        try:
+            seconds = float(raw_seconds)
+        except ValueError as error:
+            raise ValueError(f"invalid stage timeout {value!r}") from error
+        if seconds <= 0:
+            raise ValueError("stage timeouts must be positive")
+        parsed[prefix] = seconds
+    return parsed
+
+
+def _classify_probe_failure(
+    log_path: Path,
+    *,
+    return_code: int,
+    oom: bool,
+    timed_out: bool,
+) -> str | None:
+    if oom:
+        return "capacity.cuda_oom"
+    if timed_out:
+        return "liveness.no_semantic_progress"
+    if return_code == 0:
+        return None
+    normalized = log_path.read_text(encoding="utf8", errors="replace").lower()
+    for name, markers in (
+        ("numerics.nonfinite", NONFINITE_MARKERS),
+        ("distributed.collective_failure", COLLECTIVE_FAILURE_MARKERS),
+        ("data.contract_failure", DATA_FAILURE_MARKERS),
+        ("model_or_dependency.failure", MODEL_FAILURE_MARKERS),
+    ):
+        if any(marker in normalized for marker in markers):
+            return name
+    if return_code < 0:
+        return "process.signal_failure"
+    return "process.nonzero_exit"
+
+
+def _probe_outcome(
+    *,
+    return_code: int,
+    oom: bool,
+    timed_out: bool,
+    failure_class: str | None,
+) -> str:
+    """Map detailed diagnostics to the stable external candidate contract."""
+
+    if return_code == 0 and not oom and not timed_out:
+        return "SUCCESS"
+    if oom:
+        return "OOM"
+    if timed_out:
+        return "NO_PROGRESS"
+    return {
+        "numerics.nonfinite": "NONFINITE",
+        "distributed.collective_failure": "COLLECTIVE_FAILURE",
+        "data.contract_failure": "DATA_FAILURE",
+        "model_or_dependency.failure": "MODEL_FAILURE",
+        "process.signal_failure": "EXTERNAL_TERMINATION",
+        "process.nonzero_exit": "MODEL_FAILURE",
+    }.get(failure_class, "MODEL_FAILURE")
+
+
+def _runtime_policy_from_training_arguments(
+    arguments: Sequence[str],
+) -> tuple[dict[str, object], dict[str, object]]:
+    configured = _option_value(arguments, "--config")
+    path = (
+        Path(configured)
+        if configured is not None
+        else ROOT / "configs" / "graft_gs_a800_native.yaml"
+    )
+    if not path.is_absolute():
+        path = ROOT / path
+    data = yaml.safe_load(path.read_text(encoding="utf8"))
+    if not isinstance(data, dict):
+        raise ValueError("training configuration root must be a mapping")
+    watchdog = data.get("watchdog", {})
+    autotune = data.get("autotune", {})
+    instrumentation = data.get("instrumentation", {})
+    if (
+        not isinstance(watchdog, dict)
+        or not isinstance(autotune, dict)
+        or not isinstance(instrumentation, dict)
+    ):
+        raise ValueError(
+            "watchdog/autotune/instrumentation sections must be mappings"
+        )
+    if watchdog.get("policy", "semantic_progress") != "semantic_progress":
+        raise ValueError("autotuning requires watchdog.policy=semantic_progress")
+    if (
+        watchdog.get("stage_timeout_policy", "robust_q99_mad")
+        != "robust_q99_mad"
+    ):
+        raise ValueError(
+            "autotuning requires watchdog.stage_timeout_policy=robust_q99_mad"
+        )
+    if instrumentation.get("enabled", True) is not True:
+        raise ValueError("autotuning requires instrumentation.enabled=true")
+    return watchdog, autotune
 
 
 def _validate_candidates(values: Sequence[int]) -> tuple[int, ...]:
@@ -204,11 +571,28 @@ def _run_and_tee(
     environment: dict[str, str],
     timeout_seconds: float,
     termination_grace_seconds: float = 15.0,
+    no_progress_timeout_seconds: float | None = None,
+    world_size: int | None = None,
+    stage_timeout_seconds: dict[str, float] | None = None,
+    stage_latency_mad_multiplier: float = 6.0,
+    control_scope: str = "probe",
 ) -> tuple[int, bool, bool]:
-    """Run one isolated process group and terminate all ranks on OOM/timeout."""
+    """Run one isolated group; bound bootstrap/stalls, never total wall time."""
 
     if timeout_seconds <= 0 or termination_grace_seconds <= 0:
         raise ValueError("probe timeout and termination grace must be positive")
+    if control_scope not in {"probe", "training"}:
+        raise ValueError("control_scope must be 'probe' or 'training'")
+    control_prefix = (
+        "GRAFT_GS_AUTOTUNE_PROBE_CONTROL"
+        if control_scope == "probe"
+        else "GRAFT_GS_TRAINING_SUPERVISOR_CONTROL"
+    )
+    timeout_prefix = (
+        "GRAFT_GS_AUTOTUNE_PROGRESS_TIMEOUT"
+        if control_scope == "probe"
+        else "GRAFT_GS_TRAINING_PROGRESS_TIMEOUT"
+    )
     with log_path.open("w", encoding="utf8") as log:
         process = subprocess.Popen(
             list(command),
@@ -236,14 +620,35 @@ def _run_and_tee(
         timed_out = False
         output_closed = False
         started = time.monotonic()
+        monitor = SemanticProgressMonitor(
+            started=started,
+            bootstrap_timeout_seconds=timeout_seconds,
+            no_progress_timeout_seconds=(
+                timeout_seconds
+                if no_progress_timeout_seconds is None
+                else no_progress_timeout_seconds
+            ),
+            world_size=world_size,
+            stage_timeout_seconds=stage_timeout_seconds,
+            stage_latency_mad_multiplier=stage_latency_mad_multiplier,
+        )
         termination_started: float | None = None
         forced_kill = False
 
-        def emit_control(reason: str, action: str) -> None:
+        def emit_control(
+            reason: str,
+            action: str,
+            details: dict[str, object] | None = None,
+        ) -> None:
             line = (
-                "GRAFT_GS_AUTOTUNE_PROBE_CONTROL "
+                control_prefix
+                + " "
                 + json.dumps(
-                    {"action": action, "reason": reason},
+                    {
+                        "action": action,
+                        "reason": reason,
+                        **({"details": details} if details is not None else {}),
+                    },
                     sort_keys=True,
                 )
                 + "\n"
@@ -253,12 +658,15 @@ def _run_and_tee(
             log.write(line)
             log.flush()
 
-        def terminate_group(reason: str) -> None:
+        def terminate_group(
+            reason: str,
+            details: dict[str, object] | None = None,
+        ) -> None:
             nonlocal termination_started
             if termination_started is not None:
                 return
             termination_started = time.monotonic()
-            emit_control(reason, "SIGTERM_PROCESS_GROUP")
+            emit_control(reason, "SIGTERM_PROCESS_GROUP", details)
             try:
                 os.killpg(process.pid, signal.SIGTERM)
             except ProcessLookupError:
@@ -277,19 +685,52 @@ def _run_and_tee(
                     sys.stdout.flush()
                     log.write(line)
                     log.flush()
+                    monitor.observe(line, time.monotonic())
                     normalized = line.lower()
                     if any(marker in normalized for marker in OOM_MARKERS):
                         oom = True
                         terminate_group("cuda_allocation_failure")
 
                 now = time.monotonic()
-                if (
-                    not timed_out
-                    and termination_started is None
-                    and now - started >= timeout_seconds
-                ):
+                expired, timeout_reason, _, _ = monitor.deadline_status(now)
+                if not timed_out and termination_started is None and expired:
                     timed_out = True
-                    terminate_group("probe_timeout")
+                    snapshot = monitor.snapshot(now)
+                    diagnostic = (
+                        timeout_prefix
+                        + " "
+                        + json.dumps(snapshot, sort_keys=True)
+                        + "\n"
+                    )
+                    sys.stdout.write(diagnostic)
+                    sys.stdout.flush()
+                    log.write(diagnostic)
+                    log.flush()
+                    worker_pids = sorted(
+                        {
+                            state.pid
+                            for state in monitor.ranks.values()
+                            if state.pid is not None
+                        }
+                    )
+                    if worker_pids:
+                        emit_control(
+                            timeout_reason,
+                            "SIGUSR2_WORKER_STACK_DUMP",
+                            {"worker_pids": worker_pids},
+                        )
+                        for worker_pid in worker_pids:
+                            try:
+                                os.kill(worker_pid, signal.SIGUSR2)
+                            except ProcessLookupError:
+                                pass
+                        # Let faulthandler write through the already-drained
+                        # output pipe before terminating the complete group.
+                        time.sleep(0.25)
+                    terminate_group(
+                        f"probe_timeout_{timeout_reason}",
+                        snapshot,
+                    )
                 if (
                     termination_started is not None
                     and not forced_kill
@@ -366,10 +807,60 @@ def main() -> None:
     )
     parser.add_argument("--throughput-fraction", type=float, default=0.97)
     parser.add_argument(
+        "--maximum-throughput-cv",
+        type=float,
+        help="maximum steady-state step-throughput coefficient of variation",
+    )
+    parser.add_argument(
+        "--maximum-rank-step-time-ratio",
+        type=float,
+        help="maximum slowest/fastest rank step-time ratio",
+    )
+    parser.add_argument(
+        "--probe-warmup-steps",
+        type=int,
+        help="optimizer steps excluded from throughput (defaults to config)",
+    )
+    parser.add_argument(
+        "--probe-measurement-steps",
+        type=int,
+        help="optimizer steps included in throughput (defaults to config)",
+    )
+    parser.add_argument(
+        "--probe-trellis-cache-scope",
+        choices=("candidate", "shared"),
+        help=(
+            "candidate preserves fair cold/mixed-cache timing; shared reuses "
+            "exact priors across candidates (defaults to config)"
+        ),
+    )
+    parser.add_argument(
         "--probe-timeout-seconds",
         type=float,
-        default=1800.0,
-        help="terminate the complete candidate process group after this wall time",
+        help=(
+            "backward-compatible bootstrap bound before the first semantic "
+            "progress record; defaults to config and is not a total wall limit"
+        ),
+    )
+    parser.add_argument(
+        "--probe-no-progress-timeout-seconds",
+        type=float,
+        help="fallback no-progress bound (defaults to config)",
+    )
+    parser.add_argument(
+        "--stage-timeout",
+        action="append",
+        default=[],
+        metavar="PREFIX=SECONDS",
+        help=(
+            "override a semantic stage no-progress budget; may be repeated, "
+            "and the longest matching stage prefix wins"
+        ),
+    )
+    parser.add_argument(
+        "--termination-grace-seconds",
+        type=float,
+        help="SIGTERM-to-SIGKILL grace period (defaults to config)",
     )
     parser.add_argument(
         "--continue-after-oom",
@@ -406,7 +897,52 @@ def main() -> None:
         train_arguments.pop(0)
     if not train_arguments:
         raise ValueError("train_a800.py arguments must follow --")
-    forbidden = {"--object-batch-size", "--batch-probe"}
+    watchdog_config, autotune_config = _runtime_policy_from_training_arguments(
+        train_arguments
+    )
+    if args.probe_timeout_seconds is None:
+        args.probe_timeout_seconds = float(
+            watchdog_config.get("bootstrap_timeout_seconds", 1800.0)
+        )
+    if args.probe_no_progress_timeout_seconds is None:
+        args.probe_no_progress_timeout_seconds = float(
+            watchdog_config.get("no_progress_timeout_seconds", 900.0)
+        )
+    if args.probe_warmup_steps is None:
+        args.probe_warmup_steps = int(
+            autotune_config.get("warmup_optimizer_steps", 1)
+        )
+    if args.probe_measurement_steps is None:
+        args.probe_measurement_steps = int(
+            autotune_config.get("measurement_optimizer_steps", 2)
+        )
+    if args.probe_trellis_cache_scope is None:
+        args.probe_trellis_cache_scope = str(
+            autotune_config.get("probe_trellis_cache_scope", "candidate")
+        )
+    if args.probe_trellis_cache_scope not in {"candidate", "shared"}:
+        raise ValueError("autotune probe TRELLIS cache scope is invalid")
+    if args.maximum_throughput_cv is None:
+        args.maximum_throughput_cv = float(
+            autotune_config.get("maximum_throughput_cv", 0.25)
+        )
+    if args.maximum_rank_step_time_ratio is None:
+        args.maximum_rank_step_time_ratio = float(
+            autotune_config.get("maximum_rank_step_time_ratio", 3.0)
+        )
+    if args.termination_grace_seconds is None:
+        args.termination_grace_seconds = float(
+            watchdog_config.get("termination_grace_seconds", 15.0)
+        )
+    stage_latency_mad_multiplier = float(
+        watchdog_config.get("stage_latency_mad_multiplier", 6.0)
+    )
+    forbidden = {
+        "--object-batch-size",
+        "--batch-probe",
+        "--batch-probe-warmup-steps",
+        "--batch-probe-measurement-steps",
+    }
     if any(
         argument in forbidden
         or any(argument.startswith(option + "=") for option in forbidden)
@@ -415,8 +951,33 @@ def main() -> None:
         raise ValueError(
             "the autotuner owns --object-batch-size and --batch-probe"
         )
-    if args.probe_timeout_seconds <= 0:
-        raise ValueError("--probe-timeout-seconds must be positive")
+    if (
+        args.probe_timeout_seconds <= 0
+        or args.probe_no_progress_timeout_seconds <= 0
+        or args.termination_grace_seconds <= 0
+        or stage_latency_mad_multiplier < 0
+    ):
+        raise ValueError("probe watchdog timeouts must be positive")
+    if args.probe_warmup_steps < 0 or args.probe_measurement_steps < 1:
+        raise ValueError("probe warmup/measurement step counts are invalid")
+    if (
+        args.maximum_throughput_cv < 0
+        or args.maximum_rank_step_time_ratio < 1
+    ):
+        raise ValueError("probe stability thresholds are outside their domains")
+    configured_stage_timeouts = watchdog_config.get(
+        "stage_timeout_seconds",
+        {},
+    )
+    if not isinstance(configured_stage_timeouts, dict):
+        raise ValueError("watchdog.stage_timeout_seconds must be a mapping")
+    stage_timeouts = {
+        str(prefix): float(seconds)
+        for prefix, seconds in configured_stage_timeouts.items()
+    }
+    if any(seconds <= 0 for seconds in stage_timeouts.values()):
+        raise ValueError("configured stage timeouts must be positive")
+    stage_timeouts.update(_parse_stage_timeouts(args.stage_timeout))
     production_batch_policy = _training_batch_policy(train_arguments)
     probe_train_arguments = _single_microbatch_probe_arguments(train_arguments)
     if not Path(args.python).is_file():
@@ -426,6 +987,25 @@ def main() -> None:
     ):
         raise FileExistsError("autotune output directory must be fresh")
     args.output.mkdir(parents=True, exist_ok=True)
+    configured_trellis_cache = _option_value(
+        train_arguments,
+        "--trellis-cache-directory",
+    )
+    probe_trellis_cache_root = (
+        Path(configured_trellis_cache).expanduser().resolve()
+        if configured_trellis_cache is not None
+        else (args.output / "trellis_exact_cache").resolve()
+    )
+    production_trellis_cache = (
+        probe_trellis_cache_root
+        if configured_trellis_cache is not None
+        else (args.output / "production_trellis_exact_cache").resolve()
+    )
+    effective_probe_cache_scope = (
+        "explicit"
+        if configured_trellis_cache is not None
+        else args.probe_trellis_cache_scope
+    )
 
     environment, selected_gpus = _gpu_environment(args.gpus)
     subprocess.run(
@@ -475,16 +1055,31 @@ def main() -> None:
     for candidate_index, batch_size in enumerate(candidates):
         run_directory = args.output / f"batch-{batch_size:03d}"
         run_directory.mkdir()
+        candidate_trellis_cache = (
+            probe_trellis_cache_root
+            if effective_probe_cache_scope in {"shared", "explicit"}
+            else probe_trellis_cache_root / f"batch-{batch_size:03d}"
+        )
+        candidate_cache_arguments = (
+            []
+            if configured_trellis_cache is not None
+            else ["--trellis-cache-directory", str(candidate_trellis_cache)]
+        )
         probe_path = run_directory / "probe.json"
         command = _torchrun_command(
             args.python,
             world_size,
             [
                 *probe_train_arguments,
+                *candidate_cache_arguments,
                 "--object-batch-size",
                 str(batch_size),
                 "--batch-probe",
                 str(probe_path),
+                "--batch-probe-warmup-steps",
+                str(args.probe_warmup_steps),
+                "--batch-probe-measurement-steps",
+                str(args.probe_measurement_steps),
                 "--output",
                 str(run_directory / "training"),
             ],
@@ -516,7 +1111,25 @@ def main() -> None:
                 {
                     "object_batch_size": batch_size,
                     "probe_gradient_accumulation_steps": 1,
-                    "timeout_seconds": args.probe_timeout_seconds,
+                    "probe_warmup_optimizer_steps": args.probe_warmup_steps,
+                    "probe_measurement_optimizer_steps": (
+                        args.probe_measurement_steps
+                    ),
+                    "maximum_throughput_cv": args.maximum_throughput_cv,
+                    "maximum_rank_step_time_ratio": (
+                        args.maximum_rank_step_time_ratio
+                    ),
+                    "trellis_cache_scope": effective_probe_cache_scope,
+                    "trellis_cache_directory": str(candidate_trellis_cache),
+                    "bootstrap_timeout_seconds": args.probe_timeout_seconds,
+                    "no_progress_timeout_seconds": (
+                        args.probe_no_progress_timeout_seconds
+                    ),
+                    "stage_timeout_seconds": {
+                        **DEFAULT_STAGE_TIMEOUT_SECONDS,
+                        **stage_timeouts,
+                    },
+                    "stage_latency_mad_multiplier": stage_latency_mad_multiplier,
                 },
                 sort_keys=True,
             ),
@@ -528,6 +1141,13 @@ def main() -> None:
             run_directory / "run.log",
             environment,
             args.probe_timeout_seconds,
+            termination_grace_seconds=args.termination_grace_seconds,
+            no_progress_timeout_seconds=(
+                args.probe_no_progress_timeout_seconds
+            ),
+            world_size=world_size,
+            stage_timeout_seconds=stage_timeouts,
+            stage_latency_mad_multiplier=stage_latency_mad_multiplier,
         )
         probe = (
             json.loads(probe_path.read_text(encoding="utf8"))
@@ -535,13 +1155,26 @@ def main() -> None:
             else None
         )
         reasons: list[str] = []
+        failure_class = _classify_probe_failure(
+            run_directory / "run.log",
+            return_code=return_code,
+            oom=oom,
+            timed_out=timed_out,
+        )
+        outcome = _probe_outcome(
+            return_code=return_code,
+            oom=oom,
+            timed_out=timed_out,
+            failure_class=failure_class,
+        )
         if return_code != 0:
             reasons.append(f"probe exited with status {return_code}")
         if oom:
             reasons.append("CUDA allocation failure")
         if timed_out:
             reasons.append(
-                f"probe exceeded {args.probe_timeout_seconds:g} seconds"
+                "probe stopped making semantic stage progress; inspect the "
+                "rank-state timeout record in run.log"
             )
         if isinstance(probe, dict):
             if (
@@ -566,6 +1199,18 @@ def main() -> None:
                 < args.minimum_driver_free_fraction
             ):
                 reasons.append("driver-free-memory headroom failed")
+            if (
+                float(
+                    probe["measurement_throughput_coefficient_of_variation"]
+                )
+                > args.maximum_throughput_cv
+            ):
+                reasons.append("steady-state throughput stability failed")
+            if (
+                float(probe["maximum_rank_step_time_ratio"])
+                > args.maximum_rank_step_time_ratio
+            ):
+                reasons.append("cross-rank step-time balance failed")
         else:
             reasons.append("probe report is unavailable")
         record = {
@@ -573,6 +1218,8 @@ def main() -> None:
             "return_code": return_code,
             "oom": oom,
             "timed_out": timed_out,
+            "failure_class": failure_class,
+            "outcome": outcome,
             "seconds": time.perf_counter() - started,
             "probe": probe,
             "admissible": not reasons,
@@ -592,6 +1239,8 @@ def main() -> None:
                     "reasons": reasons,
                     "return_code": return_code,
                     "timed_out": timed_out,
+                    "failure_class": failure_class,
+                    "outcome": outcome,
                 },
                 sort_keys=True,
             ),
@@ -601,7 +1250,9 @@ def main() -> None:
         if oom and not args.continue_after_oom:
             stop_reason = "skipped after smaller physical batch exhausted CUDA memory"
         elif timed_out:
-            stop_reason = "skipped after smaller physical batch exceeded probe timeout"
+            stop_reason = (
+                "skipped after smaller physical batch stopped making semantic progress"
+            )
         if stop_reason is not None:
             for skipped_batch in candidates[candidate_index + 1 :]:
                 runs.append(
@@ -625,9 +1276,13 @@ def main() -> None:
         summary_path.write_text(
             json.dumps(
                 {
-                    "schema": "graft-gs-object-batch-selection-v2",
+                    "schema": "graft-gs-object-batch-selection-v3",
                     "selected_object_batch_size": None,
-                    "probe_policy": "single_microbatch_optimizer_step",
+                    "probe_policy": "isolated_warmup_and_steady_state_measurement",
+                    "probe_warmup_optimizer_steps": args.probe_warmup_steps,
+                    "probe_measurement_optimizer_steps": (
+                        args.probe_measurement_steps
+                    ),
                     "production_batch_policy": production_batch_policy,
                     "runs": runs,
                 },
@@ -658,6 +1313,14 @@ def main() -> None:
         world_size,
         [
             *train_arguments,
+            *(
+                []
+                if configured_trellis_cache is not None
+                else [
+                    "--trellis-cache-directory",
+                    str(production_trellis_cache),
+                ]
+            ),
             "--object-batch-size",
             str(selected_batch),
         ],
@@ -666,13 +1329,38 @@ def main() -> None:
     selection_path.write_text(
         json.dumps(
             {
-                "schema": "graft-gs-object-batch-selection-v2",
+                "schema": "graft-gs-object-batch-selection-v3",
                 "cuda_visible_devices": selected_gpus,
                 "world_size": world_size,
                 "selected_object_batch_size": selected_batch,
                 "throughput_fraction": args.throughput_fraction,
-                "probe_policy": "single_microbatch_optimizer_step",
+                "maximum_throughput_cv": args.maximum_throughput_cv,
+                "maximum_rank_step_time_ratio": (
+                    args.maximum_rank_step_time_ratio
+                ),
+                "probe_policy": "isolated_warmup_and_steady_state_measurement",
+                "probe_warmup_optimizer_steps": args.probe_warmup_steps,
+                "probe_measurement_optimizer_steps": (
+                    args.probe_measurement_steps
+                ),
                 "production_batch_policy": production_batch_policy,
+                "probe_trellis_cache_scope": effective_probe_cache_scope,
+                "probe_trellis_cache_root": str(probe_trellis_cache_root),
+                "production_trellis_cache_directory": str(
+                    production_trellis_cache
+                ),
+                "watchdog": {
+                    "policy": "semantic_progress",
+                    "bootstrap_timeout_seconds": args.probe_timeout_seconds,
+                    "no_progress_timeout_seconds": (
+                        args.probe_no_progress_timeout_seconds
+                    ),
+                    "stage_timeout_seconds": {
+                        **DEFAULT_STAGE_TIMEOUT_SECONDS,
+                        **stage_timeouts,
+                    },
+                    "stage_latency_mad_multiplier": stage_latency_mad_multiplier,
+                },
                 "launch_command": launch_command,
                 "runs": runs,
             },
@@ -697,14 +1385,46 @@ def main() -> None:
         )
     )
     if args.launch:
-        raise SystemExit(
-            subprocess.run(
-                launch_command,
-                cwd=ROOT,
-                env=environment,
-                check=False,
-            ).returncode
+        launch_started = time.perf_counter()
+        launch_return_code, launch_oom, launch_timed_out = _run_and_tee(
+            launch_command,
+            args.output / "production.log",
+            environment,
+            args.probe_timeout_seconds,
+            termination_grace_seconds=args.termination_grace_seconds,
+            no_progress_timeout_seconds=(
+                args.probe_no_progress_timeout_seconds
+            ),
+            world_size=world_size,
+            stage_timeout_seconds=stage_timeouts,
+            stage_latency_mad_multiplier=stage_latency_mad_multiplier,
+            control_scope="training",
         )
+        launch_result = {
+            "schema": "graft-gs-supervised-training-launch-v1",
+            "return_code": launch_return_code,
+            "oom": launch_oom,
+            "timed_out": launch_timed_out,
+            "failure_class": _classify_probe_failure(
+                args.output / "production.log",
+                return_code=launch_return_code,
+                oom=launch_oom,
+                timed_out=launch_timed_out,
+            ),
+            "seconds": time.perf_counter() - launch_started,
+            "command": launch_command,
+        }
+        launch_result["outcome"] = _probe_outcome(
+            return_code=launch_return_code,
+            oom=launch_oom,
+            timed_out=launch_timed_out,
+            failure_class=launch_result["failure_class"],
+        )
+        (args.output / "launch_result.json").write_text(
+            json.dumps(launch_result, indent=2, sort_keys=True) + "\n",
+            encoding="utf8",
+        )
+        raise SystemExit(launch_return_code)
 
 
 if __name__ == "__main__":
