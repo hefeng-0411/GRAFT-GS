@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from dataclasses import asdict, dataclass
+from copy import deepcopy
+from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
 from typing import Any, Mapping
 
@@ -11,6 +12,99 @@ import torch
 from ..integration.pipeline import GraftGS
 from ..optimization.quantization import QuantizationConfig, apply_equivariant_qat
 from .precision import NativePrecisionPolicy
+
+
+# These fields change execution scheduling only. They create no parameter,
+# buffer, tensor shape, or mathematical operator and are therefore permitted to
+# differ across phase initialization, exact resume, and inference loading.
+MODEL_EXECUTION_POLICY_PATHS = frozenset(
+    {
+        "attention.activation_checkpointing",
+    }
+)
+
+
+def _model_config_mapping(config: object) -> dict[str, object]:
+    if is_dataclass(config) and not isinstance(config, type):
+        value = asdict(config)
+    elif isinstance(config, Mapping):
+        value = deepcopy(dict(config))
+    else:
+        raise TypeError("model configuration must be a dataclass or mapping")
+    return value
+
+
+def _flatten_model_config(
+    value: object,
+    prefix: str = "",
+) -> dict[str, object]:
+    if isinstance(value, Mapping):
+        flattened: dict[str, object] = {}
+        for key in sorted(value, key=str):
+            path = f"{prefix}.{key}" if prefix else str(key)
+            flattened.update(_flatten_model_config(value[key], path))
+        return flattened
+    return {prefix: value}
+
+
+def model_config_differences(
+    checkpoint_config: object,
+    current_config: object,
+    *,
+    include_execution_policy: bool = False,
+) -> tuple[dict[str, object], ...]:
+    """Return path-level configuration differences with missing-value provenance."""
+
+    checkpoint = _flatten_model_config(_model_config_mapping(checkpoint_config))
+    current = _flatten_model_config(_model_config_mapping(current_config))
+    records: list[dict[str, object]] = []
+    for path in sorted(set(checkpoint) | set(current)):
+        if not include_execution_policy and path in MODEL_EXECUTION_POLICY_PATHS:
+            continue
+        checkpoint_present = path in checkpoint
+        current_present = path in current
+        if checkpoint_present and current_present and checkpoint[path] == current[path]:
+            continue
+        records.append(
+            {
+                "path": path,
+                "checkpoint_present": checkpoint_present,
+                "checkpoint_value": checkpoint.get(path),
+                "current_present": current_present,
+                "current_value": current.get(path),
+                "execution_policy": path in MODEL_EXECUTION_POLICY_PATHS,
+            }
+        )
+    return tuple(records)
+
+
+def validate_model_config_compatibility(
+    checkpoint_config: object,
+    current_config: object,
+    *,
+    context: str,
+) -> tuple[dict[str, object], ...]:
+    """Reject architectural drift while returning ignored execution differences."""
+
+    architecture = model_config_differences(checkpoint_config, current_config)
+    if architecture:
+        summary = "; ".join(
+            f"{record['path']}: checkpoint={record['checkpoint_value']!r}, "
+            f"current={record['current_value']!r}"
+            for record in architecture[:12]
+        )
+        if len(architecture) > 12:
+            summary += f"; ... and {len(architecture) - 12} more"
+        raise ValueError(f"{context} uses an incompatible model architecture: {summary}")
+    return tuple(
+        record
+        for record in model_config_differences(
+            checkpoint_config,
+            current_config,
+            include_execution_policy=True,
+        )
+        if bool(record["execution_policy"])
+    )
 
 
 @dataclass(frozen=True)
@@ -65,11 +159,11 @@ def load_graft_checkpoint(
     if phase is None and any(".parametrizations.weight.0.a" in key for key in state_value):
         raise ValueError("raw LoRA state dictionaries require checkpoint phase metadata")
     if validate_model_config and "model_config" in payload:
-        expected = asdict(model.config)
-        if payload["model_config"] != expected:
-            raise ValueError(
-                "checkpoint model_config differs from the instantiated GRAFT-GS architecture"
-            )
+        validate_model_config_compatibility(
+            payload["model_config"],
+            model.config,
+            context="checkpoint",
+        )
     lora_modules, qat_modules = prepare_model_for_checkpoint(model, phase)
     incompatible = model.load_state_dict(state_value, strict=strict)
     report = CheckpointLoadReport(
@@ -157,8 +251,11 @@ def validate_precision_policy(
 
 __all__ = [
     "CheckpointLoadReport",
+    "MODEL_EXECUTION_POLICY_PATHS",
     "load_graft_checkpoint",
+    "model_config_differences",
     "prepare_model_for_checkpoint",
+    "validate_model_config_compatibility",
     "validate_precision_policy",
     "validate_trellis_prior_policy",
 ]

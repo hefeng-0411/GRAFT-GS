@@ -46,6 +46,7 @@ from .losses import (
     distillation_loss,
     view_conditioned_objectives,
 )
+from .checkpoints import validate_model_config_compatibility
 from .precision import NativePrecisionPolicy
 
 
@@ -2614,8 +2615,19 @@ class GraftGSTrainer:
             raise ValueError("unsupported checkpoint format")
         if payload["phase"] != self.config.phase.value:
             raise ValueError("checkpoint phase does not match the configured trainer phase")
-        if "model_config" in payload and payload["model_config"] != asdict(self.module.config):
-            raise ValueError("checkpoint model configuration does not match the trainer model")
+        ignored_model_execution_policy: tuple[dict[str, object], ...] = ()
+        if "model_config" in payload:
+            ignored_model_execution_policy = validate_model_config_compatibility(
+                payload["model_config"],
+                self.module.config,
+                context="resume checkpoint",
+            )
+            if ignored_model_execution_policy:
+                self.progress.event(
+                    "checkpoint.resume",
+                    "execution_policy_override",
+                    differences=list(ignored_model_execution_policy),
+                )
         if format_version >= 4 and payload.get("loss_weights") != asdict(self.loss.weights):
             raise ValueError("checkpoint loss weights do not match the configured objective")
         if format_version >= 6 and payload.get("precision_runtime") != self.precision_record:
@@ -2771,9 +2783,19 @@ class GraftGSTrainer:
         """Initialize a new training phase from the preceding phase checkpoint."""
 
         payload = torch.load(path, map_location=self.context.device, weights_only=False)
+        ignored_model_execution_policy: tuple[dict[str, object], ...] = ()
         if isinstance(payload, Mapping) and "model_config" in payload:
-            if payload["model_config"] != asdict(self.module.config):
-                raise ValueError("phase initialization checkpoint uses a different model configuration")
+            ignored_model_execution_policy = validate_model_config_compatibility(
+                payload["model_config"],
+                self.module.config,
+                context="phase initialization checkpoint",
+            )
+            if ignored_model_execution_policy:
+                self.progress.event(
+                    "checkpoint.phase_initialize",
+                    "execution_policy_override",
+                    differences=list(ignored_model_execution_policy),
+                )
         source_trainer = payload.get("trainer_config", {}) if isinstance(payload, Mapping) else {}
         if isinstance(source_trainer, Mapping):
             precision_fields = (
@@ -2833,6 +2855,9 @@ class GraftGSTrainer:
                 "source": str(path),
                 "missing_keys": incompatible.missing_keys,
                 "unexpected_keys": incompatible.unexpected_keys,
+                "ignored_model_execution_policy": list(
+                    ignored_model_execution_policy
+                ),
             }
             with self.log_path.open("a", encoding="utf8") as file:
                 file.write(

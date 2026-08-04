@@ -118,6 +118,14 @@ bash scripts/launch_a800_6gpu.sh /data/MeshFleet_TRELLIS E 50000 --manifest data
 bash scripts/launch_a800_6gpu.sh /data/MeshFleet_TRELLIS F 30000 --manifest data_manifests/meshfleet_server.jsonl --split train --trellis-checkpoint "$TRELLIS_CHECKPOINT" --initialize-from outputs/phase_e/final.pt --output outputs/phase_f
 ```
 
+The complete current-revision procedure—including old-checkpoint compatibility,
+batch-8 probes, phase-specific tuning, exact resume, inference, and corpus
+evaluation—is in
+[`docs/TRAINING_AND_TESTING_TUTORIAL.md`](docs/TRAINING_AND_TESTING_TUTORIAL.md).
+Before discarding a pre-OOM Phase A checkpoint, run
+`scripts/inspect_checkpoint_compatibility.py`; activation checkpointing is an
+execution policy and does not by itself require Phase A retraining.
+
 The runtime stage boundary is explicit: A stops after calibrated evidence, B
 stops after atlas/topology/readout and never runs the flow, C runs constrained
 flow matching but does not build/render assets, and D--F execute the complete

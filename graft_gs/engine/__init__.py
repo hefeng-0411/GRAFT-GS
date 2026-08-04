@@ -11,8 +11,11 @@ from .trainer import (
 from .supervision import SurfaceTargetConfig, derive_feasible_surface_target
 from .checkpoints import (
     CheckpointLoadReport,
+    MODEL_EXECUTION_POLICY_PATHS,
     load_graft_checkpoint,
+    model_config_differences,
     prepare_model_for_checkpoint,
+    validate_model_config_compatibility,
     validate_precision_policy,
     validate_trellis_prior_policy,
 )
@@ -38,6 +41,7 @@ __all__ = [
     "assert_local_cuda_allocator_ownership",
     "bind_local_cuda_device",
     "CheckpointLoadReport",
+    "MODEL_EXECUTION_POLICY_PATHS",
     "GraftGSTrainer",
     "SurfaceTargetConfig",
     "TrainerConfig",
@@ -56,7 +60,9 @@ __all__ = [
     "load_teacher_bundle",
     "load_server_config",
     "load_trellis_prior_config",
+    "model_config_differences",
     "prepare_model_for_checkpoint",
+    "validate_model_config_compatibility",
     "validate_precision_policy",
     "validate_trellis_prior_policy",
 ]
