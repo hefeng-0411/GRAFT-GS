@@ -117,6 +117,11 @@ model:
   minimum_evidence_variance: 1.0e-6
   maximum_evidence_variance: 0.25
   encoder_layers: 4
+  # Recompute each pure sparse gauge-attention layer during backward. Effective
+  # spectrally normalized weights are captured per object, so recomputation is
+  # value/gradient equivalent even after later batch objects advance the power
+  # iteration buffers. This bounds retained E*C activations across depth.
+  gsta_activation_checkpointing: true
   attention_heads: 4
   flow_layers: 8
   flow_steps: 8

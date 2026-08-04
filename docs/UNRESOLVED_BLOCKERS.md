@@ -402,8 +402,14 @@ checkpoints, data, or a compiled server dependency.
 - GSTA now shares the exact target scalar gather across its three coupling
   paths and broadcasts head attention over multiplicities without materialized
   `repeat_interleave` tensors. Forward values, reduction order, precision, and
-  the training objective are unchanged; the remote numerical suite and fresh
-  A6000/A100 probes remain the external validation boundary.
+  the training objective are unchanged. Protocol 9 additionally checkpoints
+  the deterministic prepared-edge kernel using per-forward effective spectral
+  weights and evaluates normalized inner products without normalized edge
+  copies. The 8,192-vertex/four-layer audit reduces autograd-retained storage
+  from 580,188,592 to 20,434,064 bytes with zero output/gradient relative-L2
+  error. Fresh A6000/A100 allocator probes and the batch-8 soak remain the
+  external validation boundary because this container currently exposes no
+  NVIDIA device.
 
 ## 2026-08-02 legacy probe-timeout resolution
 

@@ -528,6 +528,10 @@ class GraftGS(nn.Module):
                         edge_ot_cost=edge_ot_cost,
                         edge_uncertainty=edge_uncertainty,
                     )
+                    self._record_cuda_memory_stage(
+                        f"scene_{batch_index}/attention_layer_{layer_index}",
+                        images.device,
+                    )
                     if encoder_activations is not None:
                         encoder_activations.append(fields)
                     self._progress_event(

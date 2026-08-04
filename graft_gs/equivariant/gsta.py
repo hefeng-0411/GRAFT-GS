@@ -18,8 +18,8 @@ from math import sqrt
 from typing import Optional, Tuple
 
 import torch
-import torch.nn.functional as F
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from ..geometry.atlas import PersistentOctreeAtlas
 
@@ -39,6 +39,7 @@ class GSTAConfig:
     uncertainty_bias_weight: float = 0.25
     residual_step: float = 0.1
     epsilon: float = 1.0e-8
+    activation_checkpointing: bool = False
 
     def __post_init__(self) -> None:
         if self.heads < 1:
@@ -62,6 +63,8 @@ class GSTAConfig:
             raise ValueError("attention residual step must be non-negative")
         if self.ot_bias_weight < 0 or self.uncertainty_bias_weight < 0:
             raise ValueError("transport and uncertainty penalties must be non-negative")
+        if not isinstance(self.activation_checkpointing, bool):
+            raise TypeError("GSTA activation_checkpointing must be Boolean")
 
 
 @dataclass
@@ -154,11 +157,32 @@ def segment_softmax(logits: Tensor, index: Tensor, size: int) -> Tensor:
     return exponential / denominator[index].clamp_min(torch.finfo(logits.dtype).tiny)
 
 
+def normalized_inner_product(left: Tensor, right: Tensor, epsilon: float) -> Tensor:
+    """Return the exact cosine numerator/denominator without normalized copies.
+
+    ``F.normalize(left) * F.normalize(right)`` materializes two tensors with
+    the complete edge/channel cardinality before their reduction.  The
+    algebraically identical quotient below lets einsum fuse the dot-product
+    reduction and retains only per-edge norms.  It deliberately does not use
+    ``out=`` or mutate an autograd input.
+    """
+
+    if left.shape != right.shape or left.ndim < 1:
+        raise ValueError("normalized inner-product operands must share a shape")
+    if epsilon <= 0:
+        raise ValueError("normalized inner-product epsilon must be positive")
+    numerator = torch.einsum("...d,...d->...", left, right)
+    left_norm = torch.linalg.vector_norm(left, dim=-1).clamp_min(epsilon)
+    right_norm = torch.linalg.vector_norm(right, dim=-1).clamp_min(epsilon)
+    return numerator / (left_norm * right_norm)
+
+
 class MultiplicityLinear(nn.Module):
     """Linear map on multiplicities only; magnetic components are untouched."""
 
     def __init__(self, channels: int) -> None:
         super().__init__()
+        self.channels = channels
         self.weight = nn.Parameter(torch.eye(channels))
         # Plain scalar policy, intentionally not checkpoint state: the value is
         # reconstructed from the phase/model configuration while the spectral
@@ -171,7 +195,20 @@ class MultiplicityLinear(nn.Module):
         self.operator_scale = float(value)
 
     def forward(self, value: Tensor) -> Tensor:
-        return self.operator_scale * torch.einsum("oi,vi...->vo...", self.weight, value)
+        return self.forward_with_weight(value, self.weight)
+
+    def forward_with_weight(self, value: Tensor, weight: Tensor) -> Tensor:
+        """Apply one already-resolved effective multiplicity weight.
+
+        The pipeline parametrizes ``weight`` with spectral normalization.  A
+        checkpoint recomputation must reuse the effective weight from the
+        original forward, because the parametrization's power-iteration
+        buffers can advance again for later objects before backward starts.
+        """
+
+        if weight.shape != (self.channels, self.channels):
+            raise ValueError("effective multiplicity weight has an invalid shape")
+        return self.operator_scale * torch.einsum("oi,vi...->vo...", weight, value)
 
 
 class CompactRadialBasis(nn.Module):
@@ -262,9 +299,23 @@ class GaugeCovariantSparseTransportAttention(nn.Module):
         centers: Optional[Tensor] = None,
         frames: Optional[Tensor] = None,
     ) -> IrrepTensor:
+        """Apply sparse gauge attention with optional exact recomputation.
+
+        The discrete graph is prepared once outside the checkpoint.  All
+        differentiable geometric tensors and the effective spectrally
+        normalized weights are explicit checkpoint inputs, so backward
+        reconstructs the same numerical function even when this layer has
+        processed later objects before recomputation begins.
+        """
+
         cfg = self.config
         if isinstance(fields, Tensor):
-            fields = IrrepTensor.from_packed(fields, cfg.scalar_channels, cfg.vector_channels, cfg.tensor_channels)
+            fields = IrrepTensor.from_packed(
+                fields,
+                cfg.scalar_channels,
+                cfg.vector_channels,
+                cfg.tensor_channels,
+            )
         if node_index is None:
             edge, active = active_adjacency(atlas)
         else:
@@ -279,7 +330,6 @@ class GaugeCovariantSparseTransportAttention(nn.Module):
             edge = torch.cat((forward_edge, reverse_edge, torch.stack((self_index, self_index))), dim=1)
             linear = torch.unique(edge[0] * active.numel() + edge[1], sorted=True)
             edge = torch.stack((torch.div(linear, active.numel(), rounding_mode="floor"), linear.remainder(active.numel())))
-        source, target = edge
         v = active.numel()
         if fields.scalar.shape != (v, cfg.scalar_channels):
             raise ValueError("scalar field does not match active atlas")
@@ -287,10 +337,86 @@ class GaugeCovariantSparseTransportAttention(nn.Module):
         frames = atlas.chart_frames[active] if frames is None else frames
         if centers.shape != (v, 3) or frames.shape != (v, 3, 3):
             raise ValueError("dynamic centers/frames must match the selected chart subset")
+        cell_sides = atlas.cell_sides[active]
+        multiplicity_modules = (
+            self.q0,
+            self.k0,
+            self.v0,
+            self.q1,
+            self.k1,
+            self.v1,
+            self.q2,
+            self.k2,
+            self.v2,
+        )
+        # Resolve each spectral parametrization once in the original forward.
+        # These small effective matrices remain ordinary differentiable inputs
+        # to the checkpoint; recomputation never advances a power iteration.
+        multiplicity_weights = tuple(
+            module.weight for module in multiplicity_modules
+        )
+        arguments = (
+            fields.scalar,
+            fields.vector,
+            fields.tensor,
+            edge,
+            centers,
+            frames,
+            cell_sides,
+            edge_ot_cost,
+            edge_uncertainty,
+            *multiplicity_weights,
+        )
+        if (
+            cfg.activation_checkpointing
+            and self.training
+            and torch.is_grad_enabled()
+        ):
+            output = checkpoint(
+                self._forward_prepared,
+                *arguments,
+                use_reentrant=False,
+                # GSTA contains no stochastic operator. Avoiding RNG snapshots
+                # removes CPU/CUDA state copies while preserving exact values.
+                preserve_rng_state=False,
+            )
+        else:
+            output = self._forward_prepared(*arguments)
+        return IrrepTensor(*output)
+
+    def _forward_prepared(
+        self,
+        scalar: Tensor,
+        vector: Tensor,
+        tensor: Tensor,
+        edge: Tensor,
+        centers: Tensor,
+        frames: Tensor,
+        cell_sides: Tensor,
+        edge_ot_cost: Optional[Tensor],
+        edge_uncertainty: Optional[Tensor],
+        q0_weight: Tensor,
+        k0_weight: Tensor,
+        v0_weight: Tensor,
+        q1_weight: Tensor,
+        k1_weight: Tensor,
+        v1_weight: Tensor,
+        q2_weight: Tensor,
+        k2_weight: Tensor,
+        v2_weight: Tensor,
+    ) -> tuple[Tensor, Tensor, Tensor]:
+        """Differentiable prepared-graph kernel used by forward/recompute."""
+
+        cfg = self.config
+        fields = IrrepTensor(scalar, vector, tensor)
+        source, target = edge
+        v = scalar.shape[0]
         displacement_world = centers[target] - centers[source]
         displacement = torch.einsum("eji,ej->ei", frames[source], displacement_world)
         connection = frames[source].transpose(-1, -2) @ frames[target]
-        cutoff = cfg.radial_cutoff_factor * torch.maximum(atlas.cell_sides[active[source]], atlas.cell_sides[active[target]])
+        cutoff = cfg.radial_cutoff_factor * torch.maximum(
+            cell_sides[source], cell_sides[target]
+        )
         # Self edges are required by the sparse attention contract and have
         # exactly zero displacement.  Use a cutoff-relative smooth norm so the
         # direction has the finite zero subgradient at that gauge-degenerate
@@ -303,11 +429,21 @@ class GaugeCovariantSparseTransportAttention(nn.Module):
         direction = displacement / safe_distance[:, None]
         radial = self.radial_basis((distance / cutoff.clamp_min(cfg.epsilon)).clamp(0.0, 1.0))
 
-        q0, k0, value0 = self.q0(fields.scalar), self.k0(fields.scalar), self.v0(fields.scalar)
-        q1, k1, value1 = self.q1(fields.vector), self.k1(fields.vector), self.v1(fields.vector)
-        q2 = l2_to_matrix(self.q2(fields.tensor))
-        k2 = l2_to_matrix(self.k2(fields.tensor))
-        value2 = l2_to_matrix(self.v2(fields.tensor))
+        q0 = self.q0.forward_with_weight(fields.scalar, q0_weight)
+        k0 = self.k0.forward_with_weight(fields.scalar, k0_weight)
+        value0 = self.v0.forward_with_weight(fields.scalar, v0_weight)
+        q1 = self.q1.forward_with_weight(fields.vector, q1_weight)
+        k1 = self.k1.forward_with_weight(fields.vector, k1_weight)
+        value1 = self.v1.forward_with_weight(fields.vector, v1_weight)
+        q2 = l2_to_matrix(
+            self.q2.forward_with_weight(fields.tensor, q2_weight)
+        )
+        k2 = l2_to_matrix(
+            self.k2.forward_with_weight(fields.tensor, k2_weight)
+        )
+        value2 = l2_to_matrix(
+            self.v2.forward_with_weight(fields.tensor, v2_weight)
+        )
         # One indexed scalar value tensor is shared by every tensor-product
         # path.  Repeating this gather kept multiple edge-by-channel
         # activations alive for backward; on the logged batch-8 failure each
@@ -320,24 +456,24 @@ class GaugeCovariantSparseTransportAttention(nn.Module):
 
         h = cfg.heads
         c0, c1, c2 = cfg.scalar_channels // h, cfg.vector_channels // h, cfg.tensor_channels // h
-        score0 = torch.sum(
-            F.normalize(q0.reshape(v, h, c0), dim=-1, eps=cfg.epsilon)[source]
-            * F.normalize(k0.reshape(v, h, c0), dim=-1, eps=cfg.epsilon)[target],
-            dim=-1,
+        score0 = normalized_inner_product(
+            q0.reshape(v, h, c0)[source],
+            k0.reshape(v, h, c0)[target],
+            cfg.epsilon,
         ) / cfg.attention_temperature_scalar
         q1_head = q1.reshape(v, h, c1, 3)
         k1_head = transported_k1.reshape(-1, h, c1, 3)
-        score1 = torch.sum(
-            F.normalize(q1_head[source].flatten(-2), dim=-1, eps=cfg.epsilon)
-            * F.normalize(k1_head.flatten(-2), dim=-1, eps=cfg.epsilon),
-            dim=-1,
+        score1 = normalized_inner_product(
+            q1_head[source].flatten(-2),
+            k1_head.flatten(-2),
+            cfg.epsilon,
         ) / cfg.attention_temperature_vector
         q2_head = q2.reshape(v, h, c2, 3, 3)
         k2_head = transported_k2.reshape(-1, h, c2, 3, 3)
-        score2 = torch.sum(
-            F.normalize(q2_head[source].flatten(-3), dim=-1, eps=cfg.epsilon)
-            * F.normalize(k2_head.flatten(-3), dim=-1, eps=cfg.epsilon),
-            dim=-1,
+        score2 = normalized_inner_product(
+            q2_head[source].flatten(-3),
+            k2_head.flatten(-3),
+            cfg.epsilon,
         ) / cfg.attention_temperature_tensor
         logits = score0 + score1 + score2 + radial @ self.score_radial.transpose(0, 1)
         if edge_ot_cost is not None:
@@ -440,7 +576,7 @@ class GaugeCovariantSparseTransportAttention(nn.Module):
         output0 = fields.scalar + cfg.residual_step * gate0 * message0 / norm0
         output1 = fields.vector + cfg.residual_step * gate1[:, :, None] * message1 / norm1
         output2 = fields.tensor + cfg.residual_step * gate2[:, :, None] * message2 / norm2
-        return IrrepTensor(output0, output1, output2)
+        return output0, output1, output2
 
 
 __all__ = [
@@ -451,4 +587,5 @@ __all__ = [
     "direction_l2",
     "l2_to_matrix",
     "matrix_to_l2",
+    "normalized_inner_product",
 ]

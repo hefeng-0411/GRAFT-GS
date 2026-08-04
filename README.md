@@ -154,6 +154,14 @@ TRELLIS seed. Same-object view-sharded DDP deliberately remains batch size one.
 When `--minimum-global-object-batch` is used, accumulation is reduced as the
 physical object batch grows.
 
+The server configuration enables exact GSTA activation recomputation for large
+physical object batches. It removes the dominant edge-by-channel tensors from
+the retained graph without changing the sparse gauge operator, resolution, or
+gradient. Use `--gsta-activation-checkpointing` (or the explicit `--no-...`
+override for an A/B measurement). The derivation, measured retained-storage
+reduction, and one-GPU CUDA acceptance command are in
+[`docs/PROTOCOL9_GSTA_MEMORY.md`](docs/PROTOCOL9_GSTA_MEMORY.md).
+
 Every ordinary DDP batch, including batch size one, is also cohort-balanced by
 the manifest's render-face and sparse-surface cardinalities. This prevents one
 rank from receiving a tail-complexity Phase-B object while peers wait. Before a

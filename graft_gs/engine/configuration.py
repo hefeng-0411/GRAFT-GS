@@ -42,6 +42,12 @@ def load_server_config(
         raise ValueError(
             "training.renderer_checkpoint_views must be a YAML Boolean"
         )
+    gsta_activation_checkpointing = model.get(
+        "gsta_activation_checkpointing",
+        base.attention.activation_checkpointing,
+    )
+    if not isinstance(gsta_activation_checkpointing, bool):
+        raise ValueError("model.gsta_activation_checkpointing must be a YAML Boolean")
     for key, default in (
         ("dataloader_persistent_workers", False),
         ("dataloader_pin_memory", True),
@@ -161,6 +167,7 @@ def load_server_config(
         attention=replace(
             base.attention,
             heads=int(model.get("attention_heads", base.attention.heads)),
+            activation_checkpointing=gsta_activation_checkpointing,
         ),
         flow=replace(
             base.flow,

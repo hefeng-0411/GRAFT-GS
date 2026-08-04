@@ -9,6 +9,7 @@ import unittest
 from unittest import mock
 
 import torch
+import torch.nn.functional as F
 
 from graft_gs.engine.losses import (
     multiview_reprojection_cycle_loss,
@@ -23,6 +24,7 @@ from graft_gs.equivariant.gsta import (
     active_adjacency,
     l2_to_matrix,
     matrix_to_l2,
+    normalized_inner_product,
 )
 from graft_gs.geometry.atlas import AtlasConfig, PersistentOctreeAtlas
 from graft_gs.integration.pipeline import GraftGS, GraftGSOutput
@@ -142,6 +144,188 @@ class CameraConventionTest(unittest.TestCase):
 
 
 class GaugeEquivarianceTest(unittest.TestCase):
+    def test_fused_normalized_inner_product_matches_explicit_normalization(self) -> None:
+        generator = torch.Generator().manual_seed(19)
+        left = torch.randn(
+            11,
+            4,
+            15,
+            generator=generator,
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        right = torch.randn(
+            11,
+            4,
+            15,
+            generator=generator,
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        with torch.no_grad():
+            left[0].zero_()
+            right[1].mul_(1.0e-12)
+        reference = torch.sum(
+            F.normalize(left, dim=-1, eps=1.0e-8)
+            * F.normalize(right, dim=-1, eps=1.0e-8),
+            dim=-1,
+        )
+        fused = normalized_inner_product(left, right, 1.0e-8)
+        torch.testing.assert_close(fused, reference, atol=2.0e-15, rtol=2.0e-15)
+        probe = torch.linspace(
+            -0.4,
+            0.7,
+            fused.numel(),
+            dtype=torch.float64,
+        ).reshape_as(fused)
+        reference_gradient = torch.autograd.grad(
+            torch.sum(reference * probe),
+            (left, right),
+            retain_graph=True,
+        )
+        fused_gradient = torch.autograd.grad(
+            torch.sum(fused * probe),
+            (left, right),
+        )
+        for expected, actual in zip(reference_gradient, fused_gradient):
+            torch.testing.assert_close(actual, expected, atol=3.0e-15, rtol=3.0e-15)
+
+    def test_checkpointed_gsta_matches_spectral_forward_and_gradients(self) -> None:
+        atlas = _grid_atlas()
+        disabled = GSTAConfig(residual_step=0.2, activation_checkpointing=False)
+        enabled = GSTAConfig(residual_step=0.2, activation_checkpointing=True)
+        reference = GaugeCovariantSparseTransportAttention(disabled).double()
+        checkpointed = GaugeCovariantSparseTransportAttention(enabled).double()
+        for layer in (reference, checkpointed):
+            for child in layer.modules():
+                if isinstance(child, MultiplicityLinear):
+                    torch.nn.utils.parametrizations.spectral_norm(
+                        child,
+                        name="weight",
+                        n_power_iterations=1,
+                    )
+        checkpointed.load_state_dict(reference.state_dict())
+        count = atlas.num_active
+        generator = torch.Generator().manual_seed(23)
+
+        def make_fields() -> IrrepTensor:
+            return IrrepTensor(
+                torch.randn(
+                    count,
+                    disabled.scalar_channels,
+                    generator=generator,
+                    dtype=torch.float64,
+                ).requires_grad_(True),
+                torch.randn(
+                    count,
+                    disabled.vector_channels,
+                    3,
+                    generator=generator,
+                    dtype=torch.float64,
+                ).requires_grad_(True),
+                torch.randn(
+                    count,
+                    disabled.tensor_channels,
+                    5,
+                    generator=generator,
+                    dtype=torch.float64,
+                ).requires_grad_(True),
+            )
+
+        reference_fields = make_fields()
+        checkpoint_fields = IrrepTensor(
+            reference_fields.scalar.detach().clone().requires_grad_(True),
+            reference_fields.vector.detach().clone().requires_grad_(True),
+            reference_fields.tensor.detach().clone().requires_grad_(True),
+        )
+        edge, _ = active_adjacency(atlas)
+        edge_cost = torch.linspace(
+            0.0,
+            1.0,
+            edge.shape[1],
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        edge_uncertainty = torch.linspace(
+            1.0,
+            0.0,
+            edge.shape[1],
+            dtype=torch.float64,
+            requires_grad=True,
+        )
+        checkpoint_cost = edge_cost.detach().clone().requires_grad_(True)
+        checkpoint_uncertainty = (
+            edge_uncertainty.detach().clone().requires_grad_(True)
+        )
+        expected = reference(
+            atlas,
+            reference_fields,
+            edge_ot_cost=edge_cost,
+            edge_uncertainty=edge_uncertainty,
+        ).pack()
+        actual = checkpointed(
+            atlas,
+            checkpoint_fields,
+            edge_ot_cost=checkpoint_cost,
+            edge_uncertainty=checkpoint_uncertainty,
+        ).pack()
+        torch.testing.assert_close(actual, expected, atol=2.0e-12, rtol=2.0e-12)
+        # A physical object batch executes later scenes before the first
+        # scene's backward. Spectral normalization advances its power-iteration
+        # buffers on those intervening forwards. The checkpoint must still
+        # recompute the first scene with its originally resolved effective
+        # weights, not the layer's subsequently advanced parametrization state.
+        later_reference_fields = make_fields()
+        later_checkpoint_fields = IrrepTensor(
+            later_reference_fields.scalar.detach().clone(),
+            later_reference_fields.vector.detach().clone(),
+            later_reference_fields.tensor.detach().clone(),
+        )
+        with torch.no_grad():
+            reference(atlas, later_reference_fields)
+            checkpointed(atlas, later_checkpoint_fields)
+        probe = torch.linspace(
+            -0.3,
+            0.8,
+            expected.numel(),
+            dtype=torch.float64,
+        ).reshape_as(expected)
+        reference_parameters = tuple(reference.parameters())
+        checkpoint_parameters = tuple(checkpointed.parameters())
+        expected_gradient = torch.autograd.grad(
+            torch.sum(expected * probe),
+            (
+                reference_fields.scalar,
+                reference_fields.vector,
+                reference_fields.tensor,
+                edge_cost,
+                edge_uncertainty,
+                *reference_parameters,
+            ),
+        )
+        actual_gradient = torch.autograd.grad(
+            torch.sum(actual * probe),
+            (
+                checkpoint_fields.scalar,
+                checkpoint_fields.vector,
+                checkpoint_fields.tensor,
+                checkpoint_cost,
+                checkpoint_uncertainty,
+                *checkpoint_parameters,
+            ),
+        )
+        self.assertEqual(len(actual_gradient), len(expected_gradient))
+        for expected_value, actual_value in zip(
+            expected_gradient,
+            actual_gradient,
+        ):
+            torch.testing.assert_close(
+                actual_value,
+                expected_value,
+                atol=3.0e-11,
+                rtol=3.0e-10,
+            )
+
     def test_multiplicity_spectral_policy_scale_is_effective(self) -> None:
         dtype = torch.float64
         layer = MultiplicityLinear(3).to(dtype=dtype)

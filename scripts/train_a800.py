@@ -65,6 +65,15 @@ def main() -> None:
     parser.add_argument("--vggt-checkpoint")
     parser.add_argument("--trellis-checkpoint")
     parser.add_argument(
+        "--gsta-activation-checkpointing",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "override model.gsta_activation_checkpointing; the A6000/A100/A800 "
+            "server policy enables exact non-reentrant recomputation"
+        ),
+    )
+    parser.add_argument(
         "--profile",
         action="store_true",
         help="enable the bounded first-step CPU/CUDA profiler from the config",
@@ -174,6 +183,14 @@ def main() -> None:
     args.vggt_checkpoint = resolve_vggt_checkpoint(args.vggt_checkpoint)
     phase = TrainingPhase(args.phase)
     model_config, training_config, distributed_config, dataset_config = load_server_config(args.config)
+    if args.gsta_activation_checkpointing is not None:
+        model_config = replace(
+            model_config,
+            attention=replace(
+                model_config.attention,
+                activation_checkpointing=args.gsta_activation_checkpointing,
+            ),
+        )
     progress_config = load_progress_config(args.config)
     profiler_config = load_training_profiler_config(args.config)
     profiling_enabled = bool(args.profile or profiler_config.enabled)
@@ -198,6 +215,10 @@ def main() -> None:
         "start",
         config=str(args.config),
         batch_probe=args.batch_probe is not None,
+        gsta_activation_checkpointing=(
+            model_config.attention.activation_checkpointing
+        ),
+        pytorch_cuda_alloc_conf=os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""),
     )
     synchronize_object_atlas = args.same_object_view_shards or bool(
         distributed_config.get("synchronize_object_atlas", False)
@@ -570,6 +591,12 @@ def main() -> None:
         loss_weights=loss_weights,
         teacher=teacher,
         progress_reporter=progress,
+    )
+    # Per-stage mem_get_info is intentionally restricted to disposable probes
+    # and explicit profiler runs. It exposes the precise scene/layer where
+    # headroom is consumed without synchronizing every production forward.
+    trainer.module.cuda_memory_stage_trace_enabled = bool(
+        args.batch_probe is not None or profiling_enabled
     )
     if trainer.context.rank == 0:
         precision_path = Path(args.output) / "precision_policy.json"
