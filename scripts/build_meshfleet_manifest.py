@@ -24,7 +24,15 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("dataset_root", type=Path)
     parser.add_argument("output", type=Path)
-    parser.add_argument("--splits", nargs="+", default=("train", "test"))
+    parser.add_argument(
+        "--splits",
+        nargs="+",
+        default=("train", "test"),
+        help=(
+            "names of existing dataset split directories to index (default: train test); "
+            "this command never creates or repartitions splits"
+        ),
+    )
     parser.add_argument(
         "--skip-image-headers",
         action="store_true",

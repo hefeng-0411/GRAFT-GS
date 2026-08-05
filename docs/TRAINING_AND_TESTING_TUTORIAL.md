@@ -85,8 +85,15 @@ Build a new manifest only if the dataset changed or no audited manifest exists:
 ```bash
 "$GRAFT_GS_PYTHON" scripts/build_meshfleet_manifest.py \
   "$GRAFT_GS_DATASET" "$GRAFT_GS_MANIFEST" \
-  --splits train val test
+  --splits train test
 ```
+
+`--splits` selects existing split directories for indexing; it does not divide,
+move, or relabel any objects. Because this dataset already provides `train` and
+`test`, do not request a synthetic `val` split. The flag may also be omitted,
+because `train test` is the builder default. Create a validation partition only
+under a separate, explicit data-governance policy when validation-based model
+selection or early stopping is required; never tune against the test partition.
 
 Validate rank-to-device ownership and the NCCL/scientific contract:
 

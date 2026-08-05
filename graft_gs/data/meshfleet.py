@@ -922,7 +922,8 @@ def build_meshfleet_manifest(
     Candidate IDs are the union found in ``primary_modalities``.  A candidate
     enters the manifest iff every ``required_modalities`` artifact contract is
     satisfied.  Missing optional modalities are recorded but never reject an
-    otherwise valid object.
+    otherwise valid object.  ``splits`` names existing dataset partitions to
+    index; this function never creates partitions or moves objects among them.
     """
 
     root = Path(root).resolve()
