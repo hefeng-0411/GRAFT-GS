@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass
 import hashlib
 from math import log, pi
@@ -10,9 +11,11 @@ from typing import Mapping, Optional, Sequence
 
 import torch
 from torch import Tensor, nn
+from torch.utils.checkpoint import checkpoint
 
 from ..equivariant.gsta import IrrepTensor, l2_to_matrix, matrix_to_l2
 from ..integration.pipeline import GraftGS, GraftGSOutput, SceneOutput
+from ..kernels import fused_ssim_loss
 from ..manifold.barrier import triangle_distance_squared
 from ..manifold.geometry import (
     geodesic_interpolate,
@@ -609,32 +612,9 @@ def structural_similarity_loss(
     target: Tensor,
     mask: Optional[Tensor] = None,
 ) -> Tensor:
-    """Three-channel 3x3 SSIM dissimilarity on batched multiview images."""
+    """Three-channel 3x3 SSIM with a fused, recomputing CUDA adjoint."""
 
-    if predicted.shape != target.shape or predicted.ndim != 5:
-        raise ValueError("SSIM inputs must share shape [B,K,3,H,W]")
-    batch, views, channels, height, width = predicted.shape
-    left = predicted.reshape(batch * views, channels, height, width)
-    right = target.reshape_as(left)
-    mean_left = torch.nn.functional.avg_pool2d(left, 3, stride=1, padding=1)
-    mean_right = torch.nn.functional.avg_pool2d(right, 3, stride=1, padding=1)
-    variance_left = torch.nn.functional.avg_pool2d(left.square(), 3, 1, 1) - mean_left.square()
-    variance_right = torch.nn.functional.avg_pool2d(right.square(), 3, 1, 1) - mean_right.square()
-    covariance = torch.nn.functional.avg_pool2d(left * right, 3, 1, 1) - mean_left * mean_right
-    c1, c2 = 0.01**2, 0.03**2
-    similarity = (
-        (2.0 * mean_left * mean_right + c1)
-        * (2.0 * covariance + c2)
-        / (
-            (mean_left.square() + mean_right.square() + c1)
-            * (variance_left + variance_right + c2)
-        ).clamp_min(1.0e-12)
-    )
-    loss = 0.5 * (1.0 - similarity.clamp(-1.0, 1.0)).mean(dim=1, keepdim=True)
-    if mask is None:
-        return loss.mean()
-    weight = mask.reshape(batch * views, 1, height, width)
-    return torch.sum(loss * weight) / weight.sum().clamp_min(1.0)
+    return fused_ssim_loss(predicted, target, mask)
 
 
 def multiscale_perceptual_loss(
@@ -693,6 +673,26 @@ def multiscale_perceptual_loss(
         if weight is not None:
             weight = torch.nn.functional.avg_pool2d(weight, 2, stride=2)
     return torch.stack(losses).mean()
+
+
+def _recomputed_dense_loss(
+    function: Callable[[Tensor, Tensor, Tensor], Tensor],
+    predicted: Tensor,
+    target: Tensor,
+    mask: Tensor,
+) -> Tensor:
+    """Drop deterministic dense-loss intermediates until their adjoint runs."""
+
+    if torch.is_grad_enabled() and predicted.requires_grad:
+        return checkpoint(
+            function,
+            predicted,
+            target,
+            mask,
+            use_reentrant=False,
+            preserve_rng_state=False,
+        )
+    return function(predicted, target, mask)
 
 
 def conservative_tile_opacity_bound(
@@ -1759,16 +1759,27 @@ class GraftGSLoss(nn.Module):
             view_availability, target_alpha, target_mask = _view_supervision_masks(
                 batch, predicted
             )
-            terms["render"] = robust_rgb(predicted, target, target_mask)
+            terms["render"] = _recomputed_dense_loss(
+                robust_rgb,
+                predicted,
+                target,
+                target_mask,
+            )
             terms["ssim"] = structural_similarity_loss(
                 predicted,
                 target,
                 target_mask,
             )
-            terms["perceptual"] = multiscale_perceptual_loss(
-                predicted, target, target_mask
-            ) if self.learned_perceptual is None else self.learned_perceptual(
-                predicted, target, target_mask
+            perceptual_objective = (
+                multiscale_perceptual_loss
+                if self.learned_perceptual is None
+                else self.learned_perceptual
+            )
+            terms["perceptual"] = _recomputed_dense_loss(
+                perceptual_objective,
+                predicted,
+                target,
+                target_mask,
             )
             tile_opacity_losses = []
             for scene in output.scenes:

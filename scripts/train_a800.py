@@ -52,6 +52,8 @@ from graft_gs.integration import (
     resolve_trellis_checkpoint,
     resolve_vggt_checkpoint,
 )
+from graft_gs.kernels import triton_ssim_available
+
 
 def main() -> None:
     parser = argparse.ArgumentParser()
@@ -182,6 +184,16 @@ def main() -> None:
     local_device = bind_local_cuda_device(require_cuda=True)
     args.vggt_checkpoint = resolve_vggt_checkpoint(args.vggt_checkpoint)
     phase = TrainingPhase(args.phase)
+    if phase in {
+        TrainingPhase.ATLAS_AUTOENCODING,
+        TrainingPhase.END_TO_END,
+        TrainingPhase.QUANTIZATION_DISTILLATION,
+        TrainingPhase.TOPOLOGY_HARDENING,
+    } and not triton_ssim_available():
+        raise RuntimeError(
+            f"phase {phase.value} renders dense supervision and requires the "
+            "bounded-memory Triton SSIM kernel"
+        )
     model_config, training_config, distributed_config, dataset_config = load_server_config(args.config)
     if args.gsta_activation_checkpointing is not None:
         model_config = replace(
@@ -218,6 +230,7 @@ def main() -> None:
         gsta_activation_checkpointing=(
             model_config.attention.activation_checkpointing
         ),
+        ssim_backend="triton_recomputing_adjoint",
         pytorch_cuda_alloc_conf=os.environ.get("PYTORCH_CUDA_ALLOC_CONF", ""),
     )
     synchronize_object_atlas = args.same_object_view_shards or bool(

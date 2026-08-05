@@ -80,6 +80,27 @@ Validate rank-to-device ownership and the NCCL/scientific contract:
 
 All explicitly selected GPUs must be idle before the DDP or tuning commands.
 
+Verify that the training interpreter contains Triton, then run the exact-shape
+SSIM value/adjoint/allocation gate on one isolated GPU. Phase B/D/E/F refuses
+to start without this backend because the eager CUDA SSIM path has an
+unbounded full-image tape at the target batch.
+
+```bash
+"$GRAFT_GS_PYTHON" -c \
+  'import torch, triton; print(torch.__version__, triton.__version__)'
+
+CUDA_VISIBLE_DEVICES=4 "$GRAFT_GS_PYTHON" \
+  scripts/benchmark_fused_ssim.py \
+  --batch 8 --views 24 --height 518 --width 518 \
+  --output outputs/validation/fused_ssim_gpu4.json
+```
+
+Require a zero exit status, positive `peak_reduction_bytes`, loss absolute
+error at most `2e-7`, and gradient relative L2 at most `5e-6`. The repository's
+measured A6000 result is in
+[`FUSED_SSIM_MEMORY.md`](FUSED_SSIM_MEMORY.md); repeat the gate on the A100/A800
+rather than extrapolating an sm_86 measurement to sm_80.
+
 ## 3. Decide whether an old Phase A checkpoint can be reused
 
 The OOM revision added `attention.activation_checkpointing`, which is an
@@ -153,7 +174,9 @@ bash scripts/launch_a800_6gpu.sh \
   2>&1 | tee "$PROBE_ROOT/run.log"
 ```
 
-The probe must contain all four ranks, three finite optimizer steps, safe peak
+The process-start records must report
+`"ssim_backend":"triton_recomputing_adjoint"`. The probe must contain all four
+ranks, three finite optimizer steps, safe peak
 allocated/reserved/driver-free fractions, and no OOM, collective error, or
 non-finite diagnostic. A successful checkpoint load only resolves the current
 configuration error; it does not by itself prove that the later batch-8 forward
@@ -312,6 +335,7 @@ Run CPU/static validation before deployment:
 
 ```bash
 "$GRAFT_GS_PYTHON" -m unittest \
+  tests.test_fused_ssim \
   tests.test_checkpoint_config_compatibility \
   tests.test_geometry_invariants \
   tests.test_object_batching \
@@ -341,12 +365,12 @@ The repository-wide discovery command is:
 "$GRAFT_GS_PYTHON" -m unittest discover -s tests -p 'test_*.py'
 ```
 
-In this workspace audit, the focused 83-test checkpoint/GSTA/DDP/tuning gate
-passes. Full discovery runs 230 tests with 11
+In this workspace audit, the focused 88-test SSIM/checkpoint/GSTA/DDP/tuning
+gate passes. Full discovery runs 235 tests with 11
 environment skips but also exposes five pre-existing, unrelated failures: three
 non-leaf-tensor `deepcopy` errors in analytical asset tests, one perceptual-loss
-threshold assertion, and one TRELLIS-prior monotonicity assertion. None touches
-the files changed by this checkpoint repair, but the repository-wide release
+threshold assertion, and one TRELLIS-prior monotonicity assertion. None is a
+regression of the checkpoint/SSIM repair, but the repository-wide release
 gate must not be reported as fully green until those independent failures are
 resolved.
 

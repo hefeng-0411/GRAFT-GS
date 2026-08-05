@@ -13,6 +13,7 @@ beside the unmodified `vggt/` and `TRELLIS/` baseline trees.
 - FP32 OT, charts, manifold state, barriers, analytical solves, and export
 - optional FP64 invariant diagnostics
 - a server-built `diff_gaussian_rasterization` extension for training renders
+- Triton-backed fused SSIM for bounded-memory Phase B/D/E/F supervision
 
 The launcher derives its world size from `CUDA_VISIBLE_DEVICES`; historical
 script/config names retain `a800` for compatibility and do not force that GPU
@@ -51,6 +52,10 @@ python -m pip install -e .
 ```
 
 No baseline source file is patched by this package.
+
+The production-size SSIM kernel and its recomputing adjoint are documented in
+[`docs/FUSED_SSIM_MEMORY.md`](docs/FUSED_SSIM_MEMORY.md). Run its allocator and
+gradient-parity gate on each deployment topology before a long training job.
 
 ## Validation
 
