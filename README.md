@@ -7,7 +7,8 @@ beside the unmodified `vggt/` and `TRELLIS/` baseline trees.
 
 - Linux, one DDP process per explicitly selected NVIDIA Ampere GPU
 - test execution profile: four RTX A6000 48 GB GPUs
-- production training profile: four A100 80 GB GPUs (A800 remains supported)
+- production training profile: physical GPUs 4 and 5, two A100 80 GB devices
+  (A800 remains supported)
 - PyTorch 2.4 or newer with CUDA/NCCL
 - native BF16 VGGT aggregation
 - FP32 OT, charts, manifold state, barriers, analytical solves, and export
@@ -61,7 +62,8 @@ gradient-parity gate on each deployment topology before a long training job.
 
 ```bash
 python scripts/validate_server.py --output outputs/validation.json
-torchrun --standalone --nproc-per-node=6 scripts/validate_ddp_server.py
+export CUDA_VISIBLE_DEVICES=4,5
+torchrun --standalone --nproc-per-node=2 scripts/validate_ddp_server.py
 ```
 
 For the real checkpoint-backed test:
@@ -115,6 +117,10 @@ configuration. Use repeated `--primary-modality`, `--required-modality`, and
 Run phases in order and initialize each new phase from the preceding model:
 
 ```bash
+export CUDA_VISIBLE_DEVICES=4,5
+export GRAFT_GS_EXPECTED_GPU_COUNT=2
+export GRAFT_GS_EXPECTED_GPU_NAME=A100
+
 bash scripts/launch_a800_6gpu.sh /data/MeshFleet_TRELLIS A 20000 --manifest data_manifests/meshfleet_server.jsonl --split train --output outputs/phase_a
 bash scripts/launch_a800_6gpu.sh /data/MeshFleet_TRELLIS B 50000 --manifest data_manifests/meshfleet_server.jsonl --split train --trellis-checkpoint "$TRELLIS_CHECKPOINT" --initialize-from outputs/phase_a/final.pt --output outputs/phase_b
 bash scripts/launch_a800_6gpu.sh /data/MeshFleet_TRELLIS C 50000 --manifest data_manifests/meshfleet_server.jsonl --split train --trellis-checkpoint "$TRELLIS_CHECKPOINT" --initialize-from outputs/phase_b/final.pt --output outputs/phase_c
@@ -191,7 +197,7 @@ fresh-process probes:
 ```bash
 export GRAFT_GS_PYTHON=/mnt/sda1/miniforge3/envs/CRAFT/bin/python
 "$GRAFT_GS_PYTHON" scripts/autotune_object_batch.py \
-  --gpus 0,2,3,5 --candidates 1 2 4 8 \
+  --gpus 4,5 --candidates 1 2 4 8 \
   --probe-timeout-seconds 1800 \
   --probe-no-progress-timeout-seconds 900 \
   --probe-warmup-steps 1 --probe-measurement-steps 2 \

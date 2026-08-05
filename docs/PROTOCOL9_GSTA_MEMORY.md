@@ -129,7 +129,7 @@ A800 stack; it already reports that feature unsupported.
 First run a fresh-process, three-step batch-8 probe:
 
 ```bash
-CUDA_VISIBLE_DEVICES=4,5,6,7 bash scripts/launch_a800_6gpu.sh \
+CUDA_VISIBLE_DEVICES=4,5 bash scripts/launch_a800_6gpu.sh \
   /mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97 \
   B 50000 \
   --manifest data_manifests/meshfleet_server.jsonl --split train \

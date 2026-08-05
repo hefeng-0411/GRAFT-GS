@@ -539,13 +539,15 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
 
     def test_visible_gpu_training_launcher_cannot_bypass_pinned_interpreter(self) -> None:
         launcher = source("scripts/launch_a800_6gpu.sh")
-        config = source("configs/graft_gs_a800_native.yaml")
-        pipeline = source("graft_gs/integration/pipeline.py")
         self.assertIn("/mnt/sda1/miniforge3/envs/CRAFT/bin/python", launcher)
         self.assertIn('"$ROOT/scripts/validate_environment.py"', launcher)
         self.assertIn('--requirements "$ROOT/requirements.txt"', launcher)
         self.assertIn('"$PYTHON_BIN" -m torch.distributed.run', launcher)
         self.assertIn("torch.cuda.device_count()", launcher)
+        self.assertIn("GRAFT_GS_EXPECTED_GPU_COUNT", launcher)
+        self.assertIn("GRAFT_GS_EXPECTED_GPU_NAME", launcher)
+        self.assertIn("GRAFT_GS_VISIBLE_GPU_MAPPING", launcher)
+        self.assertIn('"physical_token": tokens[logical_rank]', launcher)
 
     def test_mesh_supervision_is_chunked_before_trainable_forward(self) -> None:
         trainer = source("graft_gs/engine/trainer.py")

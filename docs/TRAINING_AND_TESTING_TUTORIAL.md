@@ -16,8 +16,10 @@ export GRAFT_GS_PYTHON=/mnt/sda1/miniforge3/envs/CRAFT/bin/python
 export GRAFT_GS_DATASET=/mnt/sda2/hef/Base/dataset/c9028d206944a33af776f1b6967a6d82af385e97
 export GRAFT_GS_MANIFEST=$PWD/data_manifests/meshfleet_server.jsonl
 export GRAFT_GS_CONFIG=$PWD/configs/graft_gs_a800_native.yaml
-export GRAFT_GS_GPUS=4,5,6,7
+export GRAFT_GS_GPUS=4,5
 export CUDA_VISIBLE_DEVICES=$GRAFT_GS_GPUS
+export GRAFT_GS_EXPECTED_GPU_COUNT=2
+export GRAFT_GS_EXPECTED_GPU_NAME=A100
 
 export GRAFT_GS_VGGT_ROOT=/mnt/sda2/hef/Base/vggt
 export GRAFT_GS_TRELLIS_ROOT=/mnt/sda2/hef/Base/TRELLIS
@@ -27,8 +29,27 @@ export TRELLIS_CHECKPOINT=microsoft/TRELLIS-image-large
 export GRAFT_GS_NPROC_PER_NODE=$(
   "$GRAFT_GS_PYTHON" -c 'import torch; print(torch.cuda.device_count())'
 )
-test "$GRAFT_GS_NPROC_PER_NODE" -eq 4
+test "$GRAFT_GS_NPROC_PER_NODE" -eq 2
 mkdir -p outputs/validation
+```
+
+The CUDA visibility remap is intentional: torchrun local rank 0 owns physical
+GPU 4 and local rank 1 owns physical GPU 5. Confirm both selected devices are
+A100s before loading any checkpoint:
+
+```bash
+nvidia-smi -i "$GRAFT_GS_GPUS" \
+  --query-gpu=index,name,memory.total,memory.free,compute_cap \
+  --format=csv,noheader
+
+"$GRAFT_GS_PYTHON" - <<'PY'
+import torch
+assert torch.cuda.device_count() == 2, torch.cuda.device_count()
+for logical in range(2):
+    name = torch.cuda.get_device_name(logical)
+    assert "A100" in name, (logical, name)
+    print(f"logical_cuda={logical} physical_cuda={4 + logical} name={name}")
+PY
 ```
 
 Checkpoint identifiers may be replaced by local paths. Do not set
@@ -149,8 +170,10 @@ Phase A command in section 7, and begin with the Phase B probe.
 ## 5. Phase B batch-8 repair gate
 
 After the compatibility report passes, rerun the exact failing physical batch
-in a fresh output. Four ranks times eight objects equals the declared global
-batch of 32, so accumulation is one:
+in a fresh output. Two ranks times eight objects gives physical global batch
+16. `--global-object-batch 32` therefore selects exactly two gradient-
+accumulation microsteps per optimizer step; the former global optimizer batch
+and loss scaling remain unchanged:
 
 ```bash
 RUN_TAG=$(date -u +%Y%m%dT%H%M%SZ)
@@ -175,7 +198,7 @@ bash scripts/launch_a800_6gpu.sh \
 ```
 
 The process-start records must report
-`"ssim_backend":"triton_recomputing_adjoint"`. The probe must contain all four
+`"ssim_backend":"triton_recomputing_adjoint"`. The probe must contain both
 ranks, three finite optimizer steps, safe peak
 allocated/reserved/driver-free fractions, and no OOM, collective error, or
 non-finite diagnostic. A successful checkpoint load only resolves the current
@@ -328,6 +351,13 @@ CUDA_VISIBLE_DEVICES="$GRAFT_GS_GPUS" bash scripts/launch_a800_6gpu.sh \
 ```
 
 Do not use `--initialize-from` for interruption recovery.
+
+An exact checkpoint created with four DDP ranks cannot be resumed with this
+two-rank topology because world size and accumulation policy are checkpointed.
+Phase-to-phase `--initialize-from` remains valid: for example, a compatible
+Phase-A model trained on four ranks can initialize a fresh two-rank Phase-B
+run because optimizer, sampler, and rank-local RNG state are deliberately not
+transferred.
 
 ## 9. Local numerical and GSTA memory tests
 

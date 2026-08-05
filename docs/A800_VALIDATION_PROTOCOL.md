@@ -183,10 +183,10 @@ Before a full model sweep, the lightweight progress/NCCL path can be checked
 without loading VGGT or TRELLIS:
 
 ```bash
-CUDA_VISIBLE_DEVICES=4,5,6,7 torchrun --standalone --nproc-per-node=4 \
+CUDA_VISIBLE_DEVICES=4,5 torchrun --standalone --nproc-per-node=2 \
   scripts/validate_progress_ddp.py \
   --iterations 4 \
-  --output outputs/validation/progress_ddp_4gpu.json
+  --output outputs/validation/progress_ddp_2gpu.json
 ```
 
 This is a communication and observability smoke only; it does not validate

@@ -59,6 +59,42 @@ if [[ ! "$NPROC_PER_NODE" =~ ^[1-9][0-9]*$ ]]; then
   exit 2
 fi
 
+# Emit an auditable logical-rank -> scheduler token -> device mapping. Optional
+# expectations let a production wrapper reject an accidental topology or GPU
+# class before model/checkpoint allocation begins.
+"$PYTHON_BIN" - <<'PY'
+import json
+import os
+import torch
+
+tokens = [value.strip() for value in os.environ["CUDA_VISIBLE_DEVICES"].split(",")]
+count = torch.cuda.device_count()
+expected_count = os.environ.get("GRAFT_GS_EXPECTED_GPU_COUNT")
+expected_name = os.environ.get("GRAFT_GS_EXPECTED_GPU_NAME")
+if expected_count is not None and count != int(expected_count):
+    raise SystemExit(
+        f"expected {expected_count} visible GPUs, but PyTorch exposes {count}"
+    )
+mapping = []
+for logical_rank in range(count):
+    properties = torch.cuda.get_device_properties(logical_rank)
+    if expected_name is not None and expected_name not in properties.name:
+        raise SystemExit(
+            f"logical GPU {logical_rank} is {properties.name!r}, expected a name "
+            f"containing {expected_name!r}"
+        )
+    mapping.append(
+        {
+            "logical_rank": logical_rank,
+            "physical_token": tokens[logical_rank],
+            "name": properties.name,
+            "compute_capability": [properties.major, properties.minor],
+            "total_memory_bytes": properties.total_memory,
+        }
+    )
+print("GRAFT_GS_VISIBLE_GPU_MAPPING " + json.dumps(mapping, sort_keys=True))
+PY
+
 "$PYTHON_BIN" -m torch.distributed.run \
   --standalone \
   --nnodes=1 \
