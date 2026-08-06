@@ -356,7 +356,7 @@ class DerivedSurfaceTargetTest(unittest.TestCase):
 
         model = GraftGS(
             SyntheticVGGT(),
-            GraftGSConfig(feature_dim=8, encoder_layers=1, renderer_backend="reference"),
+            GraftGSConfig(feature_dim=8, encoder_layers=1, renderer_backend="gsplat"),
         ).double()
         images = torch.zeros(1, 2, 3, 4, 4, dtype=torch.float64)
         output = model(images, execution_stage="evidence_calibration")

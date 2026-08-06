@@ -11,8 +11,9 @@ from .assets import (
 from .renderer import (
     CameraBatch,
     CudaGaussianRenderer,
+    GsplatGaussianRenderer,
+    GsplatRenderer,
     RasterizationContract,
-    ReferenceGaussianRenderer,
     RenderResult,
 )
 
@@ -21,10 +22,11 @@ __all__ = [
     "AnalyticalSurfaceReadout",
     "CameraBatch",
     "CudaGaussianRenderer",
+    "GsplatGaussianRenderer",
+    "GsplatRenderer",
     "GaussianAsset",
     "MeshAsset",
     "RasterizationContract",
-    "ReferenceGaussianRenderer",
     "RenderResult",
     "write_gaussian_ply",
     "write_mesh_glb",

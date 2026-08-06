@@ -15,6 +15,7 @@ import torch.nn.functional as F
 from torch import Tensor, nn
 
 from ..geometry.atlas import PersistentOctreeAtlas
+from ..kernels.geometry_primitives import keops_gaussian_reduction
 from ..manifold.geometry import (
     ManifoldState,
     precision_to_bounded_covariance,
@@ -453,20 +454,18 @@ class AnalyticalSurfaceReadout(nn.Module):
         basis = real_sh_basis_degree3(view_direction)
         color = mapping.evidence.colors[target] - 0.5
         bandwidth = cfg.observation_bandwidth_factor * atlas.chart_radii[state.complex.atlas_node_index[local_chart]]
-        # The kernel only needs squared Euclidean distance.  Constructing
-        # cdist and then squaring it inserts an unnecessary ||x-y|| derivative
-        # that is undefined at a perfectly surface-attached observation.
-        distance_squared = (
-            means[:, None, :] - evidence_position[None, :, :]
-        ).square().sum(-1)
-        weight = plan[None] * torch.exp(
-            -0.5
-            * distance_squared
-            / bandwidth.square().clamp_min(1.0e-12)
-        )
-        weighted_basis = basis[None] * weight[:, :, None]
-        gram = torch.einsum("gni,gnj->gij", weighted_basis, basis[None].expand(count, -1, -1))
-        rhs = torch.einsum("gni,nc->gic", weighted_basis, color)
+        gram_values = plan[:, None] * torch.einsum(
+            "ni,nj->nij", basis, basis
+        ).flatten(1)
+        rhs_values = plan[:, None] * torch.einsum(
+            "ni,nc->nic", basis, color
+        ).flatten(1)
+        gram = keops_gaussian_reduction(
+            means, evidence_position, gram_values, bandwidth
+        ).reshape(count, 16, 16)
+        rhs = keops_gaussian_reduction(
+            means, evidence_position, rhs_values, bandwidth
+        ).reshape(count, 16, 3)
         eye = torch.eye(16, dtype=means.dtype, device=means.device)
         gram = gram + cfg.color_ridge * eye
         rhs[:, 0] = rhs[:, 0] + cfg.color_prior_weight * (prior_color - 0.5) / 0.28209479177387814

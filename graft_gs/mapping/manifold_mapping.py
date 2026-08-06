@@ -26,7 +26,8 @@ import torch
 import torch.nn.functional as F
 from torch import Tensor, nn
 
-from ..geometry.atlas import PersistentOctreeAtlas
+from ..geometry.atlas import FRNNAtlasGraph, PersistentOctreeAtlas
+from ..kernels.geometry_primitives import KeOpsFUGWConfig, KeOpsFUGWSolver
 from ..manifold.geometry import spd_inverse_logdet_cholesky
 
 
@@ -175,9 +176,11 @@ class ImplicitSinkhornConfig:
 @dataclass(frozen=True)
 class ManifoldMappingConfig:
     sinkhorn: ImplicitSinkhornConfig = field(default_factory=ImplicitSinkhornConfig)
+    fugw: KeOpsFUGWConfig = field(default_factory=KeOpsFUGWConfig)
     support_radius_factor: float = 2.25
     atlas_chunk_size: int = 2048
     evidence_chunk_size: int = 8192
+    frnn_max_neighbors: int = 256
     ensure_source_support: bool = True
     ensure_target_support: bool = True
     metric_epsilon: float = 1.0e-5
@@ -190,8 +193,12 @@ class ManifoldMappingConfig:
     def __post_init__(self) -> None:
         if self.support_radius_factor <= 0 or self.radial_support_factor <= 0:
             raise ValueError("transport support factors must be positive")
-        if self.atlas_chunk_size < 1 or self.evidence_chunk_size < 1:
-            raise ValueError("transport chunk sizes must be positive")
+        if (
+            self.atlas_chunk_size < 1
+            or self.evidence_chunk_size < 1
+            or self.frnn_max_neighbors < 1
+        ):
+            raise ValueError("transport chunk and FRNN neighbor bounds must be positive")
         if self.metric_epsilon <= 0 or self.metric_normal_weight < 0:
             raise ValueError("metric regularization must be positive/non-negative")
         if self.retention_shrinkage <= 0:
@@ -1130,13 +1137,14 @@ def build_sparse_transport_graph(
     atlas: PersistentOctreeAtlas,
     evidence: EvidenceParticles,
     config: ManifoldMappingConfig,
+    graph_builder: Optional[FRNNAtlasGraph] = None,
 ) -> SparseTransportGraph:
-    """Construct the discrete radius-truncated support with coverage fallbacks.
+    """Construct a bounded-degree FRNN radius support with coverage fallbacks.
 
-    Radius membership and nearest-neighbor identities are discrete. Recording
-    a ``cdist`` autograd tape cannot differentiate those indices and retains a
-    large useless workspace. The selected-edge cost is evaluated afterwards
-    from the original tensors and carries the complete conditional gradient.
+    Radius membership and nearest-neighbor identities are discrete. FRNN's
+    grid-hashed CUDA search therefore runs under ``no_grad`` and the selected
+    edge costs are evaluated afterwards from the original tensors. With fixed
+    ``frnn_max_neighbors=K``, storage is ``O(NK+N+M)=O(N+M)``.
     """
 
     active = atlas.active_indices
@@ -1146,53 +1154,17 @@ def build_sparse_transport_graph(
     n, m = centers.shape[0], particles.shape[0]
     if n == 0 or m == 0:
         raise ValueError("atlas and evidence must both be non-empty")
-    edge_source: List[Tensor] = []
-    edge_target: List[Tensor] = []
-    nearest_target_distance = centers.new_full((n,), torch.inf)
-    nearest_target = torch.zeros(n, dtype=torch.int64, device=centers.device)
-    nearest_source_distance = centers.new_full((m,), torch.inf)
-    nearest_source = torch.zeros(m, dtype=torch.int64, device=centers.device)
-
-    for source_start in range(0, n, config.atlas_chunk_size):
-        source_end = min(source_start + config.atlas_chunk_size, n)
-        source_centers = centers[source_start:source_end]
-        source_radii = radii[source_start:source_end]
-        for target_start in range(0, m, config.evidence_chunk_size):
-            target_end = min(target_start + config.evidence_chunk_size, m)
-            distance = torch.cdist(source_centers, particles[target_start:target_end])
-            local_source, local_target = torch.nonzero(distance < source_radii[:, None], as_tuple=True)
-            if local_source.numel():
-                edge_source.append(local_source + source_start)
-                edge_target.append(local_target + target_start)
-            values, indices = distance.min(dim=1)
-            improve = values < nearest_target_distance[source_start:source_end]
-            nearest_target_distance[source_start:source_end] = torch.where(
-                improve, values, nearest_target_distance[source_start:source_end]
-            )
-            nearest_target[source_start:source_end] = torch.where(
-                improve, indices + target_start, nearest_target[source_start:source_end]
-            )
-            values, indices = distance.min(dim=0)
-            improve = values < nearest_source_distance[target_start:target_end]
-            nearest_source_distance[target_start:target_end] = torch.where(
-                improve, values, nearest_source_distance[target_start:target_end]
-            )
-            nearest_source[target_start:target_end] = torch.where(
-                improve, indices + source_start, nearest_source[target_start:target_end]
-            )
-
-    if config.ensure_source_support:
-        edge_source.append(torch.arange(n, device=centers.device))
-        edge_target.append(nearest_target)
-    if config.ensure_target_support:
-        edge_source.append(nearest_source)
-        edge_target.append(torch.arange(m, device=centers.device))
-    source = torch.cat(edge_source)
-    target = torch.cat(edge_target)
-    linear = source * m + target
-    linear = torch.unique(linear, sorted=True)
-    source, target = torch.div(linear, m, rounding_mode="floor"), linear.remainder(m)
-    edge_index = torch.stack((source, target))
+    if graph_builder is None:
+        graph_builder = FRNNAtlasGraph(
+            config.frnn_max_neighbors,
+            ensure_chart_support=config.ensure_source_support,
+            ensure_observation_support=config.ensure_target_support,
+        )
+    edge_index = graph_builder(
+        centers.contiguous(),
+        particles.contiguous(),
+        radii.contiguous(),
+    )
     return SparseTransportGraph(
         edge_index=edge_index,
         atlas_node_index=active,
@@ -1516,6 +1488,12 @@ class ManifoldMappingOperator(nn.Module):
         self.config = config or ManifoldMappingConfig()
         self.cost_model = TransportCost(feature_dim, self.config.feature_cost_dim)
         self.sinkhorn = ImplicitUnbalancedSinkhorn(self.config.sinkhorn)
+        self.fugw = KeOpsFUGWSolver(self.config.fugw)
+        self.graph_builder = FRNNAtlasGraph(
+            self.config.frnn_max_neighbors,
+            ensure_chart_support=self.config.ensure_source_support,
+            ensure_observation_support=self.config.ensure_target_support,
+        )
         self.chart_writer = GaugeCovariantChartWriter(feature_dim, self.config.radial_basis_count)
 
     def forward(
@@ -1526,7 +1504,9 @@ class ManifoldMappingOperator(nn.Module):
         visibility_barrier: Optional[Tensor] = None,
     ) -> MappingResult:
         evidence.validate()
-        graph = build_sparse_transport_graph(atlas, evidence, self.config)
+        graph = build_sparse_transport_graph(
+            atlas, evidence, self.config, self.graph_builder
+        )
         evidence_precision, evidence_logdet = spd_inverse_logdet_cholesky(
             evidence.covariance.to(dtype=torch.float64)
         )
@@ -1549,7 +1529,71 @@ class ManifoldMappingOperator(nn.Module):
         # consume erroneous or background image evidence.
         source_mass = torch.pi * atlas.chart_radii[graph.atlas_node_index].square()
         target_mass = evidence.mass
-        plan, diagnostics = self.sinkhorn(cost, source_mass, target_mass, graph.edge_index)
+        plan, fugw_diagnostics = self.fugw(
+            cost.contiguous(),
+            atlas.chart_centers[graph.atlas_node_index].contiguous(),
+            evidence.positions.contiguous(),
+            source_mass.contiguous(),
+            target_mass.contiguous(),
+            graph.edge_index.contiguous(),
+            self.sinkhorn,
+        )
+        cost = fugw_diagnostics.linearized_cost
+        row = _segment_sum(plan, graph.source, source_mass.numel())
+        col = _segment_sum(plan, graph.target, target_mass.numel())
+        reference = source_mass[graph.source] * target_mass[graph.target]
+        objective = fugw_diagnostics.objective
+        objective = objective + self.config.sinkhorn.epsilon * _generalized_kl(
+            plan, reference, self.config.sinkhorn.mass_floor
+        )
+        objective = objective + self.config.sinkhorn.tau_source * _generalized_kl(
+            row, source_mass, self.config.sinkhorn.mass_floor
+        )
+        objective = objective + self.config.sinkhorn.tau_target * _generalized_kl(
+            col, target_mass, self.config.sinkhorn.mass_floor
+        )
+        diagnostics = SinkhornDiagnostics(
+            iterations=(
+                fugw_diagnostics.iterations
+                * fugw_diagnostics.transport_iterations
+                * 2
+            ),
+            fixed_point_residual=max(
+                fugw_diagnostics.residual,
+                fugw_diagnostics.transport_residual,
+            ),
+            source_transport_mass=row,
+            target_transport_mass=col,
+            objective=objective,
+            converged=(
+                fugw_diagnostics.converged
+                and fugw_diagnostics.transport_residual
+                <= fugw_diagnostics.transport_effective_tolerance
+            ),
+            effective_tolerance=max(
+                self.config.fugw.tolerance,
+                fugw_diagnostics.transport_effective_tolerance,
+            ),
+            internal_minimum_log_plan=fugw_diagnostics.internal_minimum_log_plan,
+            storage_underflow_edges=fugw_diagnostics.storage_underflow_edges,
+            storage_zero_source_rows=fugw_diagnostics.storage_zero_source_rows,
+            storage_zero_target_columns=(
+                fugw_diagnostics.storage_zero_target_columns
+            ),
+            storage_underflow_mass_fraction=(
+                fugw_diagnostics.storage_underflow_mass_fraction
+            ),
+            storage_zero_source_mass_fraction=(
+                fugw_diagnostics.storage_zero_source_mass_fraction
+            ),
+            storage_zero_target_mass_fraction=(
+                fugw_diagnostics.storage_zero_target_mass_fraction
+            ),
+            storage_relative_l1_error=(
+                fugw_diagnostics.storage_relative_l1_error
+            ),
+            internal_solve_dtype=fugw_diagnostics.internal_solve_dtype,
+        )
         centers, mass, retention_prior_mass, metric, irreps, reliability = self.chart_writer(
             atlas,
             evidence,

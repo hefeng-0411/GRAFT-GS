@@ -15,7 +15,12 @@ from torch.utils.checkpoint import checkpoint
 
 from ..equivariant.gsta import IrrepTensor, l2_to_matrix, matrix_to_l2
 from ..integration.pipeline import GraftGS, GraftGSOutput, SceneOutput
-from ..kernels import fused_ssim_loss
+from ..kernels import (
+    fused_ssim_loss,
+    geomloss_sinkhorn_divergence,
+    keops_squared_distance_minima,
+    nearest_neighbor_indices,
+)
 from ..manifold.barrier import triangle_distance_squared
 from ..manifold.geometry import (
     geodesic_interpolate,
@@ -1067,44 +1072,38 @@ def view_conditioned_objectives(
 
 
 def symmetric_surface_chamfer(predicted: Tensor, target: Tensor, chunk_size: int = 2048) -> Tensor:
-    """Memory-bounded symmetric squared Chamfer distance between surface measures."""
+    """Exact symmetric squared Chamfer via KeOps symbolic reductions."""
 
     if predicted.ndim != 2 or target.ndim != 2 or predicted.shape[1] != 3 or target.shape[1] != 3:
         raise ValueError("surface point sets must have shapes [G,3] and [N,3]")
     if predicted.shape[0] == 0 or target.shape[0] == 0:
         raise ValueError("surface Chamfer distance is undefined for an empty point set")
-    target_minimum = target.new_full((target.shape[0],), torch.inf)
-    predicted_minimum: list[Tensor] = []
-    for start in range(0, predicted.shape[0], chunk_size):
-        # Squared Chamfer does not require Euclidean distance itself.  Avoid
-        # cdist(...).square(), whose intermediate norm has a set-valued
-        # derivative at an exact surface match and can poison the transport
-        # cotangent even though squared distance has the unique zero gradient.
-        query = predicted[start : start + chunk_size]
-        distance_squared = (
-            query.square().sum(-1, keepdim=True)
-            + target.square().sum(-1)[None]
-            - 2.0 * (query @ target.transpose(0, 1))
-        ).clamp_min(0.0)
-        predicted_minimum.append(distance_squared.amin(dim=1))
-        target_minimum = torch.minimum(
-            target_minimum, distance_squared.amin(dim=0)
-        )
-    return torch.cat(predicted_minimum).mean() + target_minimum.mean()
+    del chunk_size
+    predicted_minimum, target_minimum = keops_squared_distance_minima(
+        predicted, target
+    )
+    return predicted_minimum.mean() + target_minimum.mean()
+
+
+def sinkhorn_surface_divergence(
+    predicted: Tensor,
+    target: Tensor,
+    blur: float = 0.01,
+) -> Tensor:
+    """Debiased Wasserstein surface loss through GeomLoss/KeOps."""
+
+    return geomloss_sinkhorn_divergence(predicted, target, blur=blur)
 
 
 def nearest_surface_targets(query: Tensor, target: Tensor, chunk_size: int = 2048) -> Tensor:
-    """Piecewise-differentiable exact nearest samples without a dense global matrix."""
+    """Piecewise-differentiable exact nearest samples through CUDA FRNN."""
 
     if query.ndim != 2 or target.ndim != 2 or query.shape[1] != 3 or target.shape[1] != 3:
         raise ValueError("surface point sets must have shapes [M,3] and [N,3]")
     if query.shape[0] == 0 or target.shape[0] == 0:
         raise ValueError("nearest surface assignment is undefined for an empty point set")
-    nearest: list[Tensor] = []
-    for start in range(0, query.shape[0], chunk_size):
-        distance = torch.cdist(query[start : start + chunk_size], target)
-        nearest.append(target[distance.argmin(dim=1)])
-    return torch.cat(nearest, dim=0)
+    del chunk_size
+    return target[nearest_neighbor_indices(query, target)]
 
 
 def evidence_surface_calibration(
@@ -1653,7 +1652,9 @@ class GraftGSLoss(nn.Module):
             )
             terms["surface"] = torch.stack(
                 [
-                    symmetric_surface_chamfer(scene.gaussians.means, surfaces[index])
+                    sinkhorn_surface_divergence(
+                        scene.gaussians.means, surfaces[index]
+                    )
                     for index, scene in enumerate(output.scenes)
                 ]
             ).mean()
@@ -2644,6 +2645,7 @@ __all__ = [
     "distillation_loss",
     "robust_rgb",
     "symmetric_surface_chamfer",
+    "sinkhorn_surface_divergence",
     "evidence_surface_calibration",
     "generalized_transport_kl",
     "gauge_covariant_activation_distillation",

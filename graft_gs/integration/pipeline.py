@@ -36,7 +36,12 @@ from ..mapping.manifold_mapping import (
 )
 from ..observability import ProgressReporter
 from ..readout.assets import AnalyticalReadoutConfig, AnalyticalSurfaceReadout, GaussianAsset, MeshAsset, write_gaussian_ply, write_mesh_glb
-from ..readout.renderer import CameraBatch, CudaGaussianRenderer, ReferenceGaussianRenderer, RenderResult
+from ..readout.renderer import (
+    CameraBatch,
+    CudaGaussianRenderer,
+    GsplatRenderer,
+    RenderResult,
+)
 from ..topology.strata import TopologySelection, TopologySelector, TopologySelectorConfig
 from .vggt_adapter import (
     CameraAlignmentDiagnostics,
@@ -70,15 +75,17 @@ class GraftGSConfig:
     transport_feature_iterations: int = 2
     refinement_rounds: int = 1
     run_flow: bool = True
-    renderer_backend: str = "cuda"
+    renderer_backend: str = "gsplat"
 
     def __post_init__(self) -> None:
         if self.feature_dim < 1 or self.encoder_layers < 1:
             raise ValueError("feature width and encoder depth must be positive")
         if self.transport_feature_iterations < 1 or self.refinement_rounds < 0:
             raise ValueError("transport iterations must be positive and refinement rounds non-negative")
-        if self.renderer_backend not in {"cuda", "reference"}:
-            raise ValueError("renderer_backend must be 'cuda' or 'reference'")
+        if self.renderer_backend not in {"gsplat", "cuda"}:
+            raise ValueError(
+                "renderer_backend must be 'gsplat' or compatibility alias 'cuda'"
+            )
 
 
 @dataclass
@@ -150,12 +157,13 @@ class GraftGS(nn.Module):
         self.vector_field = RiemannianVectorField(config.flow, config.attention)
         self.integrator = SafeHeunIntegrator(config.flow.steps)
         self.readout = AnalyticalSurfaceReadout(config.readout)
-        if config.renderer_backend == "cuda":
+        if config.renderer_backend == "gsplat":
+            self.renderer = GsplatRenderer()
+        elif config.renderer_backend == "cuda":
+            # Historical configuration alias; execution is still gsplat.
             self.renderer = CudaGaussianRenderer()
-        elif config.renderer_backend == "reference":
-            self.renderer = ReferenceGaussianRenderer()
         else:
-            raise ValueError("renderer_backend must be 'cuda' or 'reference'")
+            raise ValueError("renderer_backend must be 'gsplat' or 'cuda'")
         self.trellis_prior = trellis_prior
         self.progress_reporter: Optional[ProgressReporter] = None
         self.cuda_memory_stage_trace_enabled = False

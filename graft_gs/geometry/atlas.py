@@ -26,6 +26,12 @@ from typing import Dict, Iterable, Mapping, Optional, Sequence, Tuple
 import torch
 from torch import Tensor, nn
 
+from ..kernels.geometry_primitives import (
+    fixed_radius_neighbors,
+    keops_compact_partition,
+    nearest_neighbor_indices,
+)
+
 
 @dataclass(frozen=True)
 class AtlasConfig:
@@ -79,6 +85,44 @@ class AtlasValidation:
     min_frame_determinant: float
     min_chart_immersion_eigenvalue: float
     min_active_side: float
+
+
+class FRNNAtlasGraph(nn.Module):
+    """CUDA grid-hashed local graph between atlas charts and observations."""
+
+    def __init__(
+        self,
+        max_neighbors: int,
+        *,
+        ensure_chart_support: bool = True,
+        ensure_observation_support: bool = True,
+    ) -> None:
+        super().__init__()
+        if max_neighbors < 1:
+            raise ValueError("FRNN atlas graph requires a positive neighbor bound")
+        self.max_neighbors = max_neighbors
+        self.ensure_chart_support = ensure_chart_support
+        self.ensure_observation_support = ensure_observation_support
+
+    @torch.no_grad()
+    def forward(
+        self,
+        chart_centers: Tensor,
+        observation_positions: Tensor,
+        support_radius: Tensor,
+    ) -> Tensor:
+        if chart_centers.device.type != "cuda":
+            raise RuntimeError("FRNNAtlasGraph requires CUDA-resident atlas geometry")
+        if chart_centers.dtype != torch.float32:
+            raise TypeError("FRNNAtlasGraph requires float32 atlas geometry")
+        return fixed_radius_neighbors(
+            chart_centers.contiguous(),
+            observation_positions.contiguous(),
+            support_radius.contiguous(),
+            max_neighbors=self.max_neighbors,
+            ensure_query_support=self.ensure_chart_support,
+            ensure_reference_support=self.ensure_observation_support,
+        ).contiguous()
 
 
 def morton_encode(xyz: Tensor, bits: int = 20) -> Tensor:
@@ -592,16 +636,8 @@ class PersistentOctreeAtlas(nn.Module):
         if torch.any(unresolved):
             active = self.active_indices
             query = positions[unresolved]
-            best_distance = torch.full((query.shape[0],), torch.inf, dtype=query.dtype, device=query.device)
-            best_index = torch.zeros(query.shape[0], dtype=torch.int64, device=query.device)
-            for start in range(0, active.numel(), 4096):
-                ids = active[start : start + 4096]
-                distance = torch.cdist(query, self.chart_centers[ids])
-                value, local = distance.min(dim=1)
-                improve = value < best_distance
-                best_distance = torch.where(improve, value, best_distance)
-                best_index = torch.where(improve, ids[local], best_index)
-            assignments[unresolved] = best_index
+            local = nearest_neighbor_indices(query, self.chart_centers[active])
+            assignments[unresolved] = active[local]
         return assignments
 
     def refinement_mask(
@@ -969,40 +1005,15 @@ class PersistentOctreeAtlas(nn.Module):
             return node_metric.new_empty((0, 3, 3))
         center = self.chart_centers[nodes]
         support = support_scale * self.chart_radii[nodes]
-        output = []
-        for start in range(0, query.shape[0], chunk_size):
-            value = query[start : start + chunk_size]
-            # The compact bump is a function of r^2, so evaluate squared
-            # distance directly.  This is algebraically exact and avoids the
-            # undefined intermediate derivative of ||x-c|| at a chart center.
-            squared_distance = (
-                value.square().sum(-1, keepdim=True)
-                + center.square().sum(-1)[None]
-                - 2.0 * (value @ center.transpose(0, 1))
-            ).clamp_min(0.0)
-            normalized_squared = squared_distance / support[None].square().clamp_min(
-                1.0e-12
-            )
-            inside = normalized_squared < 1.0
-            denominator = (1.0 - normalized_squared).clamp_min(1.0e-12)
-            bump = torch.where(
-                inside,
-                torch.exp(-1.0 / denominator),
-                torch.zeros_like(normalized_squared),
-            )
-            total = bump.sum(dim=-1, keepdim=True)
-            nearest = torch.nn.functional.one_hot(
-                squared_distance.argmin(dim=-1),
-                num_classes=nodes.numel(),
-            ).to(bump)
-            weight = torch.where(
-                total > torch.finfo(bump.dtype).tiny,
-                bump / total.clamp_min(torch.finfo(bump.dtype).tiny),
-                nearest,
-            )
-            metric = torch.einsum("qv,vij->qij", weight, node_metric)
-            output.append(0.5 * (metric + metric.transpose(-1, -2)))
-        return torch.cat(output, dim=0)
+        del chunk_size
+        flat_metric = keops_compact_partition(
+            query,
+            center,
+            support,
+            node_metric.reshape(nodes.numel(), 9),
+        )
+        metric = flat_metric.reshape(query.shape[0], 3, 3)
+        return 0.5 * (metric + metric.transpose(-1, -2))
 
     def chart_immersion_margin(self, delta_j: float = 1.0e-6, samples_per_axis: int = 3) -> Tensor:
         """Minimum sampled eigenvalue of ``JᵀJ`` minus ``delta_j`` per active chart."""
@@ -1088,6 +1099,7 @@ class PersistentOctreeAtlas(nn.Module):
 __all__ = [
     "AtlasConfig",
     "AtlasValidation",
+    "FRNNAtlasGraph",
     "PersistentOctreeAtlas",
     "morton_decode",
     "morton_encode",

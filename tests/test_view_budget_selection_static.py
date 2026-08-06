@@ -109,7 +109,7 @@ def report(views: int, throughput: float, reserved: float) -> dict[str, object]:
             "persistence_matching_mode": ["exact", "exact", "exact"],
         },
         "rendering": {
-            "backend": "cuda",
+            "backend": "gsplat",
             "checkpoint_views": True,
         },
     }

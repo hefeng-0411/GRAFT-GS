@@ -13,7 +13,7 @@ beside the unmodified `vggt/` and `TRELLIS/` baseline trees.
 - native BF16 VGGT aggregation
 - FP32 OT, charts, manifold state, barriers, analytical solves, and export
 - optional FP64 invariant diagnostics
-- a server-built `diff_gaussian_rasterization` extension for training renders
+- local `gsplat`, FRNN, KeOps/GeomLoss, and nerfacc CUDA extensions
 - Triton-backed fused SSIM for bounded-memory Phase B/D/E/F supervision
 
 The launcher derives its world size from `CUDA_VISIBLE_DEVICES`; historical
@@ -31,7 +31,7 @@ intrinsics               [B,K,3,3] pixels
 depth/confidence         [B,K,518,518,(1)]
 evidence particles       variable [M]
 active atlas charts      variable [V]
-sparse UOT support        [2,E_OT]
+sparse FRNN/FUGW support  [2,E_OT]
 local irreps             60(0e)+16(1o)+4(2e) = 128 scalars
 selected complex         vertices [Nv], edges [Ne,2], faces [Nf,3]
 manifold state           R3 x SO(3) x SPD(3) x R x appearance x latent
@@ -45,14 +45,21 @@ components accidentally.
 
 ## Installation on the server
 
-Install the existing VGGT and TRELLIS requirements/checkpoints, build the CUDA
-rasterizer, then install this package from the combined repository:
+Install the immutable VGGT/TRELLIS environment, then build the audited sibling
+geometry sources and this package:
 
 ```bash
+python -m pip install -r requirements-geometry-local.txt
 python -m pip install -e .
+python scripts/validate_geometry_extensions.py
 ```
 
-No baseline source file is patched by this package.
+No baseline source file is patched by this package. The provided `gsplat`
+source currently declares Torch 2.7 or newer while the recorded frozen
+baseline environment pins Torch 2.4; use the ABI validator and do not upgrade
+the baseline environment without a separate TRELLIS/VGGT compatibility audit.
+The convergence and memory certificate is in
+[`docs/GEOMETRY_KERNEL_CONVERGENCE.md`](docs/GEOMETRY_KERNEL_CONVERGENCE.md).
 
 The production-size SSIM kernel and its recomputing adjoint are documented in
 [`docs/FUSED_SSIM_MEMORY.md`](docs/FUSED_SSIM_MEMORY.md). Run its allocator and
@@ -146,7 +153,7 @@ are part of exact checkpoint compatibility.
 
 Use `--same-object-view-shards` to make all ranks iterate the same object order;
 the trainer deterministically partitions its views, autograd-all-gathers the
-complete evidence measure, and replicates one global sparse UOT/atlas solve.
+complete evidence measure, and replicates one global sparse FUGW/atlas solve.
 This is the high-precision reference because summing rank-local nonlinear UOT
 barycenters is not a global UOT solve. In ordinary DDP, ranks
 process different objects and only model gradients synchronize. Server defaults

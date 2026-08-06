@@ -1,0 +1,8 @@
+# Install after the immutable baseline snapshot in requirements.txt.
+# These editable sources are the compiled geometry ABIs used by GRAFT-GS.
+-e ../extensions/keops/keopscore
+-e ../extensions/keops/pykeops
+-e ../extensions/geomloss
+-e ../extensions/FRNN
+-e ../extensions/gsplat
+-e ../extensions/nerfacc

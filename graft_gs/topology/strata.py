@@ -344,12 +344,11 @@ def persistence_wasserstein(
     maximum_exact_points: int = 512,
     sliced_directions: int = 32,
 ) -> Tensor:
-    """Scalable persistence distance with an exact small-diagram reference.
+    """Linear-memory sliced persistence Wasserstein at every diagram size.
 
-    The Hungarian formulation is retained when ``n+m`` is within the explicit
-    memory budget. Larger diagrams use deterministic sliced Wasserstein; an
-    exact dense assignment has cubic time and quadratic memory and is not a
-    valid production operator for a refined surface atlas.
+    ``maximum_exact_points`` is retained only for checkpoint/configuration
+    compatibility. Production execution never materializes the dense
+    diagonal-augmented Hungarian matrix.
     """
 
     if left.ndim != 2 or right.ndim != 2 or left.shape[-1] != 2 or right.shape[-1] != 2:
@@ -361,42 +360,10 @@ def persistence_wasserstein(
         return left.new_zeros(())
     if order < 1 or maximum_exact_points < 1:
         raise ValueError("Wasserstein order and exact point budget must be positive")
-    if n + m > maximum_exact_points:
-        return sliced_persistence_wasserstein(
-            left, right, order=order, directions=sliced_directions
-        )
-    size = n + m
-    large = left.new_tensor(1.0e12)
-    cost = left.new_full((size, size), large)
-    if n and m:
-        if order == 2:
-            # Squared W2 ground cost has a unique zero gradient at identical
-            # persistence points. Avoid an intermediate Euclidean norm whose
-            # derivative is set-valued at that same, common match.
-            pair_cost = (
-                left[:, None, :] - right[None, :, :]
-            ).square().sum(-1)
-        else:
-            pair_cost = torch.cdist(left, right, p=2).pow(order)
-        cost[:n, :m] = pair_cost
-    if n:
-        diagonal_left = ((left[:, 1] - left[:, 0]).abs() / sqrt(2.0)).pow(order)
-        cost[torch.arange(n), m + torch.arange(n)] = diagonal_left
-    if m:
-        diagonal_right = ((right[:, 1] - right[:, 0]).abs() / sqrt(2.0)).pow(order)
-        cost[n + torch.arange(m), torch.arange(m)] = diagonal_right
-    if n and m:
-        cost[n:, m:] = 0
-    # Selection is discrete, so the exact CPU Hungarian assignment does not
-    # interrupt a required gradient path.
-    from scipy.optimize import linear_sum_assignment
-
-    rows, columns = linear_sum_assignment(cost.detach().cpu().numpy())
-    assignment = cost[torch.as_tensor(rows, device=cost.device), torch.as_tensor(columns, device=cost.device)]
-    power_cost = assignment.sum()
-    if not bool(power_cost.detach() > 0):
-        return power_cost
-    return power_cost.pow(1.0 / order)
+    del n, m, maximum_exact_points
+    return sliced_persistence_wasserstein(
+        left, right, order=order, directions=sliced_directions
+    )
 
 
 def persistence_critical_occupancy_thresholds(

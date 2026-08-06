@@ -93,6 +93,24 @@ def load_server_config(
         ),
         solve_in_float64=solve_in_float64,
     )
+    fugw_normalize_geometry = transport.get(
+        "fugw_normalize_geometry", base.mapping.fugw.normalize_geometry
+    )
+    if not isinstance(fugw_normalize_geometry, bool):
+        raise ValueError("transport.fugw_normalize_geometry must be a YAML Boolean")
+    fugw = replace(
+        base.mapping.fugw,
+        alpha=float(transport.get("fugw_alpha", base.mapping.fugw.alpha)),
+        max_iterations=int(
+            transport.get(
+                "fugw_max_iterations", base.mapping.fugw.max_iterations
+            )
+        ),
+        tolerance=float(
+            transport.get("fugw_tolerance", base.mapping.fugw.tolerance)
+        ),
+        normalize_geometry=fugw_normalize_geometry,
+    )
     config = replace(
         base,
         feature_dim=int(model.get("feature_dim", base.feature_dim)),
@@ -113,12 +131,18 @@ def load_server_config(
         mapping=replace(
             base.mapping,
             sinkhorn=sinkhorn,
+            fugw=fugw,
             atlas_chunk_size=int(
                 transport.get("atlas_chunk_size", base.mapping.atlas_chunk_size)
             ),
             evidence_chunk_size=int(
                 transport.get(
                     "evidence_chunk_size", base.mapping.evidence_chunk_size
+                )
+            ),
+            frnn_max_neighbors=int(
+                transport.get(
+                    "frnn_max_neighbors", base.mapping.frnn_max_neighbors
                 )
             ),
             retention_shrinkage=float(

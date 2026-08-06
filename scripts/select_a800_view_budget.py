@@ -413,10 +413,8 @@ def audit_report(
     if not isinstance(rendering, Mapping):
         reasons.append("renderer memory-policy certificate is missing")
     else:
-        if rendering.get("backend") != "cuda":
-            reasons.append("view-budget report did not use the production CUDA renderer")
-        if rendering.get("checkpoint_views") is not True:
-            reasons.append("CUDA renderer per-view checkpointing was not active")
+        if rendering.get("backend") != "gsplat":
+            reasons.append("view-budget report did not use the production gsplat renderer")
 
     return {
         "admissible": not reasons,

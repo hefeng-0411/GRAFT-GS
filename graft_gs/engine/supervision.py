@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import torch
 from torch import Tensor
 
+from ..kernels.geometry_primitives import nearest_neighbor_indices
 from ..manifold.barrier import BarrierConfig, BarrierProjector, FeasibilityReport
 from ..manifold.geometry import ManifoldState, ManifoldTangent
 
@@ -28,17 +29,14 @@ class SurfaceTargetConfig:
 
 
 def nearest_surface_points(query: Tensor, surface: Tensor, chunk_size: int = 2048) -> Tensor:
-    """Exact chunked nearest samples on an explicitly voxelized surface."""
+    """Exact nearest samples using FRNN CUDA grid hashing."""
 
     if query.ndim != 2 or surface.ndim != 2 or query.shape[1] != 3 or surface.shape[1] != 3:
         raise ValueError("query and surface must have shapes [V,3] and [N,3]")
     if surface.shape[0] == 0:
         raise ValueError("surface target cannot be empty")
-    selected: list[Tensor] = []
-    for start in range(0, query.shape[0], chunk_size):
-        distance = torch.cdist(query[start : start + chunk_size], surface)
-        selected.append(surface[distance.argmin(dim=1)])
-    return torch.cat(selected, dim=0)
+    del chunk_size
+    return surface[nearest_neighbor_indices(query, surface)]
 
 
 def _graph_laplacian(value: Tensor, edges: Tensor) -> Tensor:
