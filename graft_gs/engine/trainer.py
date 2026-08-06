@@ -1412,7 +1412,201 @@ class GraftGSTrainer:
             flush=True,
         )
 
+    @staticmethod
+    def _slice_object_batch(
+        batch: Mapping[str, object],
+        index: int,
+        batch_size: int,
+    ) -> dict[str, object]:
+        """Keep one collated object while preserving its batch dimension.
+
+        Variable-topology fields are collated as length-B sequences while
+        dense, camera-aligned fields use a leading B dimension.  Retaining a
+        singleton batch dimension lets the ordinary model and objective paths
+        execute without a second, numerically distinct single-object API.
+        """
+
+        if not 0 <= index < batch_size:
+            raise IndexError("object batch index is outside the collated batch")
+        selected: dict[str, object] = {}
+        for name, value in batch.items():
+            if (
+                isinstance(value, Tensor)
+                and value.ndim > 0
+                and value.shape[0] == batch_size
+            ):
+                selected[name] = value[index : index + 1]
+            elif isinstance(value, (list, tuple)) and len(value) == batch_size:
+                selected[name] = value[index : index + 1]
+            else:
+                selected[name] = value
+        return selected
+
+    @staticmethod
+    def _aggregate_streamed_metrics(
+        rows: Sequence[Mapping[str, float]],
+        *,
+        local_scenes: int,
+        local_views: int,
+    ) -> dict[str, float]:
+        """Detach and reduce per-object telemetry without retaining autograd."""
+
+        if not rows:
+            raise ValueError("streamed metric aggregation requires at least one row")
+        peak_metrics = {
+            "peak_memory_bytes",
+            "peak_reserved_memory_bytes",
+            "peak_active_memory_bytes",
+            "peak_allocated_fraction",
+            "peak_reserved_fraction",
+            "peak_active_fraction",
+        }
+        terminal_metrics = {
+            "gradient_norm",
+            "ending_allocated_memory_bytes",
+            "ending_reserved_memory_bytes",
+            "ending_inactive_reserved_memory_bytes",
+            "ending_driver_free_memory_bytes",
+            "ending_non_allocator_cuda_memory_bytes",
+            "ending_allocated_fraction",
+            "ending_reserved_fraction",
+            "ending_inactive_reserved_fraction",
+            "ending_driver_free_fraction",
+            "ending_non_allocator_cuda_fraction",
+            "device_memory_bytes",
+        }
+        names = set().union(*(row.keys() for row in rows))
+        result: dict[str, float] = {}
+        for name in names:
+            values = [float(row[name]) for row in rows if name in row]
+            if name in peak_metrics:
+                result[name] = max(values)
+            elif name in terminal_metrics:
+                result[name] = values[-1]
+            elif name not in {
+                "seconds",
+                "local_scenes",
+                "local_views",
+                "local_views_per_second",
+            }:
+                result[name] = sum(values) / len(values)
+        elapsed = sum(float(row.get("seconds", 0.0)) for row in rows)
+        result.update(
+            seconds=elapsed,
+            local_scenes=float(local_scenes),
+            local_views=float(local_views),
+            local_views_per_second=float(local_views / max(elapsed, 1.0e-12)),
+            streamed_object_microbatches=float(len(rows)),
+        )
+        return result
+
     def train_step(self, batch: Mapping[str, object], microstep: int = 0) -> dict[str, float]:
+        """Execute a logical batch with bounded, per-object graph lifetime.
+
+        Phase B/D objectives are object-separable means.  Running one complete
+        forward/loss/backward at a time therefore produces the same averaged
+        gradient as a materialized object batch, while only one scene graph is
+        live.  The configured object batch and optimizer batch remain
+        unchanged.  Phase C retains its joint minibatch OT coupling, and E/F
+        retain their joint adversarial/purification algorithms.
+        """
+
+        images = torch.as_tensor(batch["images"])
+        if images.ndim < 2:
+            raise ValueError("training images must include object and view dimensions")
+        batch_size = int(images.shape[0])
+        streamable = self.config.phase in {
+            TrainingPhase.ATLAS_AUTOENCODING,
+            TrainingPhase.END_TO_END,
+        }
+        if batch_size <= 1 or not streamable:
+            return self._train_step_single_object(batch, microstep)
+
+        if self.context.distributed:
+            local_count = torch.tensor(
+                [batch_size],
+                device=self.context.device,
+                dtype=torch.int64,
+            )
+            gathered_counts = [
+                torch.empty_like(local_count)
+                for _ in range(self.context.world_size)
+            ]
+            dist.all_gather(gathered_counts, local_count)
+            rank_batch_sizes = [int(value.item()) for value in gathered_counts]
+            if len(set(rank_batch_sizes)) != 1:
+                raise RuntimeError(
+                    "streamed DDP requires the same object count on every rank; "
+                    f"received {rank_batch_sizes}"
+                )
+
+        should_step = (
+            microstep % self.config.gradient_accumulation_steps
+            == self.config.gradient_accumulation_steps - 1
+        )
+        object_value = batch.get("object_id")
+        object_ids = (
+            [str(value) for value in object_value]
+            if isinstance(object_value, (list, tuple))
+            else [str(object_value)] if object_value is not None else []
+        )
+        self.progress.event(
+            "train.object_stream",
+            "begin",
+            logical_object_batch=batch_size,
+            accumulation_steps=self.config.gradient_accumulation_steps,
+        )
+        rows: list[dict[str, float]] = []
+        local_views = 0
+        backward_divisor = batch_size * self.config.gradient_accumulation_steps
+        for index in range(batch_size):
+            object_batch = self._slice_object_batch(batch, index, batch_size)
+            local_views += int(torch.as_tensor(object_batch["images"]).shape[1])
+            rows.append(
+                self._train_step_single_object(
+                    object_batch,
+                    microstep,
+                    backward_divisor=backward_divisor,
+                    should_step_override=should_step and index == batch_size - 1,
+                    force_manual_gradient_sync=True,
+                    defer_log=True,
+                )
+            )
+        metrics = self._aggregate_streamed_metrics(
+            rows,
+            local_scenes=batch_size,
+            local_views=local_views,
+        )
+        self._active_step_context = {
+            "global_step": self.global_step,
+            "microstep": microstep,
+            "object_ids": object_ids,
+            "phase": self.config.phase.value,
+        }
+        self.progress.set_context(**self._active_step_context)
+        if should_step and self.global_step % self.config.log_every == 0:
+            self._log(metrics)
+        self.progress.event(
+            "train.object_stream",
+            "end",
+            optimizer_stepped=should_step,
+            logical_object_batch=batch_size,
+            seconds=metrics["seconds"],
+            peak_allocated_fraction=metrics["peak_allocated_fraction"],
+            peak_reserved_fraction=metrics["peak_reserved_fraction"],
+        )
+        return metrics
+
+    def _train_step_single_object(
+        self,
+        batch: Mapping[str, object],
+        microstep: int = 0,
+        *,
+        backward_divisor: Optional[int] = None,
+        should_step_override: Optional[bool] = None,
+        force_manual_gradient_sync: bool = False,
+        defer_log: bool = False,
+    ) -> dict[str, float]:
         self.model.train()
         object_value = batch.get("object_id")
         if isinstance(object_value, (list, tuple)):
@@ -1487,16 +1681,30 @@ class GraftGSTrainer:
             images = (images + 0.01 * torch.randn_like(images)).clamp(0.0, 1.0)
             robustness = RobustnessPerturbation()
         should_step = (
-            microstep % self.config.gradient_accumulation_steps
-            == self.config.gradient_accumulation_steps - 1
+            (
+                microstep % self.config.gradient_accumulation_steps
+                == self.config.gradient_accumulation_steps - 1
+            )
+            if should_step_override is None
+            else should_step_override
         )
+        backward_divisor = (
+            self.config.gradient_accumulation_steps
+            if backward_divisor is None
+            else backward_divisor
+        )
+        if backward_divisor < 1:
+            raise ValueError("backward divisor must be positive")
         manual_phase_f_sync = (
             self.context.distributed
             and self.config.phase is TrainingPhase.TOPOLOGY_HARDENING
             and self.gradient_purifier is not None
         )
+        manual_gradient_sync = manual_phase_f_sync or (
+            self.context.distributed and force_manual_gradient_sync
+        )
         synchronize = self.context.distributed and (
-            not should_step or manual_phase_f_sync
+            not should_step or manual_gradient_sync
         )
         context = self.model.no_sync() if synchronize and isinstance(self.model, DistributedDataParallel) else nullcontext()
         if self.context.device.type == "cuda":
@@ -1663,9 +1871,10 @@ class GraftGSTrainer:
                             terms,
                             output,
                             loss_batch,
+                            backward_divisor=backward_divisor,
                         )
                     else:
-                        (total / self.config.gradient_accumulation_steps).backward()
+                        (total / backward_divisor).backward()
             except RuntimeError as error:
                 self.module._record_cuda_memory_stage(
                     "trainer/backward_failure",
@@ -1683,7 +1892,7 @@ class GraftGSTrainer:
             adversary.reset_adversary()
         gradient_norm = 0.0
         if should_step:
-            if manual_phase_f_sync:
+            if manual_gradient_sync:
                 self._synchronize_gradients()
             if self.gradient_purifier is not None:
                 self.gradient_purifier.commit_fisher(
@@ -1927,7 +2136,11 @@ class GraftGSTrainer:
                 conditioning_views.get("selected", 0)
             ),
         )
-        if should_step and self.global_step % self.config.log_every == 0:
+        if (
+            not defer_log
+            and should_step
+            and self.global_step % self.config.log_every == 0
+        ):
             self._log(metrics)
         self.progress.event(
             "train.microbatch",
@@ -2000,11 +2213,20 @@ class GraftGSTrainer:
         terms: Mapping[str, Tensor],
         output: GraftGSOutput,
         batch: Mapping[str, object],
+        *,
+        backward_divisor: Optional[int] = None,
     ) -> dict[str, float]:
         """Replace only view-conditioned gradients by robust consensus gradients."""
 
         if self.gradient_purifier is None:
             raise RuntimeError("gradient purifier is not configured")
+        backward_divisor = (
+            self.config.gradient_accumulation_steps
+            if backward_divisor is None
+            else backward_divisor
+        )
+        if backward_divisor < 1:
+            raise ValueError("backward divisor must be positive")
         view_terms = {
             "render": self.loss.weights.render,
             "ssim": self.loss.weights.ssim,
@@ -2090,11 +2312,11 @@ class GraftGSTrainer:
             purified_objects,
             object_weight,
         )
-        (stable_objective / self.config.gradient_accumulation_steps).backward()
+        (stable_objective / backward_divisor).backward()
         for parameter, component in zip(self.trainable_parameters, purified):
             if component is None:
                 continue
-            contribution = component / self.config.gradient_accumulation_steps
+            contribution = component / backward_divisor
             if parameter.grad is None:
                 parameter.grad = contribution.detach().clone()
             else:

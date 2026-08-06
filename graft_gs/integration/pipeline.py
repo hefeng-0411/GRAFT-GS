@@ -10,6 +10,7 @@ from typing import Iterator, List, Optional, Sequence
 import torch
 from torch import Tensor, nn
 from torch.profiler import record_function
+from torch.utils.checkpoint import checkpoint
 
 from ..equivariant.gsta import (
     GSTAConfig,
@@ -565,12 +566,42 @@ class GraftGS(nn.Module):
                 object_index=batch_index,
                 active_charts=int(atlas.active_indices.numel()),
             ):
-                topology = self.topology(
-                    atlas,
-                    occupancy.clamp(1.0e-6, 1.0 - 1.0e-6),
-                    evidence_probability=observed_occupancy,
-                    shape_prior_probability=shape_prior_probability,
+                bounded_occupancy = occupancy.clamp(1.0e-6, 1.0 - 1.0e-6)
+                checkpoint_topology = (
+                    self.config.attention.activation_checkpointing
+                    and self.training
+                    and torch.is_grad_enabled()
+                    and bounded_occupancy.requires_grad
                 )
+                if checkpoint_topology:
+                    def checkpointed_topology(
+                        occupancy_input: Tensor,
+                        evidence_input: Tensor,
+                        prior_input: Optional[Tensor],
+                        _atlas: PersistentOctreeAtlas = atlas,
+                    ) -> TopologySelection:
+                        return self.topology(
+                            _atlas,
+                            occupancy_input,
+                            evidence_probability=evidence_input,
+                            shape_prior_probability=prior_input,
+                        )
+
+                    topology = checkpoint(
+                        checkpointed_topology,
+                        bounded_occupancy,
+                        observed_occupancy,
+                        shape_prior_probability,
+                        use_reentrant=False,
+                        preserve_rng_state=False,
+                    )
+                else:
+                    topology = self.topology(
+                        atlas,
+                        bounded_occupancy,
+                        evidence_probability=observed_occupancy,
+                        shape_prior_probability=shape_prior_probability,
+                    )
                 topology, initial, projector, initial_report = self._select_feasible_stratum(
                     atlas, mapping, topology, occupancy
                 )

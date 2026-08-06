@@ -152,6 +152,22 @@ class ScientificProductionTraceStaticTest(unittest.TestCase):
         self.assertIn("def principal_subspace_projection", purifier)
         self.assertIn("fisher_norm_square", purifier)
 
+    def test_phase_b_streams_object_graphs_and_recomputes_topology(self) -> None:
+        trainer = source("graft_gs/engine/trainer.py")
+        pipeline = source("graft_gs/integration/pipeline.py")
+        attention = source("graft_gs/equivariant/gsta.py")
+        config = source("configs/graft_gs_a800_native.yaml")
+        self.assertIn("def _slice_object_batch", trainer)
+        self.assertIn("backward_divisor = batch_size *", trainer)
+        self.assertIn("force_manual_gradient_sync=True", trainer)
+        self.assertIn("(total / backward_divisor).backward()", trainer)
+        self.assertIn("streamed_object_microbatches", trainer)
+        self.assertIn("def checkpointed_topology", pipeline)
+        self.assertIn("topology = checkpoint(", pipeline)
+        self.assertIn("cfg.activation_checkpointing", attention)
+        self.assertIn("use_reentrant=False", attention)
+        self.assertIn("gsta_activation_checkpointing: true", config)
+
     def test_phase_f_inner_maximizes_scale_and_dimensionless_margins(self) -> None:
         trainer = source("graft_gs/engine/trainer.py")
         quantization = source("graft_gs/optimization/quantization.py")
